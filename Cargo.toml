@@ -1,0 +1,25 @@
+[package]
+name = "simmer"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "simmer"
+path = "src/main.rs"
+
+[lib]
+name = "simmerlib"
+path = "src/lib.rs"
+
+[dependencies]
+ash = { version = "0.38", features = ["linked"] }
+sdl2 = { version = "0.37", features = ["bundled", "raw-window-handle"] }
+crossbeam = "0.8.4"
+parking_lot = "0.12.4"
+bytemuck = "1.23.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "winnt"] }
