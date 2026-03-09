@@ -865,10 +865,11 @@ impl FrameLightingBuffers {
             cluster_handles.push(alloc.handle);
             cluster_buffers.push(alloc.buffer);
 
-            // Light index SSBO: DEVICE_LOCAL, compute writes + fragment reads.
+            // Light index SSBO: DEVICE_LOCAL, compute writes + fragment reads + CPU fill.
             let alloc = allocator.create_buffer(
                 index_ssbo_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,  // <-- needed for vkCmdFillBuffer
                 MemoryLocation::GpuOnly,
             )?;
             index_handles.push(alloc.handle);

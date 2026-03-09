@@ -857,8 +857,7 @@ impl ShadowAtlas {
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .compare_enable(true)
-                    .compare_op(vk::CompareOp::LESS_OR_EQUAL)
+                    .compare_enable(false)
                     .min_lod(0.0)
                     .max_lod(1.0)
                     .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE),
@@ -924,7 +923,7 @@ pub fn cube_face_matrices(
     radius: f32,
     face: u32,
 ) -> ([[f32; 4]; 4], [[f32; 4]; 4]) {
-    let proj = perspective_fov(90.0_f32.to_radians(), 1.0, SHADOW_NEAR, radius);
+    let proj = perspective_fov_cube(90.0_f32.to_radians(), 1.0, SHADOW_NEAR, radius);
 
     let (target_offset, up): ([f32; 3], [f32; 3]) = match face {
         0 => ([ 1.0,  0.0,  0.0], [0.0, -1.0,  0.0]), // +X
@@ -946,6 +945,18 @@ pub fn cube_face_matrices(
     (view, proj)
 }
 
+/// Perspective projection for cube map face rendering.
+/// NO Y-flip — cube map sampling hardware expects OpenGL face orientation.
+fn perspective_fov_cube(fov_rad: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    let f = 1.0 / (fov_rad / 2.0).tan();
+    [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],           // ← positive f, NOT -f
+        [0.0, 0.0, far / (near - far), -1.0],
+        [0.0, 0.0, (near * far) / (near - far), 0.0],
+    ]
+}
+
 // ====================================================================
 //  Math helpers (local to this module)
 // ====================================================================
@@ -955,17 +966,6 @@ fn dist_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     dx * dx + dy * dy + dz * dz
-}
-
-/// Perspective projection matrix (Vulkan clip space: Y down, Z [0,1]).
-fn perspective_fov(fov_rad: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov_rad / 2.0).tan();
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, -f, 0.0, 0.0],
-        [0.0, 0.0, far / (near - far), -1.0],
-        [0.0, 0.0, (near * far) / (near - far), 0.0],
-    ]
 }
 
 /// Look-at view matrix.

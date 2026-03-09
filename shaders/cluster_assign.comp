@@ -54,12 +54,12 @@ layout(set = 0, binding = 1, std430) readonly buffer LightSSBO {
 } lightBuf;
 
 // Binding 2: Cluster SSBO (write)
-layout(set = 0, binding = 2, std430) buffer ClusterSSBO {
+layout(set = 0, binding = 2, std430) coherent buffer ClusterSSBO {
     GpuCluster clusters[];
 } clusterBuf;
 
 // Binding 3: Light index SSBO (write)
-layout(set = 0, binding = 3, std430) buffer LightIndexSSBO {
+layout(set = 0, binding = 3, std430) coherent buffer LightIndexSSBO {
     uint global_count;
     uint _pad0;
     uint _pad1;
@@ -163,11 +163,8 @@ void main() {
     // Initialize shared state.
     if (gl_LocalInvocationID.x == 0) {
         s_light_count = 0;
-
-        // Reset the global counter once (first workgroup).
-        if (clusterIndex == 0) {
-            indexBuf.global_count = 0;
-        }
+        // NOTE: global_count reset is now handled CPU-side via vkCmdFillBuffer.
+        // No GPU-side reset needed — eliminates cross-workgroup race condition.
     }
     barrier();
     memoryBarrierBuffer();

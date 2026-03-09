@@ -22,5 +22,8 @@ layout(push_constant) uniform ShadowPush {
 
 void main() {
     float dist = length(fragWorldPos - shadow.lightPos);
-    gl_FragDepth = dist / shadow.lightRadius;
+    // Apply bias at write time (hardware depth_bias is ineffective because
+    // gl_FragDepth overwrites the rasterizer depth).  Push depth slightly
+    // further from the light to prevent self-shadowing.
+    gl_FragDepth = dist / shadow.lightRadius + 0.002;
 }

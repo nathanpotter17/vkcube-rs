@@ -243,14 +243,14 @@ impl Renderer {
         // Register a directional sun light (not tied to any chunk).
         // Intensity 10.0 compensates for the Cook-Torrance 1/pi diffuse divisor.
         // Direction pitched steeply downward for good ground coverage.
-        light_manager.register(
-            (i32::MAX, i32::MAX), // sentinel coord for global lights
-            vec![Light::directional(
-                [0.3, -0.9, 0.2],   // steep downward angle
-                [1.0, 0.95, 0.9],   // warm sunlight
-                10.0,                // Phase 2: bright enough for PBR
-            )],
-        );
+        // light_manager.register(
+        //     (i32::MAX, i32::MAX), // sentinel coord for global lights
+        //     vec![Light::directional(
+        //         [0.3, -0.9, 0.2],   // steep downward angle
+        //         [1.0, 0.95, 0.9],   // warm sunlight
+        //         10.0,                // Phase 2: bright enough for PBR
+        //     )],
+        // );
 
         let shadow_budget = ShadowBudgetManager::new();
 
@@ -501,52 +501,24 @@ impl Renderer {
     }
 
     /// Register procedural lights for a newly-ready chunk.
-    ///
-    /// Phase 2 PBR showcase: brighter point lights elevated higher so
-    /// the Cook-Torrance BRDF produces visible illumination and shadows
-    /// are cast at useful angles.
     fn register_chunk_lights(&mut self, coord: ChunkCoord) {
         use crate::scene::CHUNK_SIZE;
 
         let cx = coord.0 as f32 * CHUNK_SIZE;
         let cz = coord.1 as f32 * CHUNK_SIZE;
 
-        let mut lights = Vec::new();
-
-        // Deterministic pseudo-random based on coord.
-        let hash = ((coord.0.wrapping_mul(73856093)) ^ (coord.1.wrapping_mul(19349663))) as u32;
-        let r = (hash % 256) as f32 / 255.0 * 0.3 + 0.7;
-        let g = ((hash >> 8) % 256) as f32 / 255.0 * 0.3 + 0.7;
-        let b = ((hash >> 16) % 256) as f32 / 255.0 * 0.3 + 0.5;
-
-        // Primary point light — high intensity, elevated, wide radius.
-        let center_x = cx + CHUNK_SIZE * 0.5;
+        let center_x = cx + CHUNK_SIZE * 0.5; // 32.0 for chunk (0,0)
         let center_z = cz + CHUNK_SIZE * 0.5;
-        let mut primary = Light::point(
-            [center_x, 8.0, center_z],
-            [r, g, b],
-            60.0,  // bright enough for PBR (divides by pi internally)
-            35.0,  // wide radius for cross-chunk coverage
-        );
-        primary.shadow_capable = true;
-        lights.push(primary);
 
-        // Secondary accent light — offset, slightly dimmer, colored.
-        let offset_x = ((hash >> 4) % 24) as f32 - 12.0;
-        let offset_z = ((hash >> 12) % 24) as f32 - 12.0;
-        let accent_r = ((hash >> 3) % 256) as f32 / 255.0 * 0.5 + 0.5;
-        let accent_g = ((hash >> 11) % 256) as f32 / 255.0 * 0.4 + 0.3;
-        let accent_b = ((hash >> 19) % 256) as f32 / 255.0 * 0.6 + 0.4;
-        let mut accent = Light::point(
-            [center_x + offset_x, 5.0, center_z + offset_z],
-            [accent_r, accent_g, accent_b],
-            40.0,
-            25.0,
+        let mut light = Light::point(
+            [center_x, 12.0, center_z],   // elevated at Y=12 for long shadows
+            [1.0, 0.95, 0.85],            // warm white — easy to read shadows
+            120.0,                         // very bright — single light must illuminate everything
+            50.0,                          // covers entire chunk with margin
         );
-        accent.shadow_capable = false;
-        lights.push(accent);
+        light.shadow_capable = true;
 
-        self.light_manager.register(coord, lights);
+        self.light_manager.register(coord, vec![light]);
     }
 
     fn run_eviction(&mut self) {
@@ -968,17 +940,36 @@ impl Renderer {
             //  PASS 2: Cluster Assignment Compute
             // ============================================================
 
-            // Memory barrier: ensure light SSBO writes are visible to compute.
-            let pre_compute_barrier = vk::MemoryBarrier::default()
+            // Zero the global light index counter from the CPU side.
+            // This eliminates the cross-workgroup race condition where
+            // the GPU-side reset (workgroup 0 only) may not be visible
+            // to other workgroups before their atomicAdd executes.
+            self.device.cmd_fill_buffer(
+                cmd,
+                self.lighting_buffers.index_ssbo_buffers[self.current_frame],
+                0,   // offset: global_count is at byte 0
+                16,  // size: header is [global_count, _pad, _pad, _pad] = 16 bytes
+                0,   // data: zero
+            );
+
+            // Barrier: fill → compute (ensures zero is visible before atomicAdd).
+            let fill_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                );
+
+            // Also need the light SSBO host writes visible to compute.
+            let host_barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::HOST_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
 
             self.device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
-                std::slice::from_ref(&pre_compute_barrier),
+                &[fill_barrier, host_barrier],
                 &[],
                 &[],
             );
@@ -999,8 +990,7 @@ impl Renderer {
                 &set0_dynamic_offsets,
             );
 
-            let workgroups = (TOTAL_CLUSTERS + 63) / 64;
-            self.device.cmd_dispatch(cmd, workgroups, 1, 1);
+            self.device.cmd_dispatch(cmd, TOTAL_CLUSTERS, 1, 1);
 
             // Memory barrier: compute writes → fragment reads.
             let post_compute_barrier = vk::MemoryBarrier::default()

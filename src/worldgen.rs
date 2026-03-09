@@ -359,83 +359,90 @@ enum ObjectKind {
 }
 
 pub fn generate_chunk_meshes(cx: i32, cz: i32) -> Vec<Mesh> {
-    let mut rng = ChunkRng::new(cx, cz);
     let mut meshes = Vec::new();
 
-    // 1. Ground plane (material 1).
+    // 1. Ground plane.
     meshes.push(make_ground_plane(cx, cz));
-
-    // 2. Scattered objects: 3-8 per chunk with varied materials.
-    let object_count = 3 + rng.range_usize(6);
 
     let world_x = cx as f32 * CHUNK_SIZE;
     let world_z = cz as f32 * CHUNK_SIZE;
+    let center_x = world_x + CHUNK_SIZE * 0.5;
+    let center_z = world_z + CHUNK_SIZE * 0.5;
 
-    let kinds = [ObjectKind::Cube, ObjectKind::Pyramid, ObjectKind::Column];
+    // ---- Shadow test objects ----
+    // Placed at known offsets from chunk center so shadows are predictable.
+    // Light is at [center_x, 12.0, center_z].
 
-    for _ in 0..object_count {
-        let kind = kinds[rng.range_usize(kinds.len())];
-        let material_id = pick_object_material(&mut rng);
-
-        let margin = 2.0;
-        let lx = rng.range_f32(margin, CHUNK_SIZE - margin);
-        let lz = rng.range_f32(margin, CHUNK_SIZE - margin);
-
-        let px = world_x + lx;
-        let pz = world_z + lz;
-
-        let scale = rng.range_f32(0.8, 3.0);
-
-        let r = rng.range_f32(0.3, 1.0);
-        let g = rng.range_f32(0.3, 1.0);
-        let b = rng.range_f32(0.3, 1.0);
-        let color = [r, g, b];
-
-        let mut mesh = match kind {
-            ObjectKind::Cube => make_cube(color, material_id),
-            ObjectKind::Pyramid => {
-                let h = rng.range_f32(1.0, 2.5);
-                make_pyramid(color, h, material_id)
-            }
-            ObjectKind::Column => {
-                let h = rng.range_f32(1.5, 4.0);
-                let rad = rng.range_f32(0.2, 0.6);
-                make_column(color, h, rad, material_id)
-            }
-        };
-
-        mesh.transform = [
-            [scale, 0.0, 0.0, 0.0],
-            [0.0, scale, 0.0, 0.0],
-            [0.0, 0.0, scale, 0.0],
-            [px, 0.0, pz, 1.0],
-        ];
-
-        meshes.push(mesh);
-    }
-
-    // 3. Emissive beacon - one per chunk near center.
-    //    Warm (10) or cool (11) based on chunk coordinate parity.
+    // Object A: Large cube, 8 units south of light.
+    // Should cast a clear rectangular shadow away from light.
     {
-        let emissive_id = if (cx + cz) % 2 == 0 { 10u32 } else { 11u32 };
-        let ec = if emissive_id == 10 {
-            [1.0, 0.85, 0.4]
-        } else {
-            [0.4, 0.7, 1.0]
-        };
-
-        let ex = world_x + CHUNK_SIZE * 0.5 + rng.range_f32(-4.0, 4.0);
-        let ez = world_z + CHUNK_SIZE * 0.5 + rng.range_f32(-4.0, 4.0);
-
-        let mut beacon = make_emissive_pedestal(ec, emissive_id);
-        beacon.transform = [
-            [2.0, 0.0, 0.0, 0.0],
-            [0.0, 2.0, 0.0, 0.0],
-            [0.0, 0.0, 2.0, 0.0],
-            [ex, 0.0, ez, 1.0],
+        let mut m = make_cube([0.9, 0.9, 0.9], 2); // polished_metal
+        let scale = 3.0;
+        m.transform = [
+            [scale, 0.0,   0.0,   0.0],
+            [0.0,   scale, 0.0,   0.0],
+            [0.0,   0.0,   scale, 0.0],
+            [center_x, 0.0, center_z + 8.0, 1.0],
         ];
-        meshes.push(beacon);
+        meshes.push(m);
     }
+
+    // Object B: Tall column, 10 units east of light.
+    // Should cast a long thin shadow.
+    {
+        let mut m = make_column([0.8, 0.3, 0.3], 6.0, 0.5, 5); // ceramic_red
+        let scale = 2.0;
+        m.transform = [
+            [scale, 0.0,   0.0,   0.0],
+            [0.0,   scale, 0.0,   0.0],
+            [0.0,   0.0,   scale, 0.0],
+            [center_x + 10.0, 0.0, center_z, 1.0],
+        ];
+        meshes.push(m);
+    }
+
+    // Object C: Pyramid, 9 units west of light.
+    // Triangular shadow silhouette.
+    {
+        let mut m = make_pyramid([0.3, 0.5, 0.9], 2.0, 6); // ceramic_blue
+        let scale = 4.0;
+        m.transform = [
+            [scale, 0.0,   0.0,   0.0],
+            [0.0,   scale, 0.0,   0.0],
+            [0.0,   0.0,   scale, 0.0],
+            [center_x - 9.0, 0.0, center_z, 1.0],
+        ];
+        meshes.push(m);
+    }
+
+    // Object D: Small cube, 6 units north — close to light for short, sharp shadow.
+    {
+        let mut m = make_cube([1.0, 0.76, 0.33], 7); // gold
+        let scale = 2.0;
+        m.transform = [
+            [scale, 0.0,   0.0,   0.0],
+            [0.0,   scale, 0.0,   0.0],
+            [0.0,   0.0,   scale, 0.0],
+            [center_x, 0.0, center_z - 6.0, 1.0],
+        ];
+        meshes.push(m);
+    }
+
+    // Object E: Cube between two others — tests shadow overlap.
+    // Between A and B, at an angle.
+    {
+        let mut m = make_cube([0.5, 0.5, 0.5], 3); // rough_stone
+        let scale = 1.5;
+        m.transform = [
+            [scale, 0.0,   0.0,   0.0],
+            [0.0,   scale, 0.0,   0.0],
+            [0.0,   0.0,   scale, 0.0],
+            [center_x + 5.0, 0.0, center_z + 5.0, 1.0],
+        ];
+        meshes.push(m);
+    }
+
+    // No emissive beacon — keep the scene clean for shadow testing.
 
     meshes
 }

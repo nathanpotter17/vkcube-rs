@@ -133,14 +133,14 @@ pub struct Camera {
     pub far: f32,
 }
 
-/// Orbit radius (world units) — close enough to see material detail.
-const ORBIT_RADIUS: f32 = 55.0;
-/// Camera height above ground — ~27° elevation gives good specular angles.
-const ORBIT_HEIGHT: f32 = 28.0;
+/// Orbit radius (world units) — close to single chunk center.
+const ORBIT_RADIUS: f32 = 25.0;        // was 55.0
+/// Camera height above ground — steep enough to see ground shadows.
+const ORBIT_HEIGHT: f32 = 18.0;        // was 28.0
 /// Look-at target Y.
-const TARGET_Y: f32 = 2.0;
+const TARGET_Y: f32 = 1.0;             // was 2.0
 /// Rotation speed (radians per second) — slow cinematic orbit.
-const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.15;
+const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.08;  // was 0.15 — slower for observation
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
@@ -242,7 +242,7 @@ impl Camera {
 
 pub type ChunkCoord = (i32, i32);
 pub const CHUNK_SIZE: f32 = 64.0;
-pub const WORLD_GRID_RADIUS: i32 = 3;
+pub const WORLD_GRID_RADIUS: i32 = 0;
 pub const MAX_STREAM_STARTS_PER_FRAME: usize = 4;
 
 // ===== Load State =====
@@ -449,12 +449,15 @@ impl Scene {
         let cos_r = self.rotation.cos();
         let sin_r = self.rotation.sin();
 
+        let center_x = 32.0; // chunk (0,0) center
+        let center_z = 32.0;
+
         self.camera.position = [
-            ORBIT_RADIUS * cos_r,
+            center_x + ORBIT_RADIUS * cos_r,
             ORBIT_HEIGHT,
-            ORBIT_RADIUS * sin_r,
+            center_z + ORBIT_RADIUS * sin_r,
         ];
-        self.camera.target = [0.0, TARGET_Y, 0.0];
+        self.camera.target = [center_x, TARGET_Y, center_z];
     }
 
     /// Unloaded chunks sorted nearest-to-camera first.
