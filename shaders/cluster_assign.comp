@@ -1,0 +1,257 @@
+// Phase 2: Cluster Light Assignment Compute Shader
+// Compile: glslangValidator -V cluster_assign.comp -o compiled/cluster_assign.comp.spv
+//
+// Each workgroup processes one cluster.  64 threads cooperatively test
+// all lights against the cluster AABB and build a per-cluster light
+// list using shared memory + global atomic allocation.
+//
+// Fast path: when light_count < 50, skips spatial culling and assigns
+// all lights to all clusters (avoiding cluster bounds overhead).
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// --------------------------------------------------------------------
+//  Constants (must match Rust-side light.rs constants)
+// --------------------------------------------------------------------
+
+#define MAX_LIGHTS_PER_CLUSTER 128
+#define CLUSTER_X 16
+#define CLUSTER_Y 9
+#define CLUSTER_Z 24
+
+// --------------------------------------------------------------------
+//  GPU types
+// --------------------------------------------------------------------
+
+struct GpuLight {
+    vec4  position_radius;
+    vec4  direction_cos_outer;
+    vec4  color_intensity;
+    uint  type_flags;
+    uint  shadow_index;
+    float falloff;
+    float cos_inner_angle;
+};
+
+struct GpuCluster {
+    uint offset;
+    uint count;
+};
+
+// --------------------------------------------------------------------
+//  Descriptor bindings (all in set 0)
+// --------------------------------------------------------------------
+
+// Binding 1: Light SSBO (read-only)
+layout(set = 0, binding = 1, std430) readonly buffer LightSSBO {
+    uint  light_count;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+    GpuLight lights[];
+} lightBuf;
+
+// Binding 2: Cluster SSBO (write)
+layout(set = 0, binding = 2, std430) buffer ClusterSSBO {
+    GpuCluster clusters[];
+} clusterBuf;
+
+// Binding 3: Light index SSBO (write)
+layout(set = 0, binding = 3, std430) buffer LightIndexSSBO {
+    uint global_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint indices[];
+} indexBuf;
+
+// Binding 4: Cluster params UBO
+layout(set = 0, binding = 4, std140) uniform ClusterParams {
+    mat4  view;
+    mat4  proj;
+    mat4  inv_proj;
+    uvec4 grid_size;    // x, y, z, total
+    vec4  z_params;     // near, far, log_ratio, _
+    uvec2 screen_size;
+    uint  light_count;
+    uint  _pad;
+} params;
+
+// --------------------------------------------------------------------
+//  Shared memory
+// --------------------------------------------------------------------
+
+shared uint s_light_count;
+shared uint s_light_indices[MAX_LIGHTS_PER_CLUSTER];
+shared uint s_global_offset;
+
+// --------------------------------------------------------------------
+//  Cluster bounds computation
+// --------------------------------------------------------------------
+
+// Convert cluster (cx, cy, cz) to an AABB in view space.
+//
+// XY bounds: derived from screen-space tile → NDC → view space via inv_proj.
+// Z bounds: logarithmic depth slicing.
+void clusterBounds(uint cx, uint cy, uint cz, out vec3 aabb_min, out vec3 aabb_max) {
+    float near = params.z_params.x;
+    float far  = params.z_params.y;
+
+    // Logarithmic depth slicing.
+    float z_near = near * pow(far / near, float(cz)     / float(params.grid_size.z));
+    float z_far  = near * pow(far / near, float(cz + 1) / float(params.grid_size.z));
+
+    // Screen-space tile bounds → NDC.
+    float tile_w = float(params.screen_size.x) / float(params.grid_size.x);
+    float tile_h = float(params.screen_size.y) / float(params.grid_size.y);
+
+    float ndc_x_min = float(cx)     * tile_w / float(params.screen_size.x) * 2.0 - 1.0;
+    float ndc_x_max = float(cx + 1) * tile_w / float(params.screen_size.x) * 2.0 - 1.0;
+    // Vulkan Y is top-down, so flip.
+    float ndc_y_min = -(float(cy + 1) * tile_h / float(params.screen_size.y) * 2.0 - 1.0);
+    float ndc_y_max = -(float(cy)     * tile_h / float(params.screen_size.y) * 2.0 - 1.0);
+
+    // Unproject NDC corners to view space at z_near and z_far.
+    // For a standard perspective projection, view-space XY at depth z:
+    //   x_view = ndc_x * (-z) / proj[0][0]
+    //   y_view = ndc_y * (-z) / proj[1][1]
+    float inv_px = 1.0 / params.proj[0][0];
+    float inv_py = 1.0 / abs(params.proj[1][1]); // abs because Vulkan Y flip
+
+    // View-space Z is negative (looking down -Z).
+    // But we work with positive Z for AABB.
+    vec3 corners[8];
+    corners[0] = vec3(ndc_x_min * z_near * inv_px, ndc_y_min * z_near * inv_py, -z_near);
+    corners[1] = vec3(ndc_x_max * z_near * inv_px, ndc_y_min * z_near * inv_py, -z_near);
+    corners[2] = vec3(ndc_x_min * z_near * inv_px, ndc_y_max * z_near * inv_py, -z_near);
+    corners[3] = vec3(ndc_x_max * z_near * inv_px, ndc_y_max * z_near * inv_py, -z_near);
+    corners[4] = vec3(ndc_x_min * z_far  * inv_px, ndc_y_min * z_far  * inv_py, -z_far);
+    corners[5] = vec3(ndc_x_max * z_far  * inv_px, ndc_y_min * z_far  * inv_py, -z_far);
+    corners[6] = vec3(ndc_x_min * z_far  * inv_px, ndc_y_max * z_far  * inv_py, -z_far);
+    corners[7] = vec3(ndc_x_max * z_far  * inv_px, ndc_y_max * z_far  * inv_py, -z_far);
+
+    aabb_min = corners[0];
+    aabb_max = corners[0];
+    for (int i = 1; i < 8; i++) {
+        aabb_min = min(aabb_min, corners[i]);
+        aabb_max = max(aabb_max, corners[i]);
+    }
+}
+
+// Sphere-AABB intersection test.
+bool sphereIntersectsAABB(vec3 center, float radius, vec3 aabb_min, vec3 aabb_max) {
+    vec3 closest = clamp(center, aabb_min, aabb_max);
+    vec3 d = center - closest;
+    return dot(d, d) <= radius * radius;
+}
+
+// --------------------------------------------------------------------
+//  Main
+// --------------------------------------------------------------------
+
+void main() {
+    uint clusterIndex = gl_WorkGroupID.x;
+
+    if (clusterIndex >= params.grid_size.w) {
+        return;
+    }
+
+    uint numLights = params.light_count;
+
+    // Initialize shared state.
+    if (gl_LocalInvocationID.x == 0) {
+        s_light_count = 0;
+
+        // Reset the global counter once (first workgroup).
+        if (clusterIndex == 0) {
+            indexBuf.global_count = 0;
+        }
+    }
+    barrier();
+    memoryBarrierBuffer();
+
+    // ---- Fast path: <50 lights → assign all to all clusters ----
+    if (numLights < 50) {
+        uint count = min(numLights, MAX_LIGHTS_PER_CLUSTER);
+
+        if (gl_LocalInvocationID.x == 0) {
+            // Allocate space in the global index buffer.
+            s_global_offset = atomicAdd(indexBuf.global_count, count);
+            clusterBuf.clusters[clusterIndex].offset = s_global_offset;
+            clusterBuf.clusters[clusterIndex].count  = count;
+        }
+        barrier();
+
+        // Each thread writes a subset of indices.
+        for (uint i = gl_LocalInvocationID.x; i < count; i += 64) {
+            indexBuf.indices[s_global_offset + i] = i;
+        }
+        return;
+    }
+
+    // ---- Standard path: spatial culling per cluster ----
+
+    // Decompose cluster index to 3D coordinates.
+    uint cz = clusterIndex / (params.grid_size.x * params.grid_size.y);
+    uint rem = clusterIndex - cz * params.grid_size.x * params.grid_size.y;
+    uint cy = rem / params.grid_size.x;
+    uint cx = rem - cy * params.grid_size.x;
+
+    // Compute cluster AABB in view space.
+    vec3 aabb_min, aabb_max;
+    clusterBounds(cx, cy, cz, aabb_min, aabb_max);
+
+    // Each thread tests a range of lights.
+    uint lightsPerThread = (numLights + 63) / 64;
+    uint startLight = gl_LocalInvocationID.x * lightsPerThread;
+    uint endLight   = min(startLight + lightsPerThread, numLights);
+
+    for (uint i = startLight; i < endLight; i++) {
+        GpuLight light = lightBuf.lights[i];
+
+        uint lightType = light.type_flags & 3u;
+
+        if (lightType == 2u) {
+            // Directional light: always affects all clusters.
+            uint idx = atomicAdd(s_light_count, 1);
+            if (idx < MAX_LIGHTS_PER_CLUSTER) {
+                s_light_indices[idx] = i;
+            }
+            continue;
+        }
+
+        // Point / spot: sphere-AABB test in view space.
+        vec3 lightPosWorld = light.position_radius.xyz;
+        float radius       = light.position_radius.w;
+
+        // Transform to view space.
+        vec4 lightPosView = params.view * vec4(lightPosWorld, 1.0);
+        vec3 lightViewPos = lightPosView.xyz;
+
+        if (sphereIntersectsAABB(lightViewPos, radius, aabb_min, aabb_max)) {
+            uint idx = atomicAdd(s_light_count, 1);
+            if (idx < MAX_LIGHTS_PER_CLUSTER) {
+                s_light_indices[idx] = i;
+            }
+        }
+    }
+
+    barrier();
+
+    // Allocate in global index buffer and write cluster entry.
+    uint count = min(s_light_count, MAX_LIGHTS_PER_CLUSTER);
+
+    if (gl_LocalInvocationID.x == 0) {
+        s_global_offset = atomicAdd(indexBuf.global_count, count);
+        clusterBuf.clusters[clusterIndex].offset = s_global_offset;
+        clusterBuf.clusters[clusterIndex].count  = count;
+    }
+    barrier();
+
+    // Copy shared indices to global buffer.
+    for (uint i = gl_LocalInvocationID.x; i < count; i += 64) {
+        indexBuf.indices[s_global_offset + i] = s_light_indices[i];
+    }
+}

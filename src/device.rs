@@ -228,9 +228,12 @@ impl DeviceContext {
                     .runtime_descriptor_array(true)
                     .shader_sampled_image_array_non_uniform_indexing(true);
 
-            // Core 1.0 features: sampler anisotropy for texture filtering.
+            // Core 1.0 features:
+            //   - sampler_anisotropy: texture filtering
+            //   - image_cube_array:   samplerCubeArray for shadow cube maps (Phase 2)
             let physical_features = vk::PhysicalDeviceFeatures::default()
-                .sampler_anisotropy(true);
+                .sampler_anisotropy(true)
+                .image_cube_array(true);
 
             let device = instance.create_device(
                 physical_device,

@@ -1,15 +1,26 @@
-//! Procedural world generation for the chunk streaming test.
+//! Procedural world generation — Phase 2 PBR showcase.
 //!
-//! Each chunk is a 64×64 world-unit tile containing:
-//!   - A ground plane quad colored by chunk coordinate
-//!   - 3–8 scattered objects (cubes, pyramids, columns) at positions
+//! Each chunk is a 64x64 world-unit tile containing:
+//!   - A ground plane quad (material 1: ground)
+//!   - 3-8 scattered objects assigned varied PBR materials (IDs 2-11)
 //!     determined by a simple hash of the chunk coordinate
 //!
-//! Everything is deterministic – regenerating a chunk at the same coord
-//! always produces identical geometry, so evicted chunks can be re-loaded
-//! without storing anything on disk.
+//! Material ID palette (must match renderer.rs MaterialLibrary):
+//!   0  = default white PBR
+//!   1  = ground (earthy, rough)
+//!   2  = polished_metal (silver, low roughness, full metallic)
+//!   3  = rough_stone (gray, high roughness)
+//!   4  = copper (orange-brown, metallic)
+//!   5  = ceramic_red (red, glossy dielectric)
+//!   6  = ceramic_blue (blue, glossy dielectric)
+//!   7  = gold (gold, metallic)
+//!   8  = rubber (dark, very rough)
+//!   9  = marble (whitish, medium roughness)
+//!   10 = emissive_warm (warm glow)
+//!   11 = emissive_cool (cool glow)
 //!
-//! Phase 1: vertices now include normals and UVs for PBR shading.
+//! Everything is deterministic - regenerating a chunk at the same coord
+//! always produces identical geometry.
 
 use crate::scene::{Mesh, Vertex, CHUNK_SIZE};
 
@@ -53,7 +64,7 @@ impl ChunkRng {
 }
 
 // ====================================================================
-//  Chunk colour palette
+//  Chunk ground colour palette
 // ====================================================================
 
 fn chunk_ground_color(cx: i32, cz: i32) -> [f32; 3] {
@@ -75,10 +86,11 @@ fn chunk_ground_color(cx: i32, cz: i32) -> [f32; 3] {
 }
 
 // ====================================================================
-//  Geometry primitives (now with normals + UVs)
+//  Geometry primitives (normals + UVs + material IDs)
 // ====================================================================
 
-/// Ground plane quad on XZ at y=0, with normal pointing UP (+Y).
+/// Ground plane quad on XZ at y=0, normal UP (+Y).
+/// Always uses material 1 (ground).
 fn make_ground_plane(cx: i32, cz: i32) -> Mesh {
     let x0 = cx as f32 * CHUNK_SIZE;
     let z0 = cz as f32 * CHUNK_SIZE;
@@ -99,12 +111,12 @@ fn make_ground_plane(cx: i32, cz: i32) -> Mesh {
         vertices,
         indices,
         transform: crate::scene::identity_matrix(),
-        material_id: 0, // default material
+        material_id: 1,
     }
 }
 
-/// Unit cube centered at origin with per-face normals and colors.
-fn make_cube(base_color: [f32; 3]) -> Mesh {
+/// Unit cube with per-face normals and vertex colors.
+fn make_cube(base_color: [f32; 3], material_id: u32) -> Mesh {
     let tint = |r: f32, g: f32, b: f32| -> [f32; 3] {
         [
             (base_color[0] * 0.5 + r * 0.5).min(1.0),
@@ -121,12 +133,12 @@ fn make_cube(base_color: [f32; 3]) -> Mesh {
     ];
 
     let face_normals: [[f32; 3]; 6] = [
-        [ 0.0,  0.0,  1.0],  // front
-        [ 0.0,  0.0, -1.0],  // back
-        [ 0.0,  1.0,  0.0],  // top
-        [ 0.0, -1.0,  0.0],  // bottom
-        [ 1.0,  0.0,  0.0],  // right
-        [-1.0,  0.0,  0.0],  // left
+        [ 0.0,  0.0,  1.0],
+        [ 0.0,  0.0, -1.0],
+        [ 0.0,  1.0,  0.0],
+        [ 0.0, -1.0,  0.0],
+        [ 1.0,  0.0,  0.0],
+        [-1.0,  0.0,  0.0],
     ];
 
     let face_colors = [
@@ -139,12 +151,12 @@ fn make_cube(base_color: [f32; 3]) -> Mesh {
     ];
 
     let face_data: [([usize; 4], usize); 6] = [
-        ([0, 1, 2, 3], 0),  // front
-        ([4, 5, 6, 7], 1),  // back
-        ([3, 2, 7, 6], 2),  // top
-        ([5, 4, 1, 0], 3),  // bottom
-        ([1, 4, 7, 2], 4),  // right
-        ([5, 0, 3, 6], 5),  // left
+        ([0, 1, 2, 3], 0),
+        ([4, 5, 6, 7], 1),
+        ([3, 2, 7, 6], 2),
+        ([5, 4, 1, 0], 3),
+        ([1, 4, 7, 2], 4),
+        ([5, 0, 3, 6], 5),
     ];
 
     let face_uvs: [[f32; 2]; 4] = [
@@ -169,12 +181,12 @@ fn make_cube(base_color: [f32; 3]) -> Mesh {
         vertices,
         indices,
         transform: crate::scene::identity_matrix(),
-        material_id: 0,
+        material_id,
     }
 }
 
 /// Four-sided pyramid with per-face normals.
-fn make_pyramid(color: [f32; 3], height: f32) -> Mesh {
+fn make_pyramid(color: [f32; 3], height: f32, material_id: u32) -> Mesh {
     let s = 0.5f32;
     let apex = [0.0, height, 0.0];
 
@@ -191,7 +203,6 @@ fn make_pyramid(color: [f32; 3], height: f32) -> Mesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // Compute normals for each triangular face.
     let faces: [([f32; 3], [f32; 3], [f32; 3], [f32; 3]); 4] = [
         (fl, fr, apex, c0),
         (fr, br, apex, c1),
@@ -228,12 +239,12 @@ fn make_pyramid(color: [f32; 3], height: f32) -> Mesh {
         vertices,
         indices,
         transform: crate::scene::identity_matrix(),
-        material_id: 0,
+        material_id,
     }
 }
 
 /// Octagonal column with per-face normals.
-fn make_column(color: [f32; 3], height: f32, radius: f32) -> Mesh {
+fn make_column(color: [f32; 3], height: f32, radius: f32, material_id: u32) -> Mesh {
     const SIDES: usize = 8;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -255,12 +266,10 @@ fn make_column(color: [f32; 3], height: f32, radius: f32) -> Mesh {
         top_ring.push([x, height, z]);
     }
 
-    // Side quads with outward normals.
     for i in 0..SIDES {
         let j = (i + 1) % SIDES;
         let base = vertices.len() as u32;
 
-        // Compute face normal: cross product of two edges.
         let mid_x = (bottom_ring[i][0] + bottom_ring[j][0]) * 0.5;
         let mid_z = (bottom_ring[i][2] + bottom_ring[j][2]) * 0.5;
         let len = (mid_x * mid_x + mid_z * mid_z).sqrt();
@@ -281,7 +290,7 @@ fn make_column(color: [f32; 3], height: f32, radius: f32) -> Mesh {
         indices.extend([base, base + 1, base + 2, base + 2, base + 3, base]);
     }
 
-    // Top cap (fan from center), normal pointing UP.
+    // Top cap fan.
     let top_normal = [0.0, 1.0, 0.0];
     let center_top = vertices.len() as u32;
     vertices.push(Vertex::full([0.0, height, 0.0], top_normal, [0.5, 0.5], top_color));
@@ -299,12 +308,18 @@ fn make_column(color: [f32; 3], height: f32, radius: f32) -> Mesh {
         vertices,
         indices,
         transform: crate::scene::identity_matrix(),
-        material_id: 0,
+        material_id,
     }
 }
 
+/// Small emissive pedestal — a short wide column that glows via
+/// emissive materials (10 or 11).
+fn make_emissive_pedestal(color: [f32; 3], material_id: u32) -> Mesh {
+    make_column(color, 0.3, 0.4, material_id)
+}
+
 // ====================================================================
-//  Math helpers (local to worldgen)
+//  Math helpers
 // ====================================================================
 
 fn cross_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -318,6 +333,18 @@ fn cross_vec3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 fn normalize_vec3(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
     if len > 0.0 { [v[0]/len, v[1]/len, v[2]/len] } else { [0.0, 1.0, 0.0] }
+}
+
+// ====================================================================
+//  Material assignment
+// ====================================================================
+
+/// Object material IDs to cycle through (excludes ground=1, emissives=10,11).
+const OBJECT_MATERIALS: [u32; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
+
+/// Pick a material ID for a scattered object based on RNG state.
+fn pick_object_material(rng: &mut ChunkRng) -> u32 {
+    OBJECT_MATERIALS[rng.range_usize(OBJECT_MATERIALS.len())]
 }
 
 // ====================================================================
@@ -335,10 +362,10 @@ pub fn generate_chunk_meshes(cx: i32, cz: i32) -> Vec<Mesh> {
     let mut rng = ChunkRng::new(cx, cz);
     let mut meshes = Vec::new();
 
-    // 1. Ground plane.
+    // 1. Ground plane (material 1).
     meshes.push(make_ground_plane(cx, cz));
 
-    // 2. Scattered objects: 3–8 per chunk.
+    // 2. Scattered objects: 3-8 per chunk with varied materials.
     let object_count = 3 + rng.range_usize(6);
 
     let world_x = cx as f32 * CHUNK_SIZE;
@@ -348,6 +375,7 @@ pub fn generate_chunk_meshes(cx: i32, cz: i32) -> Vec<Mesh> {
 
     for _ in 0..object_count {
         let kind = kinds[rng.range_usize(kinds.len())];
+        let material_id = pick_object_material(&mut rng);
 
         let margin = 2.0;
         let lx = rng.range_f32(margin, CHUNK_SIZE - margin);
@@ -364,15 +392,15 @@ pub fn generate_chunk_meshes(cx: i32, cz: i32) -> Vec<Mesh> {
         let color = [r, g, b];
 
         let mut mesh = match kind {
-            ObjectKind::Cube => make_cube(color),
+            ObjectKind::Cube => make_cube(color, material_id),
             ObjectKind::Pyramid => {
                 let h = rng.range_f32(1.0, 2.5);
-                make_pyramid(color, h)
+                make_pyramid(color, h, material_id)
             }
             ObjectKind::Column => {
                 let h = rng.range_f32(1.5, 4.0);
                 let rad = rng.range_f32(0.2, 0.6);
-                make_column(color, h, rad)
+                make_column(color, h, rad, material_id)
             }
         };
 
@@ -384,6 +412,29 @@ pub fn generate_chunk_meshes(cx: i32, cz: i32) -> Vec<Mesh> {
         ];
 
         meshes.push(mesh);
+    }
+
+    // 3. Emissive beacon - one per chunk near center.
+    //    Warm (10) or cool (11) based on chunk coordinate parity.
+    {
+        let emissive_id = if (cx + cz) % 2 == 0 { 10u32 } else { 11u32 };
+        let ec = if emissive_id == 10 {
+            [1.0, 0.85, 0.4]
+        } else {
+            [0.4, 0.7, 1.0]
+        };
+
+        let ex = world_x + CHUNK_SIZE * 0.5 + rng.range_f32(-4.0, 4.0);
+        let ez = world_z + CHUNK_SIZE * 0.5 + rng.range_f32(-4.0, 4.0);
+
+        let mut beacon = make_emissive_pedestal(ec, emissive_id);
+        beacon.transform = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+            [ex, 0.0, ez, 1.0],
+        ];
+        meshes.push(beacon);
     }
 
     meshes

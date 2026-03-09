@@ -18,6 +18,9 @@ shaders=(
     "pbr.frag:basic.frag.spv"
     "depth.frag:depth.frag.spv"
     "depth.vert:depth.vert.spv"
+    "shadow.vert:shadow.vert.spv"
+    "shadow.frag:shadow.frag.spv"
+    "cluster_assign.comp:cluster_assign.comp.spv"
 )
 
 set_avx2() {

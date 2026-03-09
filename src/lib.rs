@@ -3,6 +3,7 @@ pub mod device;
 pub mod memory;
 pub mod material;
 pub mod texture;
+pub mod light;
 pub mod pipeline;
 pub mod renderer;
 pub mod scene;

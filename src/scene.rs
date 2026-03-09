@@ -119,6 +119,9 @@ impl UniformBufferObject {
 }
 
 // ===== Camera =====
+//
+// Phase 2: elevated orbit camera.  Orbits at a fixed height and radius
+// around the world origin, looking down at ground level.
 
 pub struct Camera {
     pub position: [f32; 3],
@@ -130,11 +133,20 @@ pub struct Camera {
     pub far: f32,
 }
 
+/// Orbit radius (world units) — close enough to see material detail.
+const ORBIT_RADIUS: f32 = 55.0;
+/// Camera height above ground — ~27° elevation gives good specular angles.
+const ORBIT_HEIGHT: f32 = 28.0;
+/// Look-at target Y.
+const TARGET_Y: f32 = 2.0;
+/// Rotation speed (radians per second) — slow cinematic orbit.
+const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.15;
+
 impl Camera {
     pub fn new(aspect: f32) -> Self {
         Self {
-            position: [0.0, 3.0, 0.0],
-            target: [1.0, 3.0, 0.0],
+            position: [ORBIT_RADIUS, ORBIT_HEIGHT, 0.0],
+            target: [0.0, TARGET_Y, 0.0],
             up: [0.0, 1.0, 0.0],
             fov: 60.0,
             aspect,
@@ -340,14 +352,13 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn create_cube() -> Self {
-        // Generate a cube with per-face normals and colors.
         let face_normals: [[f32; 3]; 6] = [
-            [ 0.0,  0.0,  1.0], // front  (+Z)
-            [ 0.0,  0.0, -1.0], // back   (-Z)
-            [ 0.0,  1.0,  0.0], // top    (+Y)
-            [ 0.0, -1.0,  0.0], // bottom (-Y)
-            [ 1.0,  0.0,  0.0], // right  (+X)
-            [-1.0,  0.0,  0.0], // left   (-X)
+            [ 0.0,  0.0,  1.0],
+            [ 0.0,  0.0, -1.0],
+            [ 0.0,  1.0,  0.0],
+            [ 0.0, -1.0,  0.0],
+            [ 1.0,  0.0,  0.0],
+            [-1.0,  0.0,  0.0],
         ];
 
         let face_colors: [[f32; 3]; 6] = [
@@ -362,14 +373,13 @@ impl Mesh {
             [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5],
         ];
 
-        // Face vertex indices and UV coords for each face quad.
         let face_data: [([usize; 4], [[f32; 2]; 4]); 6] = [
-            ([0,1,2,3], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // front
-            ([4,5,6,7], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // back
-            ([3,2,7,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // top
-            ([5,4,1,0], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // bottom
-            ([1,4,7,2], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // right
-            ([5,0,3,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // left
+            ([0,1,2,3], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
+            ([4,5,6,7], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
+            ([3,2,7,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
+            ([5,4,1,0], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
+            ([1,4,7,2], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
+            ([5,0,3,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
         ];
 
         let mut vertices = Vec::new();
@@ -417,7 +427,7 @@ impl Scene {
         }
 
         println!(
-            "[Scene] Generated {} chunks ({}×{} grid), all Unloaded",
+            "[Scene] Generated {} chunks ({}x{} grid), all Unloaded",
             chunks.len(),
             WORLD_GRID_RADIUS * 2 + 1,
             WORLD_GRID_RADIUS * 2 + 1,
@@ -431,16 +441,20 @@ impl Scene {
         }
     }
 
+    /// Phase 2: elevated orbit around world origin.
     pub fn update(&mut self, delta_time: f32) {
-        self.rotation += delta_time * 30.0_f32.to_radians();
+        self.rotation += delta_time * ORBIT_SPEED_RAD_PER_SEC;
         self.frame_number += 1;
 
-        self.camera.position = [0.0, 3.0, 0.0];
-        self.camera.target = [
-            self.rotation.cos(),
-            3.0,
-            self.rotation.sin(),
+        let cos_r = self.rotation.cos();
+        let sin_r = self.rotation.sin();
+
+        self.camera.position = [
+            ORBIT_RADIUS * cos_r,
+            ORBIT_HEIGHT,
+            ORBIT_RADIUS * sin_r,
         ];
+        self.camera.target = [0.0, TARGET_Y, 0.0];
     }
 
     /// Unloaded chunks sorted nearest-to-camera first.
