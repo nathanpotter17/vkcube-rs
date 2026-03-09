@@ -25,6 +25,7 @@ pub struct DeviceContext {
     pub depth_image_view: vk::ImageView,
     pub depth_image_memory: vk::DeviceMemory,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pub min_ubo_alignment: u64,
     pub debug_utils: Option<debug_utils::Instance>,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 }
@@ -64,7 +65,7 @@ impl DeviceContext {
             let mut extension_ptrs: Vec<*const i8> = extension_names
                 .iter()
                 .map(|name| name.as_ptr())
-                .collect();;
+                .collect();
             
             // Add debug extension if validation is enabled
             let debug_ext_name = CString::new(debug_utils::NAME.to_bytes()).unwrap();
@@ -119,6 +120,8 @@ impl DeviceContext {
             
             let queue = device.get_device_queue(queue_family_index, 0);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
+            let device_properties = instance.get_physical_device_properties(physical_device);
+            let min_ubo_alignment = device_properties.limits.min_uniform_buffer_offset_alignment;
             
             let formats = surface_loader.get_physical_device_surface_formats(physical_device, surface)?;
             let surface_format = formats.first().copied().ok_or("No formats")?;
@@ -181,7 +184,7 @@ impl DeviceContext {
                 surface_format, swapchain_loader, swapchain, swapchain_images: images,
                 swapchain_image_views: views, swapchain_extent: caps.current_extent,
                 command_pool, depth_image, depth_image_view, depth_image_memory, 
-                memory_properties, debug_utils, debug_messenger,
+                memory_properties, min_ubo_alignment, debug_utils, debug_messenger,
             })
         }
     }
@@ -189,7 +192,14 @@ impl DeviceContext {
     pub fn recreate_swapchain(&mut self, width: u32, height: u32) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            
+            // Destroy old swapchain image views
             self.swapchain_image_views.iter().for_each(|&v| self.device.destroy_image_view(v, None));
+            
+            // Destroy old depth resources
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_image_memory, None);
             
             let caps = self.surface_loader.get_physical_device_surface_capabilities(self.physical_device, self.surface).unwrap();
             let extent = vk::Extent2D {
@@ -197,6 +207,7 @@ impl DeviceContext {
                 height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             };
             
+            // Recreate swapchain
             let old = self.swapchain;
             self.swapchain = self.swapchain_loader.create_swapchain(&vk::SwapchainCreateInfoKHR::default()
                 .surface(self.surface).min_image_count(caps.min_image_count + 1)
@@ -208,6 +219,7 @@ impl DeviceContext {
             
             self.swapchain_loader.destroy_swapchain(old, None);
             
+            // Recreate swapchain image views
             self.swapchain_images = self.swapchain_loader.get_swapchain_images(self.swapchain).unwrap();
             self.swapchain_image_views = self.swapchain_images.iter().map(|&img| 
                 self.device.create_image_view(&vk::ImageViewCreateInfo::default()
@@ -217,6 +229,37 @@ impl DeviceContext {
                         aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0,
                         level_count: 1, base_array_layer: 0, layer_count: 1,
                     }).image(img), None).unwrap()).collect();
+            
+            // Recreate depth image at the new extent
+            self.depth_image = self.device.create_image(&vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+                .mip_levels(1).array_layers(1).samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE), None).unwrap();
+            
+            let mem_requirements = self.device.get_image_memory_requirements(self.depth_image);
+            let memory_type_index = (0..self.memory_properties.memory_type_count)
+                .find(|&i| {
+                    (mem_requirements.memory_type_bits & (1 << i)) != 0 &&
+                    self.memory_properties.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                }).expect("No suitable memory type for depth image");
+            
+            self.depth_image_memory = self.device.allocate_memory(&vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(memory_type_index), None).unwrap();
+            
+            self.device.bind_image_memory(self.depth_image, self.depth_image_memory, 0).unwrap();
+            
+            self.depth_image_view = self.device.create_image_view(&vk::ImageViewCreateInfo::default()
+                .view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::D32_SFLOAT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH, base_mip_level: 0,
+                    level_count: 1, base_array_layer: 0, layer_count: 1,
+                }).image(self.depth_image), None).unwrap();
+            
             self.swapchain_extent = extent;
         }
     }
