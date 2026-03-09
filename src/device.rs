@@ -210,22 +210,34 @@ impl DeviceContext {
                 );
             }
 
-            // Enable VK_KHR_timeline_semaphore via Vulkan 1.2 features
-            // (available because we request API_VERSION_1_3).
-            let mut timeline_features =
-                vk::PhysicalDeviceTimelineSemaphoreFeatures::default()
-                    .timeline_semaphore(true);
-
+            // Enable Vulkan 1.2 features:
+            //   - timeline_semaphore:  async transfer completion polling
+            //   - descriptor_binding_partially_bound:  bindless texture array
+            //     slots can be unwritten without validation errors
+            //   - descriptor_binding_sampled_image_update_after_bind:
+            //     write texture descriptors after set is bound (async load)
+            //   - runtime_descriptor_array:  unbounded descriptor arrays
+            //   - shader_sampled_image_array_non_uniform_indexing:
+            //     nonuniformEXT() qualifier in fragment shader for
+            //     dynamically indexed bindless texture sampling
             let mut vk12_features =
                 vk::PhysicalDeviceVulkan12Features::default()
-                    .timeline_semaphore(true);
+                    .timeline_semaphore(true)
+                    .descriptor_binding_partially_bound(true)
+                    .descriptor_binding_sampled_image_update_after_bind(true)
+                    .runtime_descriptor_array(true)
+                    .shader_sampled_image_array_non_uniform_indexing(true);
+
+            // Core 1.0 features: sampler anisotropy for texture filtering.
+            let physical_features = vk::PhysicalDeviceFeatures::default()
+                .sampler_anisotropy(true);
 
             let device = instance.create_device(
                 physical_device,
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queue_cis)
                     .enabled_extension_names(&[swapchain::NAME.as_ptr()])
-                    .enabled_features(&vk::PhysicalDeviceFeatures::default())
+                    .enabled_features(&physical_features)
                     .push_next(&mut vk12_features),
                 None,
             )?;

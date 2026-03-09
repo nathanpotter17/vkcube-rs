@@ -14,8 +14,10 @@ BUILD_MODE=""
 
 # Shader list
 shaders=(
-    "basic.vert:basic.vert.spv"
-    "basic.frag:basic.frag.spv"
+    "pbr.vert:basic.vert.spv"
+    "pbr.frag:basic.frag.spv"
+    "depth.frag:depth.frag.spv"
+    "depth.vert:depth.vert.spv"
 )
 
 set_avx2() {

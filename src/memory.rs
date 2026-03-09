@@ -51,10 +51,13 @@ impl MemoryLocation {
     }
 }
 
-// ===== Handle =====
+// ===== Handles =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferHandle(pub(crate) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageHandle(pub(crate) u64);
 
 // ===== Helpers =====
 
@@ -221,13 +224,17 @@ struct AllocationRecord {
     size: u64,
 }
 
-/// VMA-style GPU memory allocator.
-pub struct GpuAllocator {
-    device: Device,
-    memory_properties: vk::PhysicalDeviceMemoryProperties,
-    pools: HashMap<u32, Vec<PoolBlock>>,
-    allocations: HashMap<BufferHandle, AllocationRecord>,
-    next_handle: u64,
+/// Tracks a VkImage sub-allocated from a pool block.
+struct ImageAllocationRecord {
+    image: vk::Image,
+    view: Option<vk::ImageView>,
+    memory_type_index: u32,
+    block_index: usize,
+    offset: u64,
+    size: u64,
+    format: vk::Format,
+    extent: vk::Extent3D,
+    mip_levels: u32,
 }
 
 /// Returned from [`GpuAllocator::create_buffer`].
@@ -239,6 +246,30 @@ pub struct BufferAllocation {
     pub size: u64,
     /// Non-null only for `CpuToGpu` allocations.
     pub mapped_ptr: Option<NonNull<u8>>,
+}
+
+/// Returned from [`GpuAllocator::create_image`].
+pub struct ImageAllocation {
+    pub handle: ImageHandle,
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub memory: vk::DeviceMemory,
+    pub offset: u64,
+    pub size: u64,
+    pub format: vk::Format,
+    pub extent: vk::Extent3D,
+    pub mip_levels: u32,
+}
+
+/// VMA-style GPU memory allocator.
+pub struct GpuAllocator {
+    device: Device,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pools: HashMap<u32, Vec<PoolBlock>>,
+    allocations: HashMap<BufferHandle, AllocationRecord>,
+    image_allocations: HashMap<ImageHandle, ImageAllocationRecord>,
+    next_handle: u64,
+    next_image_handle: u64,
 }
 
 impl GpuAllocator {
@@ -266,7 +297,9 @@ impl GpuAllocator {
             memory_properties,
             pools: HashMap::new(),
             allocations: HashMap::new(),
+            image_allocations: HashMap::new(),
             next_handle: 1,
+            next_image_handle: 1,
         }
     }
 
@@ -320,10 +353,135 @@ impl GpuAllocator {
         Ok(BufferAllocation { handle, buffer, memory, offset, size: mem_req.size, mapped_ptr })
     }
 
+    /// Create a `VkImage` + `VkImageView` backed by sub-allocated pool memory.
+    ///
+    /// The image is created in `UNDEFINED` layout. The caller must
+    /// transition it before use (typically via a pipeline barrier in
+    /// the transfer or graphics command buffer).
+    pub fn create_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        mip_levels: u32,
+        location: MemoryLocation,
+    ) -> Result<ImageAllocation, Box<dyn std::error::Error>> {
+        let extent = vk::Extent3D { width, height, depth: 1 };
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(extent)
+            .mip_levels(mip_levels)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = unsafe { self.device.create_image(&image_info, None)? };
+        let mem_req = unsafe { self.device.get_image_memory_requirements(image) };
+
+        let memory_type_index =
+            self.find_memory_type(mem_req.memory_type_bits, location.required_flags())?;
+        // Images are GPU-only in practice; never map.
+        let should_map = false;
+
+        let (block_index, offset, _mapped_ptr) = self.pool_alloc(
+            memory_type_index,
+            mem_req.size,
+            mem_req.alignment,
+            should_map,
+        )?;
+
+        let memory =
+            self.pools.get(&memory_type_index).unwrap()[block_index].memory;
+        unsafe {
+            self.device.bind_image_memory(image, memory, offset)?;
+        }
+
+        // Determine aspect mask from format.
+        let aspect = if format == vk::Format::D32_SFLOAT
+            || format == vk::Format::D16_UNORM
+            || format == vk::Format::D32_SFLOAT_S8_UINT
+            || format == vk::Format::D24_UNORM_S8_UINT
+        {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+
+        let view = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: aspect,
+                        base_mip_level: 0,
+                        level_count: mip_levels,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )?
+        };
+
+        let handle = ImageHandle(self.next_image_handle);
+        self.next_image_handle += 1;
+
+        self.image_allocations.insert(
+            handle,
+            ImageAllocationRecord {
+                image,
+                view: Some(view),
+                memory_type_index,
+                block_index,
+                offset,
+                size: mem_req.size,
+                format,
+                extent,
+                mip_levels,
+            },
+        );
+
+        Ok(ImageAllocation {
+            handle,
+            image,
+            view,
+            memory,
+            offset,
+            size: mem_req.size,
+            format,
+            extent,
+            mip_levels,
+        })
+    }
+
     /// Destroy a buffer and return its memory to the pool.
     pub fn free_buffer(&mut self, handle: BufferHandle) {
         if let Some(rec) = self.allocations.remove(&handle) {
             unsafe { self.device.destroy_buffer(rec.buffer, None) }
+            if let Some(blocks) = self.pools.get_mut(&rec.memory_type_index) {
+                if rec.block_index < blocks.len() {
+                    blocks[rec.block_index].free(rec.offset, rec.size);
+                }
+            }
+        }
+    }
+
+    /// Destroy an image (and its view) and return memory to the pool.
+    pub fn free_image(&mut self, handle: ImageHandle) {
+        if let Some(rec) = self.image_allocations.remove(&handle) {
+            unsafe {
+                if let Some(view) = rec.view {
+                    self.device.destroy_image_view(view, None);
+                }
+                self.device.destroy_image(rec.image, None);
+            }
             if let Some(blocks) = self.pools.get_mut(&rec.memory_type_index) {
                 if rec.block_index < blocks.len() {
                     blocks[rec.block_index].free(rec.offset, rec.size);
@@ -351,6 +509,11 @@ impl GpuAllocator {
         self.allocations.len()
     }
 
+    /// Number of live image handles.
+    pub fn live_image_count(&self) -> usize {
+        self.image_allocations.len()
+    }
+
     /// Print a compact utilisation summary to stdout.
     pub fn print_stats(&self) {
         let mut total_used: u64 = 0;
@@ -374,11 +537,12 @@ impl GpuAllocator {
             }
         }
         println!(
-            "[GpuAllocator] {} blocks, {}/{} used, {} live buffers",
+            "[GpuAllocator] {} blocks, {}/{} used, {} live buffers, {} live images",
             n_blocks,
             fmt_bytes(total_used),
             fmt_bytes(total_cap),
             self.allocations.len(),
+            self.image_allocations.len(),
         );
     }
 
@@ -421,7 +585,7 @@ impl GpuAllocator {
         Ok((idx, offset, mapped))
     }
 
-    fn find_memory_type(
+    pub fn find_memory_type(
         &self,
         type_filter: u32,
         properties: vk::MemoryPropertyFlags,
@@ -442,9 +606,18 @@ impl GpuAllocator {
 impl Drop for GpuAllocator {
     fn drop(&mut self) {
         unsafe {
+            // Destroy all live buffers.
             for (_, rec) in self.allocations.drain() {
                 self.device.destroy_buffer(rec.buffer, None);
             }
+            // Destroy all live images.
+            for (_, rec) in self.image_allocations.drain() {
+                if let Some(view) = rec.view {
+                    self.device.destroy_image_view(view, None);
+                }
+                self.device.destroy_image(rec.image, None);
+            }
+            // Free all pool blocks.
             for (_, blocks) in self.pools.drain() {
                 for block in blocks {
                     if block.mapped_ptr.is_some() {
@@ -497,7 +670,8 @@ impl RingBuffer {
             .size(total_size)
             .usage(
                 vk::BufferUsageFlags::UNIFORM_BUFFER
-                    | vk::BufferUsageFlags::VERTEX_BUFFER,
+                    | vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -582,6 +756,19 @@ impl RingBuffer {
         }
         Some(slice)
     }
+
+    /// Push a byte slice (useful for SSBO uploads).
+    pub fn push_bytes(&mut self, data: &[u8]) -> Option<RingSlice> {
+        let slice = self.push(data.len() as u64)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                slice.mapped_ptr.as_ptr(),
+                data.len(),
+            );
+        }
+        Some(slice)
+    }
 }
 
 // ====================================================================
@@ -593,10 +780,20 @@ impl RingBuffer {
 #[derive(Debug, Clone)]
 pub struct TransferTicket {
     /// The destination buffer that is being uploaded to.
-    pub dst_handle: BufferHandle,
+    pub dst_buffer_handle: Option<BufferHandle>,
+    /// The destination image that is being uploaded to (mutually exclusive with buffer).
+    pub dst_image_handle: Option<ImageHandle>,
     /// Timeline semaphore value that will be signalled when the copy
     /// command finishes on the transfer queue.
     pub timeline_value: u64,
+}
+
+// Keep backward compat: dst_handle as an alias
+impl TransferTicket {
+    /// Convenience accessor for buffer uploads (backward compat).
+    pub fn dst_handle(&self) -> Option<BufferHandle> {
+        self.dst_buffer_handle
+    }
 }
 
 /// Async transfer engine.  Owns a dedicated command pool on the transfer
@@ -727,10 +924,7 @@ impl TransferQueue {
     /// Copy `data` into a staging region and submit a transfer command
     /// that copies it into `dst_buffer`.  Returns a ticket whose
     /// `timeline_value` the caller can poll with [`is_complete`].
-    ///
-    /// The destination buffer must have been created with
-    /// `TRANSFER_DST` usage.  This function does NOT block.
-    pub fn upload_async(
+    pub fn upload_buffer_async(
         &mut self,
         data: &[u8],
         dst_buffer: vk::Buffer,
@@ -744,9 +938,7 @@ impl TransferQueue {
             self.staging_size,
         );
 
-        // Wrap around the staging ring if needed.  In production you'd
-        // track per-region fences; for now a simple wrap is enough since
-        // we only allow one staging_size worth of in-flight data.
+        // Wrap around the staging ring if needed.
         if self.staging_offset + size > self.staging_size {
             self.staging_offset = 0;
         }
@@ -816,13 +1008,207 @@ impl TransferQueue {
             self.device.end_command_buffer(cmd)?;
         }
 
-        // Submit with timeline signal.
+        self.submit_timeline(cmd)
+            .map(|timeline_value| TransferTicket {
+                dst_buffer_handle: Some(dst_handle),
+                dst_image_handle: None,
+                timeline_value,
+            })
+    }
+
+    /// Upload pixel data to a VkImage via the staging ring.
+    ///
+    /// The image must be in `UNDEFINED` or `PREINITIALIZED` layout.
+    /// After the copy the image will be in `TRANSFER_DST_OPTIMAL` layout.
+    /// The caller must transition to `SHADER_READ_ONLY_OPTIMAL` on the
+    /// graphics queue (an acquire barrier if dedicated transfer, or a
+    /// simple layout transition otherwise).
+    pub fn upload_image_async(
+        &mut self,
+        data: &[u8],
+        dst_image: vk::Image,
+        dst_handle: ImageHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<TransferTicket, Box<dyn std::error::Error>> {
+        let size = data.len() as u64;
+        assert!(
+            size <= self.staging_size,
+            "Image upload {} B exceeds staging belt {} B",
+            size,
+            self.staging_size,
+        );
+
+        if self.staging_offset + size > self.staging_size {
+            self.staging_offset = 0;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging_mapped.as_ptr().add(self.staging_offset as usize),
+                data.len(),
+            );
+        }
+
+        let staging_offset = self.staging_offset;
+        self.staging_offset += align_up(size, 64);
+
+        let cmd = unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            self.device.allocate_command_buffers(&info)?[0]
+        };
+
+        unsafe {
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            // Transition UNDEFINED → TRANSFER_DST_OPTIMAL.
+            let barrier_to_transfer = vk::ImageMemoryBarrier::default()
+                .image(dst_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_to_transfer),
+            );
+
+            // Copy staging buffer → image.
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(staging_offset)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                self.staging_buffer,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+
+            // If dedicated transfer, release ownership.
+            // The graphics queue must acquire and transition to
+            // SHADER_READ_ONLY_OPTIMAL.
+            if self.is_dedicated {
+                let release = vk::ImageMemoryBarrier::default()
+                    .image(dst_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(self.queue_family_index)
+                    .dst_queue_family_index(self.graphics_family_index)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&release),
+                );
+            } else {
+                // Same family: just transition directly.
+                let barrier_to_shader = vk::ImageMemoryBarrier::default()
+                    .image(dst_image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&barrier_to_shader),
+                );
+            }
+
+            self.device.end_command_buffer(cmd)?;
+        }
+
+        self.submit_timeline(cmd)
+            .map(|timeline_value| TransferTicket {
+                dst_buffer_handle: None,
+                dst_image_handle: Some(dst_handle),
+                timeline_value,
+            })
+    }
+
+    /// Backward-compatible wrapper: upload buffer async.
+    pub fn upload_async(
+        &mut self,
+        data: &[u8],
+        dst_buffer: vk::Buffer,
+        dst_handle: BufferHandle,
+    ) -> Result<TransferTicket, Box<dyn std::error::Error>> {
+        self.upload_buffer_async(data, dst_buffer, dst_handle)
+    }
+
+    /// Submit a recorded command buffer with timeline signal.
+    /// Returns the timeline value.
+    fn submit_timeline(
+        &mut self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         let timeline_value = self.next_timeline;
         self.next_timeline += 1;
 
         let binding = [timeline_value];
-         let mut timeline_submit = vk::TimelineSemaphoreSubmitInfo::default()
-             .signal_semaphore_values(&binding);
+        let mut timeline_submit = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&binding);
 
         let signal_sems = [self.timeline_semaphore];
         let cmd_bufs = [cmd];
@@ -840,10 +1226,7 @@ impl TransferQueue {
             )?;
         }
 
-        Ok(TransferTicket {
-            dst_handle,
-            timeline_value,
-        })
+        Ok(timeline_value)
     }
 
     /// Check whether a particular transfer has finished on the GPU.
@@ -860,9 +1243,9 @@ impl TransferQueue {
     pub fn wait_for(&self, ticket: &TransferTicket, timeout_ns: u64) -> Result<(), vk::Result> {
         let binding = [ticket.timeline_value];
         let ts = [self.timeline_semaphore];
-         let wait_info = vk::SemaphoreWaitInfo::default()
-             .semaphores(&ts)
-             .values(&binding);
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&ts)
+            .values(&binding);
         unsafe { self.device.wait_semaphores(&wait_info, timeout_ns) }
     }
 
@@ -872,8 +1255,7 @@ impl TransferQueue {
         self.timeline_semaphore
     }
 
-    /// Drain the command pool.  Call after waiting idle or when all
-    /// in-flight transfers are known complete.
+    /// Drain the command pool.
     pub fn reset_pool(&self) {
         unsafe {
             let _ = self.device.reset_command_pool(
@@ -906,20 +1288,15 @@ impl Drop for TransferQueue {
 struct UsageRecord {
     handle: BufferHandle,
     size: u64,
-    /// Frame number when this handle was last referenced in a draw call.
     last_used_frame: u64,
 }
 
 /// Tracks VRAM consumption against the device-local heap budget and
 /// provides LRU eviction for streamable assets.
 pub struct MemoryBudget {
-    /// Budget cap in bytes (derived from heap size × ratio).
     budget_bytes: u64,
-    /// Device-local heap index (for logging/queries).
     #[allow(dead_code)]
     device_local_heap: u32,
-    /// Per-handle tracking.  Only *evictable* handles are inserted here
-    /// (i.e. chunk mesh data, not the ring buffer or staging belt).
     usage: HashMap<BufferHandle, UsageRecord>,
 }
 
@@ -927,7 +1304,6 @@ impl MemoryBudget {
     pub fn new(
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
     ) -> Self {
-        // Find the device-local heap and derive a budget.
         let (heap_idx, heap_size) = (0..memory_properties.memory_heap_count as usize)
             .find_map(|i| {
                 let heap = memory_properties.memory_heaps[i];
@@ -935,7 +1311,7 @@ impl MemoryBudget {
                     .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
                     .then_some((i as u32, heap.size))
             })
-            .unwrap_or((0, 256 * 1024 * 1024)); // 256 MB fallback
+            .unwrap_or((0, 256 * 1024 * 1024));
 
         let budget_bytes = (heap_size as f64 * VRAM_BUDGET_RATIO) as u64;
 
@@ -954,39 +1330,27 @@ impl MemoryBudget {
         }
     }
 
-    /// Register an evictable buffer.
     pub fn track(&mut self, handle: BufferHandle, size: u64, current_frame: u64) {
         self.usage.insert(
             handle,
-            UsageRecord {
-                handle,
-                size,
-                last_used_frame: current_frame,
-            },
+            UsageRecord { handle, size, last_used_frame: current_frame },
         );
     }
 
-    /// Mark a handle as used this frame (call during draw submission).
     pub fn touch(&mut self, handle: BufferHandle, current_frame: u64) {
         if let Some(rec) = self.usage.get_mut(&handle) {
             rec.last_used_frame = current_frame;
         }
     }
 
-    /// Remove tracking for a handle (after eviction or explicit free).
     pub fn untrack(&mut self, handle: BufferHandle) {
         self.usage.remove(&handle);
     }
 
-    /// Returns `true` when tracked allocations exceed the budget.
     pub fn is_over_budget(&self, current_pool_usage: u64) -> bool {
         current_pool_usage > self.budget_bytes
     }
 
-    /// Evict the least-recently-used handles until we're under budget.
-    /// Returns the list of handles that should be freed by the caller
-    /// (the caller is responsible for destroying the VkBuffers and
-    /// updating chunk load states).
     pub fn evict_lru(
         &mut self,
         current_pool_usage: u64,
@@ -997,7 +1361,6 @@ impl MemoryBudget {
             return Vec::new();
         }
 
-        // Sort tracked handles by last_used_frame ascending (oldest first).
         let mut candidates: Vec<&UsageRecord> = self
             .usage
             .values()
@@ -1017,7 +1380,6 @@ impl MemoryBudget {
             evicted.push(rec.handle);
         }
 
-        // Remove evicted entries from tracking.
         for &h in &evicted {
             self.usage.remove(&h);
         }
@@ -1033,7 +1395,6 @@ impl MemoryBudget {
         evicted
     }
 
-    /// Total tracked evictable bytes.
     pub fn tracked_bytes(&self) -> u64 {
         self.usage.values().map(|r| r.size).sum()
     }
@@ -1053,8 +1414,7 @@ pub struct MemoryContext {
     pub transfer: TransferQueue,
     pub budget: MemoryBudget,
 
-    // Legacy synchronous staging belt (kept for simple init-time uploads
-    // that don't need async).
+    // Legacy synchronous staging belt
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_mapped: NonNull<u8>,
@@ -1143,13 +1503,9 @@ impl MemoryContext {
     }
 
     // ----------------------------------------------------------------
-    //  Async upload path (for streaming chunks)
+    //  Async buffer upload (for streaming chunks)
     // ----------------------------------------------------------------
 
-    /// Allocate a device-local buffer and kick off an async transfer.
-    /// Returns the `BufferAllocation` (immediately usable for binding)
-    /// and a `TransferTicket` that must be polled before the buffer
-    /// contents are valid.
     pub fn upload_async(
         &mut self,
         data: &[u8],
@@ -1161,7 +1517,7 @@ impl MemoryContext {
             MemoryLocation::GpuOnly,
         )?;
 
-        let ticket = self.transfer.upload_async(
+        let ticket = self.transfer.upload_buffer_async(
             data,
             alloc.buffer,
             alloc.handle,
@@ -1170,7 +1526,6 @@ impl MemoryContext {
         Ok((alloc, ticket))
     }
 
-    /// Typed version of [`upload_async`].
     pub fn upload_async_typed<T: Copy>(
         &mut self,
         data: &[T],
@@ -1186,11 +1541,45 @@ impl MemoryContext {
     }
 
     // ----------------------------------------------------------------
+    //  Async image upload (Phase 1: texture streaming)
+    // ----------------------------------------------------------------
+
+    /// Allocate a device-local VkImage and kick off an async transfer.
+    /// Returns the `ImageAllocation` and a `TransferTicket`.
+    /// After the ticket completes, the image is in
+    /// `SHADER_READ_ONLY_OPTIMAL` (or `TRANSFER_DST_OPTIMAL` if
+    /// dedicated transfer — caller must issue acquire barrier).
+    pub fn upload_image_async(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<(ImageAllocation, TransferTicket), Box<dyn std::error::Error>> {
+        let alloc = self.allocator.create_image(
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            1, // mip_levels
+            MemoryLocation::GpuOnly,
+        )?;
+
+        let ticket = self.transfer.upload_image_async(
+            data,
+            alloc.image,
+            alloc.handle,
+            width,
+            height,
+        )?;
+
+        Ok((alloc, ticket))
+    }
+
+    // ----------------------------------------------------------------
     //  Synchronous upload path (for init-time data)
     // ----------------------------------------------------------------
 
-    /// Create a device-local buffer and upload `data` synchronously via
-    /// the legacy staging belt.
     pub fn create_buffer_with_data(
         &mut self,
         data: &[u8],
@@ -1256,7 +1645,6 @@ impl MemoryContext {
         Ok(alloc)
     }
 
-    /// Create a device-local buffer from a typed slice (synchronous).
     pub fn create_typed_buffer<T: Copy>(
         &mut self,
         data: &[T],
@@ -1271,6 +1659,135 @@ impl MemoryContext {
             )
         };
         self.create_buffer_with_data(bytes, usage, command_pool, queue)
+    }
+
+    /// Create a device-local VkImage and upload pixel data synchronously.
+    /// Returns the image in `SHADER_READ_ONLY_OPTIMAL` layout.
+    pub fn create_image_with_data(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<ImageAllocation, Box<dyn std::error::Error>> {
+        let size = data.len() as u64;
+        assert!(size <= self.staging_size);
+
+        let alloc = self.allocator.create_image(
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            1,
+            MemoryLocation::GpuOnly,
+        )?;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging_mapped.as_ptr(),
+                data.len(),
+            );
+
+            let cmd_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = self.device.allocate_command_buffers(&cmd_info)?[0];
+
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            // UNDEFINED → TRANSFER_DST_OPTIMAL
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(alloc.image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier),
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                self.staging_buffer,
+                alloc.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+
+            // TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+            let barrier2 = vk::ImageMemoryBarrier::default()
+                .image(alloc.image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier2),
+            );
+
+            self.device.end_command_buffer(cmd)?;
+
+            let submit =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            self.device
+                .queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+            self.device.queue_wait_idle(queue)?;
+
+            self.device
+                .free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        }
+
+        Ok(alloc)
     }
 }
 

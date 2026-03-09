@@ -1,6 +1,9 @@
 pub mod event;
 pub mod device;
 pub mod memory;
+pub mod material;
+pub mod texture;
+pub mod pipeline;
 pub mod renderer;
 pub mod scene;
 pub mod worldgen;

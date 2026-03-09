@@ -2,20 +2,92 @@ use ash::vk;
 use std::collections::HashMap;
 use crate::memory::{BufferHandle, TransferTicket};
 
-// ===== Vertex & UBO =====
+// ===== Vertex =====
+//
+// Phase 1 vertex format: position + normal + UV + color.
+// Matches the PBR pipeline's vertex input layout.
+// Total: 12 + 12 + 8 + 12 = 44 bytes per vertex.
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex {
     pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
     pub color: [f32; 3],
 }
 
 impl Vertex {
     pub fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-        Self { position, color }
+        Self {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            color,
+        }
+    }
+
+    pub fn with_normal(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Self {
+        Self {
+            position,
+            normal,
+            uv: [0.0, 0.0],
+            color,
+        }
+    }
+
+    pub fn full(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv: [f32; 2],
+        color: [f32; 3],
+    ) -> Self {
+        Self { position, normal, uv, color }
+    }
+
+    /// Vulkan vertex input binding description for binding 0.
+    pub fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<Self>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+    }
+
+    /// Vulkan vertex input attribute descriptions.
+    ///   location 0: position (vec3, offset 0)
+    ///   location 1: normal   (vec3, offset 12)
+    ///   location 2: uv       (vec2, offset 24)
+    ///   location 3: color    (vec3, offset 32)
+    pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
+        [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(12),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(24),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(32),
+        ]
     }
 }
+
+// ===== UBO =====
+//
+// Phase 1 per-draw UBO: model/view/proj matrices + material index.
+// Bound via dynamic offset from the ring buffer (descriptor set 3).
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +95,27 @@ pub struct UniformBufferObject {
     pub model: [[f32; 4]; 4],
     pub view: [[f32; 4]; 4],
     pub proj: [[f32; 4]; 4],
+    /// Index into the material SSBO (set 0, binding 5).
+    pub material_id: u32,
+    /// Padding to align to 16 bytes (3 floats = 12 bytes).
+    pub _pad: [u32; 3],
+}
+
+impl UniformBufferObject {
+    pub fn new(
+        model: [[f32; 4]; 4],
+        view: [[f32; 4]; 4],
+        proj: [[f32; 4]; 4],
+        material_id: u32,
+    ) -> Self {
+        Self {
+            model,
+            view,
+            proj,
+            material_id,
+            _pad: [0; 3],
+        }
+    }
 }
 
 // ===== Camera =====
@@ -103,8 +196,6 @@ impl Camera {
 
     /// Gribb-Hartmann frustum plane extraction.
     pub fn extract_frustum_planes(&self) -> [[f32; 4]; 6] {
-        // multiply_matrices(A, B) computes B*A in our column-major layout,
-        // so pass (view, proj) to get Proj * View.
         let vp = multiply_matrices(
             self.get_view_matrix(),
             self.get_projection_matrix(),
@@ -163,7 +254,6 @@ pub struct Chunk {
     pub vertex_handle: Option<BufferHandle>,
     pub index_handle: Option<BufferHandle>,
 
-    /// Raw VkBuffer objects for cmd_bind_vertex_buffers / cmd_bind_index_buffer.
     pub vertex_vk_buffer: Option<vk::Buffer>,
     pub index_vk_buffer: Option<vk::Buffer>,
 
@@ -244,32 +334,64 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub transform: [[f32; 4]; 4],
+    /// Index into the global MaterialLibrary.  0 = default PBR material.
+    pub material_id: u32,
 }
 
 impl Mesh {
     pub fn create_cube() -> Self {
-        let positions = [
-            [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
-            [0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5],
+        // Generate a cube with per-face normals and colors.
+        let face_normals: [[f32; 3]; 6] = [
+            [ 0.0,  0.0,  1.0], // front  (+Z)
+            [ 0.0,  0.0, -1.0], // back   (-Z)
+            [ 0.0,  1.0,  0.0], // top    (+Y)
+            [ 0.0, -1.0,  0.0], // bottom (-Y)
+            [ 1.0,  0.0,  0.0], // right  (+X)
+            [-1.0,  0.0,  0.0], // left   (-X)
         ];
-        let face_colors = [
+
+        let face_colors: [[f32; 3]; 6] = [
             [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
             [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0],
         ];
-        let face_data = [
-            ([0,1,2,3], 0), ([4,5,6,7], 1), ([3,2,7,6], 2),
-            ([5,4,1,0], 3), ([1,4,7,2], 4), ([5,0,3,6], 5),
+
+        let positions: [[f32; 3]; 8] = [
+            [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5],
+            [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+            [ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5],
+            [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5],
         ];
+
+        // Face vertex indices and UV coords for each face quad.
+        let face_data: [([usize; 4], [[f32; 2]; 4]); 6] = [
+            ([0,1,2,3], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // front
+            ([4,5,6,7], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // back
+            ([3,2,7,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // top
+            ([5,4,1,0], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // bottom
+            ([1,4,7,2], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // right
+            ([5,0,3,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]), // left
+        ];
+
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        for (face_idx, color_idx) in face_data {
+
+        for (face_idx, (pos_indices, uvs)) in face_data.iter().enumerate() {
             let base = vertices.len() as u32;
-            for &idx in face_idx.iter() {
-                vertices.push(Vertex::new(positions[idx], face_colors[color_idx]));
+            let normal = face_normals[face_idx];
+            let color = face_colors[face_idx];
+
+            for (vi, &pos_idx) in pos_indices.iter().enumerate() {
+                vertices.push(Vertex::full(positions[pos_idx], normal, uvs[vi], color));
             }
             indices.extend([base, base+1, base+2, base+2, base+3, base]);
         }
-        Self { vertices, indices, transform: identity_matrix() }
+
+        Self {
+            vertices,
+            indices,
+            transform: identity_matrix(),
+            material_id: 0,
+        }
     }
 }
 
@@ -310,12 +432,9 @@ impl Scene {
     }
 
     pub fn update(&mut self, delta_time: f32) {
-        self.rotation += delta_time * 30.0_f32.to_radians(); // ~30°/sec → full 360° in 12 sec
+        self.rotation += delta_time * 30.0_f32.to_radians();
         self.frame_number += 1;
 
-        // Stand at the origin, 3 units above ground, rotate to look
-        // outward horizontally.  This ensures many chunks are behind
-        // the camera at any given moment and get frustum-culled.
         self.camera.position = [0.0, 3.0, 0.0];
         self.camera.target = [
             self.rotation.cos(),
@@ -352,12 +471,13 @@ impl Scene {
         self.chunks.values().filter(|c| c.is_ready() && c.is_visible(frustum)).collect()
     }
 
-    pub fn get_ubo(&self) -> UniformBufferObject {
-        UniformBufferObject {
-            model: identity_matrix(),
-            view: self.camera.get_view_matrix(),
-            proj: self.camera.get_projection_matrix(),
-        }
+    pub fn get_ubo(&self, material_id: u32) -> UniformBufferObject {
+        UniformBufferObject::new(
+            identity_matrix(),
+            self.camera.get_view_matrix(),
+            self.camera.get_projection_matrix(),
+            material_id,
+        )
     }
 }
 
