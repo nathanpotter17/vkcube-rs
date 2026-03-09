@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n╔════════════════════════════════════╗");
     println!("║        VULKAN RENDERER             ║");
     println!("║   VMA-Style Memory Architecture    ║");
+    println!("║   + Async Streaming & Budgeting    ║");
     println!("╚════════════════════════════════════╝");
 
     // SDL2
@@ -23,17 +24,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vulkan()
         .build()?;
 
-    // Vulkan device
+    // Vulkan device (now discovers dedicated transfer queue)
     let mut device_context = DeviceContext::new(&window, ENABLE_VALIDATION)?;
-    println!("✓ Device initialized (UBO alignment: {})", device_context.min_ubo_alignment);
+    println!(
+        "✓ Device initialized (UBO alignment: {}, dedicated transfer: {})",
+        device_context.min_ubo_alignment,
+        device_context.has_dedicated_transfer,
+    );
 
-    // Memory system: pool allocator + ring buffer + staging belt
+    // Memory system: pool allocator + ring buffer + transfer queue + budget
     let memory_ctx = MemoryContext::new(
         device_context.device.clone(),
         device_context.memory_properties,
         device_context.min_ubo_alignment,
+        device_context.transfer_queue,
+        device_context.transfer_queue_family_index,
+        device_context.queue_family_index,
     )?;
-    println!("✓ Memory system initialized");
+    println!("✓ Memory system initialized (with async transfer + budget)");
 
     // Renderer (takes ownership of MemoryContext)
     let mut renderer = Renderer::new(&device_context, memory_ctx)?;

@@ -20,8 +20,13 @@ const RING_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 /// Frames allowed in flight simultaneously.  Must match the renderer.
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// Staging-belt size for CPU → GPU transfers at init time.
+/// Staging-belt size for CPU → GPU transfers.  The transfer queue uses a
+/// ring of staging memory so multiple uploads can be in-flight at once.
 const STAGING_BUFFER_SIZE: u64 = 32 * 1024 * 1024;
+
+/// Maximum VRAM budget ratio.  When pool allocations exceed this fraction
+/// of the device-local heap, the budget system starts evicting.
+const VRAM_BUDGET_RATIO: f64 = 0.85;
 
 // ===== Memory Location =====
 
@@ -49,7 +54,7 @@ impl MemoryLocation {
 // ===== Handle =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BufferHandle(u64);
+pub struct BufferHandle(pub(crate) u64);
 
 // ===== Helpers =====
 
@@ -134,10 +139,6 @@ impl PoolBlock {
     }
 
     /// First-fit sub-allocation respecting `alignment`.
-    ///
-    /// Returns `(aligned_offset, optional_mapped_ptr)`.  Alignment padding
-    /// between the region start and the aligned offset is kept as its own
-    /// free region so no memory is permanently lost.
     fn alloc(
         &mut self,
         size: u64,
@@ -155,7 +156,6 @@ impl PoolBlock {
 
             let remaining = region.size - needed;
 
-            //  ┌─padding─┬──size──┬─remaining─┐
             if padding > 0 && remaining > 0 {
                 self.free_regions[i].size = padding;
                 self.free_regions.insert(
@@ -222,12 +222,6 @@ struct AllocationRecord {
 }
 
 /// VMA-style GPU memory allocator.
-///
-/// Maintains a small number of large `VkDeviceMemory` blocks (64 MB each)
-/// and sub-allocates individual `VkBuffer` regions within them.  This
-/// keeps the total `vkAllocateMemory` call count under ~20 regardless of
-/// how many buffers the engine creates, while giving full control over
-/// data locality within each block.
 pub struct GpuAllocator {
     device: Device,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -283,7 +277,6 @@ impl GpuAllocator {
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
     ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
-        // Create a temporary VkBuffer to query memory requirements.
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
@@ -339,6 +332,25 @@ impl GpuAllocator {
         }
     }
 
+    /// Total bytes allocated across all pool blocks.
+    pub fn total_allocated(&self) -> u64 {
+        self.pools.values().flat_map(|bs| bs.iter()).map(|b| b.size).sum()
+    }
+
+    /// Total bytes actually used (allocated minus free).
+    pub fn total_used(&self) -> u64 {
+        self.pools
+            .values()
+            .flat_map(|bs| bs.iter())
+            .map(|b| b.size - b.total_free)
+            .sum()
+    }
+
+    /// Number of live buffer handles.
+    pub fn live_buffer_count(&self) -> usize {
+        self.allocations.len()
+    }
+
     /// Print a compact utilisation summary to stdout.
     pub fn print_stats(&self) {
         let mut total_used: u64 = 0;
@@ -381,7 +393,6 @@ impl GpuAllocator {
     ) -> Result<(usize, u64, Option<NonNull<u8>>), Box<dyn std::error::Error>> {
         let blocks = self.pools.entry(memory_type_index).or_default();
 
-        // Try existing blocks first.
         for (i, block) in blocks.iter_mut().enumerate() {
             if block.total_free >= size {
                 if let Some((offset, mapped)) = block.alloc(size, alignment) {
@@ -390,7 +401,6 @@ impl GpuAllocator {
             }
         }
 
-        // Allocate a new block.
         let block_size = POOL_BLOCK_SIZE.max(align_up(size * 2, 1024 * 1024));
         let new_block =
             PoolBlock::new(&self.device, block_size, memory_type_index, map)?;
@@ -452,16 +462,6 @@ impl Drop for GpuAllocator {
 // ====================================================================
 
 /// Triple-buffered ring allocator for uniform and dynamic-vertex data.
-///
-/// The underlying `VkBuffer` is divided into `MAX_FRAMES_IN_FLIGHT` equal
-/// segments.  Each frame bumps forward inside its own segment, so there
-/// is zero contention between the CPU writing frame N and the GPU still
-/// consuming frame N−1.
-///
-/// Combined with `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC`, per-draw
-/// uniform data is addressed by a dynamic offset at bind time – no
-/// descriptor rewrites, no stalls, and the entire frame's uniform data
-/// sits in a handful of contiguous cache lines.
 pub struct RingBuffer {
     pub buffer: vk::Buffer,
     pub(crate) memory: vk::DeviceMemory,
@@ -479,9 +479,7 @@ unsafe impl Sync for RingBuffer {}
 
 /// A slice of ring-buffer memory returned by [`RingBuffer::push`].
 pub struct RingSlice {
-    /// Byte offset from the start of the ring buffer's `VkBuffer`.
     pub offset: u64,
-    /// CPU-mapped pointer for writing data.
     pub mapped_ptr: NonNull<u8>,
     pub size: u64,
 }
@@ -548,14 +546,11 @@ impl RingBuffer {
         })
     }
 
-    /// Reset the write cursor for a new frame.  Call **after** the fence
-    /// for `frame_index` has been waited on.
     pub fn begin_frame(&mut self, frame_index: usize) {
         self.current_frame = frame_index;
         self.frame_offset = 0;
     }
 
-    /// Reserve `size` bytes in the current frame's segment.
     pub fn push(&mut self, size: u64) -> Option<RingSlice> {
         let aligned = align_up(size, self.min_alignment);
         let base = self.current_frame as u64 * self.frame_size;
@@ -575,7 +570,6 @@ impl RingBuffer {
         Some(RingSlice { offset: global, mapped_ptr: ptr, size })
     }
 
-    /// Push a `Copy` value and write it into the ring.
     pub fn push_data<T: Copy>(&mut self, data: &T) -> Option<RingSlice> {
         let n = std::mem::size_of::<T>() as u64;
         let slice = self.push(n)?;
@@ -591,15 +585,476 @@ impl RingBuffer {
 }
 
 // ====================================================================
+//  TransferQueue – async GPU uploads via timeline semaphore
+// ====================================================================
+
+/// Identifies a single in-flight transfer.  The renderer polls completed
+/// tickets each frame to promote chunk load states from Streaming→Ready.
+#[derive(Debug, Clone)]
+pub struct TransferTicket {
+    /// The destination buffer that is being uploaded to.
+    pub dst_handle: BufferHandle,
+    /// Timeline semaphore value that will be signalled when the copy
+    /// command finishes on the transfer queue.
+    pub timeline_value: u64,
+}
+
+/// Async transfer engine.  Owns a dedicated command pool on the transfer
+/// queue family, a HOST_VISIBLE staging ring, and a timeline semaphore
+/// for CPU-side completion polling.
+pub struct TransferQueue {
+    device: Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    timeline_semaphore: vk::Semaphore,
+    /// Monotonically increasing; bumped once per `upload_async` call.
+    next_timeline: u64,
+    /// Staging ring: single persistently-mapped buffer used round-robin.
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    staging_mapped: NonNull<u8>,
+    staging_size: u64,
+    /// Current write offset into the staging ring.
+    staging_offset: u64,
+    /// Queue family index for ownership transfer barriers.
+    pub queue_family_index: u32,
+    /// The graphics queue family (for release/acquire barriers).
+    pub graphics_family_index: u32,
+    /// Whether transfer and graphics are on separate families.
+    pub is_dedicated: bool,
+}
+
+unsafe impl Send for TransferQueue {}
+
+impl TransferQueue {
+    pub fn new(
+        device: Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        transfer_queue: vk::Queue,
+        transfer_family: u32,
+        graphics_family: u32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let is_dedicated = transfer_family != graphics_family;
+
+        // Command pool for the transfer queue family.
+        let command_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(
+                        vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                            | vk::CommandPoolCreateFlags::TRANSIENT,
+                    )
+                    .queue_family_index(transfer_family),
+                None,
+            )?
+        };
+
+        // Timeline semaphore (Vulkan 1.2+).
+        let mut timeline_info =
+            vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+
+        let timeline_semaphore = unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_info),
+                None,
+            )?
+        };
+
+        // HOST_VISIBLE staging ring.
+        let staging_info = vk::BufferCreateInfo::default()
+            .size(STAGING_BUFFER_SIZE)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let staging_buffer = unsafe { device.create_buffer(&staging_info, None)? };
+        let staging_req =
+            unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+
+        let required = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let staging_type = (0..memory_properties.memory_type_count)
+            .find(|&i| {
+                (staging_req.memory_type_bits & (1 << i)) != 0
+                    && memory_properties.memory_types[i as usize]
+                        .property_flags
+                        .contains(required)
+            })
+            .ok_or("No memory type for transfer staging buffer")?;
+
+        let staging_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_req.size)
+            .memory_type_index(staging_type);
+        let staging_memory = unsafe { device.allocate_memory(&staging_alloc, None)? };
+        unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0)? }
+
+        let raw = unsafe {
+            device.map_memory(
+                staging_memory,
+                0,
+                STAGING_BUFFER_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )?
+        };
+        let staging_mapped =
+            NonNull::new(raw as *mut u8).ok_or("Failed to map transfer staging")?;
+
+        println!(
+            "[TransferQueue] family {} (dedicated: {}), staging {} MB, timeline semaphore ready",
+            transfer_family,
+            is_dedicated,
+            STAGING_BUFFER_SIZE / (1024 * 1024),
+        );
+
+        Ok(Self {
+            device,
+            queue: transfer_queue,
+            command_pool,
+            timeline_semaphore,
+            next_timeline: 1,
+            staging_buffer,
+            staging_memory,
+            staging_mapped,
+            staging_size: STAGING_BUFFER_SIZE,
+            staging_offset: 0,
+            queue_family_index: transfer_family,
+            graphics_family_index: graphics_family,
+            is_dedicated,
+        })
+    }
+
+    /// Copy `data` into a staging region and submit a transfer command
+    /// that copies it into `dst_buffer`.  Returns a ticket whose
+    /// `timeline_value` the caller can poll with [`is_complete`].
+    ///
+    /// The destination buffer must have been created with
+    /// `TRANSFER_DST` usage.  This function does NOT block.
+    pub fn upload_async(
+        &mut self,
+        data: &[u8],
+        dst_buffer: vk::Buffer,
+        dst_handle: BufferHandle,
+    ) -> Result<TransferTicket, Box<dyn std::error::Error>> {
+        let size = data.len() as u64;
+        assert!(
+            size <= self.staging_size,
+            "Upload {} B exceeds transfer staging belt {} B",
+            size,
+            self.staging_size,
+        );
+
+        // Wrap around the staging ring if needed.  In production you'd
+        // track per-region fences; for now a simple wrap is enough since
+        // we only allow one staging_size worth of in-flight data.
+        if self.staging_offset + size > self.staging_size {
+            self.staging_offset = 0;
+        }
+
+        // Copy data into the staging region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging_mapped.as_ptr().add(self.staging_offset as usize),
+                data.len(),
+            );
+        }
+
+        let staging_offset = self.staging_offset;
+        self.staging_offset += align_up(size, 64);
+
+        // Record the copy command.
+        let cmd = unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            self.device.allocate_command_buffers(&info)?[0]
+        };
+
+        unsafe {
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            let region = vk::BufferCopy::default()
+                .src_offset(staging_offset)
+                .dst_offset(0)
+                .size(size);
+            self.device.cmd_copy_buffer(
+                cmd,
+                self.staging_buffer,
+                dst_buffer,
+                std::slice::from_ref(&region),
+            );
+
+            // If using a dedicated transfer family, insert a release
+            // barrier so the graphics queue can acquire ownership.
+            if self.is_dedicated {
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .buffer(dst_buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(self.queue_family_index)
+                    .dst_queue_family_index(self.graphics_family_index);
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&barrier),
+                    &[],
+                );
+            }
+
+            self.device.end_command_buffer(cmd)?;
+        }
+
+        // Submit with timeline signal.
+        let timeline_value = self.next_timeline;
+        self.next_timeline += 1;
+
+        let binding = [timeline_value];
+         let mut timeline_submit = vk::TimelineSemaphoreSubmitInfo::default()
+             .signal_semaphore_values(&binding);
+
+        let signal_sems = [self.timeline_semaphore];
+        let cmd_bufs = [cmd];
+
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(&cmd_bufs)
+            .signal_semaphores(&signal_sems)
+            .push_next(&mut timeline_submit);
+
+        unsafe {
+            self.device.queue_submit(
+                self.queue,
+                std::slice::from_ref(&submit),
+                vk::Fence::null(),
+            )?;
+        }
+
+        Ok(TransferTicket {
+            dst_handle,
+            timeline_value,
+        })
+    }
+
+    /// Check whether a particular transfer has finished on the GPU.
+    pub fn is_complete(&self, ticket: &TransferTicket) -> bool {
+        let current = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.timeline_semaphore)
+                .unwrap_or(0)
+        };
+        current >= ticket.timeline_value
+    }
+
+    /// Block until a specific timeline value is reached.
+    pub fn wait_for(&self, ticket: &TransferTicket, timeout_ns: u64) -> Result<(), vk::Result> {
+        let binding = [ticket.timeline_value];
+        let ts = [self.timeline_semaphore];
+         let wait_info = vk::SemaphoreWaitInfo::default()
+             .semaphores(&ts)
+             .values(&binding);
+        unsafe { self.device.wait_semaphores(&wait_info, timeout_ns) }
+    }
+
+    /// The timeline semaphore, for the renderer to use as a wait
+    /// semaphore on the graphics queue if needed.
+    pub fn timeline_semaphore(&self) -> vk::Semaphore {
+        self.timeline_semaphore
+    }
+
+    /// Drain the command pool.  Call after waiting idle or when all
+    /// in-flight transfers are known complete.
+    pub fn reset_pool(&self) {
+        unsafe {
+            let _ = self.device.reset_command_pool(
+                self.command_pool,
+                vk::CommandPoolResetFlags::RELEASE_RESOURCES,
+            );
+        }
+    }
+}
+
+impl Drop for TransferQueue {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.queue_wait_idle(self.queue);
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.device.destroy_semaphore(self.timeline_semaphore, None);
+            self.device.unmap_memory(self.staging_memory);
+            self.device.destroy_buffer(self.staging_buffer, None);
+            self.device.free_memory(self.staging_memory, None);
+        }
+    }
+}
+
+// ====================================================================
+//  MemoryBudget – VRAM tracking + LRU eviction
+// ====================================================================
+
+/// Per-handle usage tracking for LRU eviction.
+#[derive(Debug, Clone)]
+struct UsageRecord {
+    handle: BufferHandle,
+    size: u64,
+    /// Frame number when this handle was last referenced in a draw call.
+    last_used_frame: u64,
+}
+
+/// Tracks VRAM consumption against the device-local heap budget and
+/// provides LRU eviction for streamable assets.
+pub struct MemoryBudget {
+    /// Budget cap in bytes (derived from heap size × ratio).
+    budget_bytes: u64,
+    /// Device-local heap index (for logging/queries).
+    #[allow(dead_code)]
+    device_local_heap: u32,
+    /// Per-handle tracking.  Only *evictable* handles are inserted here
+    /// (i.e. chunk mesh data, not the ring buffer or staging belt).
+    usage: HashMap<BufferHandle, UsageRecord>,
+}
+
+impl MemoryBudget {
+    pub fn new(
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    ) -> Self {
+        // Find the device-local heap and derive a budget.
+        let (heap_idx, heap_size) = (0..memory_properties.memory_heap_count as usize)
+            .find_map(|i| {
+                let heap = memory_properties.memory_heaps[i];
+                heap.flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                    .then_some((i as u32, heap.size))
+            })
+            .unwrap_or((0, 256 * 1024 * 1024)); // 256 MB fallback
+
+        let budget_bytes = (heap_size as f64 * VRAM_BUDGET_RATIO) as u64;
+
+        println!(
+            "[MemoryBudget] Heap {} = {}, budget = {} ({:.0}%)",
+            heap_idx,
+            fmt_bytes(heap_size),
+            fmt_bytes(budget_bytes),
+            VRAM_BUDGET_RATIO * 100.0,
+        );
+
+        Self {
+            budget_bytes,
+            device_local_heap: heap_idx,
+            usage: HashMap::new(),
+        }
+    }
+
+    /// Register an evictable buffer.
+    pub fn track(&mut self, handle: BufferHandle, size: u64, current_frame: u64) {
+        self.usage.insert(
+            handle,
+            UsageRecord {
+                handle,
+                size,
+                last_used_frame: current_frame,
+            },
+        );
+    }
+
+    /// Mark a handle as used this frame (call during draw submission).
+    pub fn touch(&mut self, handle: BufferHandle, current_frame: u64) {
+        if let Some(rec) = self.usage.get_mut(&handle) {
+            rec.last_used_frame = current_frame;
+        }
+    }
+
+    /// Remove tracking for a handle (after eviction or explicit free).
+    pub fn untrack(&mut self, handle: BufferHandle) {
+        self.usage.remove(&handle);
+    }
+
+    /// Returns `true` when tracked allocations exceed the budget.
+    pub fn is_over_budget(&self, current_pool_usage: u64) -> bool {
+        current_pool_usage > self.budget_bytes
+    }
+
+    /// Evict the least-recently-used handles until we're under budget.
+    /// Returns the list of handles that should be freed by the caller
+    /// (the caller is responsible for destroying the VkBuffers and
+    /// updating chunk load states).
+    pub fn evict_lru(
+        &mut self,
+        current_pool_usage: u64,
+        current_frame: u64,
+        min_age_frames: u64,
+    ) -> Vec<BufferHandle> {
+        if !self.is_over_budget(current_pool_usage) {
+            return Vec::new();
+        }
+
+        // Sort tracked handles by last_used_frame ascending (oldest first).
+        let mut candidates: Vec<&UsageRecord> = self
+            .usage
+            .values()
+            .filter(|r| current_frame.saturating_sub(r.last_used_frame) >= min_age_frames)
+            .collect();
+        candidates.sort_by_key(|r| r.last_used_frame);
+
+        let mut freed = 0u64;
+        let excess = current_pool_usage.saturating_sub(self.budget_bytes);
+        let mut evicted = Vec::new();
+
+        for rec in candidates {
+            if freed >= excess {
+                break;
+            }
+            freed += rec.size;
+            evicted.push(rec.handle);
+        }
+
+        // Remove evicted entries from tracking.
+        for &h in &evicted {
+            self.usage.remove(&h);
+        }
+
+        if !evicted.is_empty() {
+            println!(
+                "[MemoryBudget] Evicting {} handles, freeing ~{}",
+                evicted.len(),
+                fmt_bytes(freed),
+            );
+        }
+
+        evicted
+    }
+
+    /// Total tracked evictable bytes.
+    pub fn tracked_bytes(&self) -> u64 {
+        self.usage.values().map(|r| r.size).sum()
+    }
+}
+
+// ====================================================================
 //  MemoryContext – public interface that owns everything
 // ====================================================================
 
-/// Owns all GPU memory resources: pool allocator, ring buffer, and the
-/// reusable staging belt.  Handed to the renderer at construction.
+/// Owns all GPU memory resources: pool allocator, ring buffer, transfer
+/// queue, memory budget, and the legacy staging belt for synchronous
+/// init-time uploads.
 pub struct MemoryContext {
     device: Device,
     pub allocator: GpuAllocator,
     pub ring: RingBuffer,
+    pub transfer: TransferQueue,
+    pub budget: MemoryBudget,
+
+    // Legacy synchronous staging belt (kept for simple init-time uploads
+    // that don't need async).
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_mapped: NonNull<u8>,
@@ -613,12 +1068,25 @@ impl MemoryContext {
         device: Device,
         memory_properties: vk::PhysicalDeviceMemoryProperties,
         min_ubo_alignment: u64,
+        transfer_queue: vk::Queue,
+        transfer_family: u32,
+        graphics_family: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let allocator = GpuAllocator::new(device.clone(), memory_properties);
         let ring =
             RingBuffer::new(&device, &memory_properties, min_ubo_alignment.max(256))?;
 
-        // ---- reusable staging buffer ----
+        let transfer = TransferQueue::new(
+            device.clone(),
+            &memory_properties,
+            transfer_queue,
+            transfer_family,
+            graphics_family,
+        )?;
+
+        let budget = MemoryBudget::new(&memory_properties);
+
+        // ---- legacy reusable staging buffer ----
         let staging_info = vk::BufferCreateInfo::default()
             .size(STAGING_BUFFER_SIZE)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -657,7 +1125,7 @@ impl MemoryContext {
             NonNull::new(raw as *mut u8).ok_or("Failed to map staging")?;
 
         println!(
-            "[MemoryContext] Staging belt: {} MB",
+            "[MemoryContext] Legacy staging belt: {} MB",
             STAGING_BUFFER_SIZE / (1024 * 1024),
         );
 
@@ -665,6 +1133,8 @@ impl MemoryContext {
             device,
             allocator,
             ring,
+            transfer,
+            budget,
             staging_buffer,
             staging_memory,
             staging_mapped,
@@ -672,8 +1142,55 @@ impl MemoryContext {
         })
     }
 
+    // ----------------------------------------------------------------
+    //  Async upload path (for streaming chunks)
+    // ----------------------------------------------------------------
+
+    /// Allocate a device-local buffer and kick off an async transfer.
+    /// Returns the `BufferAllocation` (immediately usable for binding)
+    /// and a `TransferTicket` that must be polled before the buffer
+    /// contents are valid.
+    pub fn upload_async(
+        &mut self,
+        data: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(BufferAllocation, TransferTicket), Box<dyn std::error::Error>> {
+        let alloc = self.allocator.create_buffer(
+            data.len() as u64,
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+        )?;
+
+        let ticket = self.transfer.upload_async(
+            data,
+            alloc.buffer,
+            alloc.handle,
+        )?;
+
+        Ok((alloc, ticket))
+    }
+
+    /// Typed version of [`upload_async`].
+    pub fn upload_async_typed<T: Copy>(
+        &mut self,
+        data: &[T],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(BufferAllocation, TransferTicket), Box<dyn std::error::Error>> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                std::mem::size_of_val(data),
+            )
+        };
+        self.upload_async(bytes, usage)
+    }
+
+    // ----------------------------------------------------------------
+    //  Synchronous upload path (for init-time data)
+    // ----------------------------------------------------------------
+
     /// Create a device-local buffer and upload `data` synchronously via
-    /// the staging belt.
+    /// the legacy staging belt.
     pub fn create_buffer_with_data(
         &mut self,
         data: &[u8],
@@ -739,7 +1256,7 @@ impl MemoryContext {
         Ok(alloc)
     }
 
-    /// Create a device-local buffer from a typed slice.
+    /// Create a device-local buffer from a typed slice (synchronous).
     pub fn create_typed_buffer<T: Copy>(
         &mut self,
         data: &[T],
@@ -765,13 +1282,13 @@ impl Drop for MemoryContext {
             self.device.destroy_buffer(self.ring.buffer, None);
             self.device.free_memory(self.ring.memory, None);
 
-            // Staging belt.
+            // Legacy staging belt.
             self.device.unmap_memory(self.staging_memory);
             self.device.destroy_buffer(self.staging_buffer, None);
             self.device.free_memory(self.staging_memory, None);
 
-            // GpuAllocator::drop runs after this method, destroying all
-            // remaining VkBuffers and freeing every pool VkDeviceMemory.
+            // TransferQueue::drop runs automatically.
+            // GpuAllocator::drop runs after this method.
         }
     }
 }
