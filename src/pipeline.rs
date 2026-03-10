@@ -278,37 +278,63 @@ impl RenderPasses {
         })
     }
 
+    /// Depth pre-pass render pass with G-buffer normal output.
+    ///
+    /// Attachment 0: R16G16_SFLOAT normal (octahedral encoded view-space normal).
+    ///   CLEAR + STORE, UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
+    /// Attachment 1: D32_SFLOAT depth.
+    ///   CLEAR + STORE, UNDEFINED → DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
     fn create_depth_prepass(
         device: &Device,
     ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
-        let attachment = vk::AttachmentDescription::default()
-            .format(vk::Format::D32_SFLOAT)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let attachments = [
+            // Attachment 0: normal (R16G16_SFLOAT)
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R16G16_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            // Attachment 1: depth (D32_SFLOAT)
+            vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
 
-        let depth_ref = vk::AttachmentReference::default()
+        let color_ref = vk::AttachmentReference::default()
             .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref))
             .depth_stencil_attachment(&depth_ref);
 
         let dependency = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
-            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
 
         let info = vk::RenderPassCreateInfo::default()
-            .attachments(std::slice::from_ref(&attachment))
+            .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
 
@@ -518,6 +544,8 @@ pub struct Pipelines {
     pub probe_capture: vk::Pipeline,
     /// Sun directional shadow pipeline (depth-only with hardware z, ortho projection).
     pub sun_shadow: vk::Pipeline,
+    /// HDR skybox background pipeline (procedural cube, depth=1.0, no vertex buffer).
+    pub skybox: vk::Pipeline,
     /// Graphics pipeline layout (all four sets + push constants).
     pub layout: vk::PipelineLayout,
     /// Compute pipeline layout (set 0 only).
@@ -538,6 +566,8 @@ impl Pipelines {
         shadow_frag_spv: &[u8],
         cluster_comp_spv: &[u8],
         probe_capture_frag_spv: &[u8],
+        skybox_vert_spv: &[u8],
+        skybox_frag_spv: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cache = unsafe {
             device.create_pipeline_cache(
@@ -574,8 +604,8 @@ impl Pipelines {
             )?
         };
 
-        // ---- Depth pre-pass pipeline ----
-        let depth_prepass = Self::create_depth_pipeline(
+        // ---- Depth pre-pass pipeline (with G-buffer normal output) ----
+        let depth_prepass = Self::create_depth_normal_pipeline(
             device, cache, layout, passes.depth_prepass,
             depth_vert_spv, depth_frag_spv,
         )?;
@@ -613,6 +643,12 @@ impl Pipelines {
             depth_vert_spv, depth_frag_spv,
         )?;
 
+        // ---- Skybox pipeline ----
+        let skybox = Self::create_skybox_pipeline(
+            device, cache, layout, passes.lighting,
+            skybox_vert_spv, skybox_frag_spv,
+        )?;
+
         Ok(Self {
             depth_prepass,
             lighting,
@@ -620,6 +656,7 @@ impl Pipelines {
             cluster_compute,
             probe_capture,
             sun_shadow,
+            skybox,
             layout,
             compute_layout,
             cache,
@@ -673,6 +710,88 @@ impl Pipelines {
                 .depth_write_enable(true)
                 .depth_compare_op(vk::CompareOp::LESS);
             let color_blending = vk::PipelineColorBlendStateCreateInfo::default();
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dynamic_states);
+
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterizer)
+                .multisample_state(&multisampling)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blending)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .render_pass(render_pass)
+                .subpass(0);
+
+            let pipelines = device
+                .create_graphics_pipelines(cache, &[pipeline_info], None)
+                .map_err(|(_, e)| e)?;
+            device.destroy_shader_module(vert_module, None);
+            device.destroy_shader_module(frag_module, None);
+            Ok(pipelines[0])
+        }
+    }
+
+    /// Depth pre-pass pipeline with G-buffer normal color output.
+    /// Same as `create_depth_pipeline` but includes one color blend
+    /// attachment for the R16G16_SFLOAT normal render target.
+    fn create_depth_normal_pipeline(
+        device: &Device,
+        cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+        render_pass: vk::RenderPass,
+        vert_spv: &[u8],
+        frag_spv: &[u8],
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        unsafe {
+            let vert_module = create_shader_module(device, vert_spv)?;
+            let frag_module = create_shader_module(device, frag_spv)?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vert_module)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(frag_module)
+                    .name(c"main"),
+            ];
+
+            let binding = Vertex::binding_description();
+            let attributes = Vertex::attribute_descriptions();
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(std::slice::from_ref(&binding))
+                .vertex_attribute_descriptions(&attributes);
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .line_width(1.0)
+                .cull_mode(vk::CullModeFlags::BACK)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+            let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS);
+            // Color attachment 0: normal RG output.  Write R+G only.
+            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(
+                    vk::ColorComponentFlags::R | vk::ColorComponentFlags::G,
+                )
+                .blend_enable(false);
+            let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&dynamic_states);
@@ -888,6 +1007,7 @@ impl Pipelines {
             device.destroy_pipeline(self.cluster_compute, None);
             device.destroy_pipeline(self.probe_capture, None);
             device.destroy_pipeline(self.sun_shadow, None);
+            device.destroy_pipeline(self.skybox, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_pipeline_layout(self.compute_layout, None);
             device.destroy_pipeline_cache(self.cache, None);
@@ -972,6 +1092,81 @@ impl Pipelines {
             Ok(pipelines[0])
         }
     }
+
+    /// Skybox pipeline: procedural cube, no vertex input, depth test ≤, no depth write.
+    /// Renders inside the lighting pass after all opaque geometry.
+    fn create_skybox_pipeline(
+        device: &Device,
+        cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+        render_pass: vk::RenderPass,
+        vert_spv: &[u8],
+        frag_spv: &[u8],
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        unsafe {
+            let vert_module = create_shader_module(device, vert_spv)?;
+            let frag_module = create_shader_module(device, frag_spv)?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vert_module)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(frag_module)
+                    .name(c"main"),
+            ];
+
+            // No vertex input — cube is procedural (gl_VertexIndex).
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .line_width(1.0)
+                .cull_mode(vk::CullModeFlags::FRONT)       // We're inside the cube
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+            let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(false)                  // Don't write depth
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL); // Pass where depth=1.0 (cleared)
+            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false);
+            let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dynamic_states);
+
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterizer)
+                .multisample_state(&multisampling)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blending)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .render_pass(render_pass)
+                .subpass(0);
+
+            let pipelines = device
+                .create_graphics_pipelines(cache, &[pipeline_info], None)
+                .map_err(|(_, e)| e)?;
+            device.destroy_shader_module(vert_module, None);
+            device.destroy_shader_module(frag_module, None);
+            Ok(pipelines[0])
+        }
+    }
 }
 
 // ====================================================================
@@ -989,13 +1184,16 @@ impl PassFramebuffers {
         passes: &RenderPasses,
         swapchain_image_views: &[vk::ImageView],
         depth_view: vk::ImageView,
+        normal_view: vk::ImageView,
         extent: vk::Extent2D,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut depth_prepass = Vec::new();
         let mut lighting = Vec::new();
 
         for &color_view in swapchain_image_views {
-            let depth_attach = [depth_view];
+            // Depth pre-pass: attachment 0 = normal (R16G16_SFLOAT),
+            //                  attachment 1 = depth (D32_SFLOAT).
+            let depth_attach = [normal_view, depth_view];
             let fb_info = vk::FramebufferCreateInfo::default()
                 .render_pass(passes.depth_prepass)
                 .attachments(&depth_attach)

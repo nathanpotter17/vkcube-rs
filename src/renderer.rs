@@ -1,6 +1,6 @@
 use ash::{vk, Device};
 use std::collections::HashMap;
-
+use std::path::Path;
 use crate::device::DeviceContext;
 use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
                  SHProjectPushConstants, MAX_PROBE_BAKES_PER_FRAME,
@@ -13,7 +13,7 @@ use crate::light::{
     SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY,
 };
 use crate::material::{MaterialData, MaterialLibrary, MaterialSsbo};
-use crate::memory::{BufferHandle, MemoryContext, MAX_FRAMES_IN_FLIGHT};
+use crate::memory::{BufferHandle, GpuAllocator, MemoryContext, MAX_FRAMES_IN_FLIGHT};
 use crate::pipeline::{
     DescriptorLayouts, FrameDescriptors, FrameLightingBuffers, PassFramebuffers,
     Pipelines, RenderPasses,
@@ -197,7 +197,14 @@ pub struct Renderer {
     /// visibility and explicit cleanup.  These live outside the sector
     /// batching path (each mesh owns its own VB/IB).
     gltf_buffer_handles: Vec<BufferHandle>,
+
+    // ---- G-buffer view-space normal (for HBAO) ----
+    normal_image: vk::Image,
+    normal_memory: vk::DeviceMemory,
+    normal_view: vk::ImageView,
+
     hbao_pass: HbaoPass,
+    has_hdr_skybox: bool,
 }
 
 impl Renderer {
@@ -348,8 +355,9 @@ impl Renderer {
 
         // Phase 3: Global Illumination resources.
         let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
-        let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
-
+        let hdr_path: Option<&Path> = Some(Path::new("assets/park1k.hdr"));
+        let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue, hdr_path)?;
+        
         let vert_spv = include_bytes!("../shaders/compiled/basic.vert.spv");
         let frag_spv = include_bytes!("../shaders/compiled/basic.frag.spv");
         let depth_vert_spv: &[u8] = include_bytes!("../shaders/compiled/depth.vert.spv");
@@ -361,6 +369,8 @@ impl Renderer {
         let sh_project_comp_spv: &[u8] = include_bytes!("../shaders/compiled/sh_project.comp.spv");
         let hbao_comp_spv: &[u8] = include_bytes!("../shaders/compiled/hbao.comp.spv");
         let hbao_blur_comp_spv: &[u8] = include_bytes!("../shaders/compiled/hbao_blur.comp.spv");
+        let skybox_vert_spv: &[u8] = include_bytes!("../shaders/compiled/skybox.vert.spv");
+        let skybox_frag_spv: &[u8] = include_bytes!("../shaders/compiled/skybox.frag.spv");
 
         let probe_bake_target = ProbeBakeTarget::new(
             &device, &memory_ctx.allocator, render_passes.probe_capture,
@@ -371,16 +381,24 @@ impl Renderer {
 
         let pipelines = Pipelines::new(&device, &descriptor_layouts, &render_passes,
             vert_spv, frag_spv, depth_vert_spv, depth_frag_spv, shadow_vert_spv, shadow_frag_spv,
-            cluster_comp_spv, probe_capture_frag_spv)?;
-        let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
-            device_ctx.depth_image_view, device_ctx.swapchain_extent)?;
+            cluster_comp_spv, probe_capture_frag_spv, skybox_vert_spv, skybox_frag_spv)?;
 
-        // HBAO pass.
+        // G-buffer view-space normal — written by depth pre-pass, read by HBAO.
+        let (normal_image, normal_memory, normal_view) = Self::create_normal_image(
+            &device, &memory_ctx.allocator,
+            device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height,
+        )?;
+
+        let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
+            device_ctx.depth_image_view, normal_view, device_ctx.swapchain_extent)?;
+
+        // HBAO pass — receives both depth and normal views for compute sampling.
         let inv_proj = crate::scene::invert_projection(scene.camera.get_projection_matrix());
         let mut hbao_pass = HbaoPass::new(
             &device,
             &mut memory_ctx.allocator,
             device_ctx.depth_image_view,
+            normal_view,
             device_ctx.swapchain_extent,
             scene.camera.get_projection_matrix(),
             inv_proj,
@@ -477,7 +495,10 @@ impl Renderer {
             spawned_geometry_count: 0,
             next_dynamic_sector: 0,
             deferred_frees: Vec::new(),
-            gltf_buffer_handles, hbao_pass,
+            gltf_buffer_handles,
+            normal_image, normal_memory, normal_view,
+            hbao_pass,
+            has_hdr_skybox: hdr_path.is_some(),
         })
     }
 
@@ -1092,9 +1113,15 @@ impl Renderer {
             }
 
             // ============================================================
-            //  PASS 1: Depth Pre-Pass
+            //  PASS 1: Depth Pre-Pass + G-Buffer Normal
             // ============================================================
-            let dc = [vk::ClearValue{depth_stencil:vk::ClearDepthStencilValue{depth:1.0,stencil:0}}];
+            // Attachment 0: R16G16_SFLOAT normal (octahedral encoded)
+            // Attachment 1: D32_SFLOAT depth
+            // Clear normal to (0.5, 0.5) = octEncode(0,0,1) — benign default for sky pixels.
+            let dc = [
+                vk::ClearValue { color: vk::ClearColorValue { float32: [0.5, 0.5, 0.0, 0.0] } },
+                vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
+            ];
             let drp = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_passes.depth_prepass)
                 .framebuffer(self.framebuffers.depth_prepass[image_index as usize])
@@ -1115,9 +1142,33 @@ impl Renderer {
             //  PASS 1.5: HBAO (Phase 6)
             // ============================================================
             //
-            // Transition depth to read-only for compute sampling,
-            // dispatch HBAO + bilateral blur, then transition depth
-            // back to attachment for the lighting pass.
+            // Transition depth to read-only and normal to shader-read for
+            // compute sampling, dispatch HBAO + bilateral blur, then
+            // transition depth back to attachment for the lighting pass.
+
+            // Normal image: render pass leaves it in COLOR_ATTACHMENT_OPTIMAL
+            // (finalLayout). Transition to SHADER_READ_ONLY for HBAO compute.
+            let normal_barrier = vk::ImageMemoryBarrier::default()
+                .image(self.normal_image)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                });
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[], std::slice::from_ref(&normal_barrier),
+            );
+
             HbaoPass::barrier_depth_to_read(&self.device, cmd, device_ctx.depth_image);
             self.hbao_pass.dispatch(&self.device, cmd);
             HbaoPass::barrier_depth_to_attachment(&self.device, cmd, device_ctx.depth_image);
@@ -1167,6 +1218,16 @@ impl Renderer {
 
             self.record_draw_list(cmd, &opaque_draws, view_mat, proj_mat);
             self.world.opaque_draws = opaque_draws;
+
+            // ---- Skybox (draw behind all opaque geometry) ----
+            // Pipeline: procedural cube, depth test ≤, no depth write, cull front.
+            // Set 0 already bound with camera view/proj from the lighting pass.
+            if self.has_hdr_skybox {
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.skybox);
+                self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+                self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+                self.device.cmd_draw(cmd, 36, 1, 0, 0);
+            }
 
             self.device.cmd_end_render_pass(cmd);
             self.device.end_command_buffer(cmd)?;
@@ -1352,14 +1413,31 @@ impl Renderer {
     pub fn recreate_framebuffers(&mut self, device_ctx: &DeviceContext) -> Result<(), Box<dyn std::error::Error>> {
         unsafe { self.device.device_wait_idle()? };
         self.framebuffers.destroy(&self.device);
+
+        // Recreate G-buffer normal image at new resolution.
+        unsafe {
+            self.device.destroy_image_view(self.normal_view, None);
+            self.device.destroy_image(self.normal_image, None);
+            self.device.free_memory(self.normal_memory, None);
+        }
+        let (ni, nm, nv) = Self::create_normal_image(
+            &self.device, &self.memory_ctx.allocator,
+            device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height,
+        )?;
+        self.normal_image = ni;
+        self.normal_memory = nm;
+        self.normal_view = nv;
+
         self.framebuffers = PassFramebuffers::new(&self.device, &self.render_passes,
-            &device_ctx.swapchain_image_views, device_ctx.depth_image_view, device_ctx.swapchain_extent)?;
+            &device_ctx.swapchain_image_views, device_ctx.depth_image_view,
+            self.normal_view, device_ctx.swapchain_extent)?;
         self.scene.camera.update_aspect(device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height);
         let inv_proj = crate::scene::invert_projection(self.scene.camera.get_projection_matrix());
         self.hbao_pass.resize(
             &self.device,
             &mut self.memory_ctx.allocator,
             device_ctx.depth_image_view,
+            self.normal_view,
             device_ctx.swapchain_extent,
             self.scene.camera.get_projection_matrix(),
             inv_proj,
@@ -1371,6 +1449,67 @@ impl Renderer {
     pub fn materials(&self) -> &MaterialLibrary { &self.material_library }
     pub fn texture_manager_mut(&mut self) -> &mut TextureManager { &mut self.texture_manager }
     pub fn light_manager_mut(&mut self) -> &mut LightManager { &mut self.light_manager }
+
+    // ================================================================
+    //  G-buffer normal image creation
+    // ================================================================
+
+    /// Create a full-resolution R16G16_SFLOAT image for octahedral-encoded
+    /// view-space normals.  Written by the depth pre-pass fragment shader,
+    /// sampled by the HBAO compute shader at binding 3.
+    fn create_normal_image(
+        device: &Device,
+        allocator: &GpuAllocator,
+        width: u32,
+        height: u32,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), Box<dyn std::error::Error>> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R16G16_SFLOAT)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = unsafe { device.create_image(&image_info, None)? };
+        let mem_req = unsafe { device.get_image_memory_requirements(image) };
+
+        let mem_type = allocator.find_memory_type(
+            mem_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mem_req.size)
+                    .memory_type_index(mem_type),
+                None,
+            )?
+        };
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R16G16_SFLOAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    }),
+                None,
+            )?
+        };
+
+        println!("[Renderer] G-buffer normal image created: {}×{} R16G16_SFLOAT", width, height);
+        Ok((image, memory, view))
+    }
 
     fn allocate_command_buffers(device: &Device, pool: vk::CommandPool) -> Result<Vec<vk::CommandBuffer>, Box<dyn std::error::Error>> {
         let info = vk::CommandBufferAllocateInfo::default().command_pool(pool)
@@ -1403,6 +1542,10 @@ impl Drop for Renderer {
         self.shadow_atlas.destroy(&self.device);
         self.sun_shadow.destroy(&self.device);
         self.gi_resources.destroy(&self.device);
+        // G-buffer normal image (owned by Renderer, read by HbaoPass).
+        self.device.destroy_image_view(self.normal_view, None);
+        self.device.destroy_image(self.normal_image, None);
+        self.device.free_memory(self.normal_memory, None);
         self.hbao_pass.destroy(&self.device, &mut self.memory_ctx.allocator);
         self.probe_bake_target.destroy(&self.device);
         // probe_grid SSBO freed via allocator on MemoryContext drop

@@ -25,6 +25,8 @@ shaders=(
     "sh_project.comp:sh_project.comp.spv"
     "hbao.comp:hbao.comp.spv"
     "hbao_blur.comp:hbao_blur.comp.spv"
+    "skybox.vert:skybox.vert.spv"
+    "skybox.frag:skybox.frag.spv"
 )
 
 set_avx2() {

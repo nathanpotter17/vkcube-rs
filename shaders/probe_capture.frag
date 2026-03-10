@@ -84,7 +84,8 @@ layout(set = 0, binding = 5, std430) readonly buffer MaterialSSBO {
     MaterialData materials[];
 } materialBuf;
 
-// Bindings 6-10: GI data — not used during probe capture.
+// Binding 9: HDR irradiance cube map — sampled for ambient sky term.
+layout(set = 0, binding = 9) uniform samplerCube irradianceMap;
 
 // ---- Descriptor Set 1: Bindless textures ----
 layout(set = 1, binding = 0) uniform sampler2D textures[];
@@ -292,9 +293,15 @@ void main() {
     for (uint i = 0; i < count; i++) {
         Lo += evaluateLight(lightBuf.lights[i], N, V, albedo, metallic, roughness, F0);
     }
-
-    // Minimal ambient floor (no GI — we're PRODUCING the GI data).
-    vec3 ambient = albedo * vec3(0.015, 0.015, 0.02) * ao;
+    
+    // Sample HDR irradiance cubemap for far-field environment contribution.
+    // This is not circular — the irradiance cubemap is pre-convolved at init time
+    // from the HDR source, independent of probe data.
+    vec3 envIrradiance = texture(irradianceMap, N).rgb;
+    vec3 kD = (vec3(1.0) - fresnelSchlick(max(dot(N, normalize(getEyeFromViewMatrix(frame.view) - fragWorldPos)), 0.0), F0)) * (1.0 - metallic);
+    vec3 ambient = kD * albedo * envIrradiance * ao;
+    // Floor to prevent pure-black regions from collapsing SH coefficients.
+    ambient = max(ambient, albedo * vec3(0.015, 0.015, 0.02) * ao);
 
     // Phase 4: Emissive texture multiplication.
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;

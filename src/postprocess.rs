@@ -27,11 +27,11 @@ use crate::pipeline::create_shader_module;
 /// HBAO default parameters.
 const HBAO_RADIUS: f32 = 0.5;       // World-space sampling radius (metres)
 const HBAO_BIAS: f32 = 0.1;         // Angle bias to reduce self-occlusion
-const HBAO_INTENSITY: f32 = 1.5;    // AO strength multiplier
-const HBAO_MAX_DISTANCE: f32 = 2.0; // Maximum influence distance (metres)
+const HBAO_INTENSITY: f32 = 1.0;    // AO strength multiplier (was 1.5)
+const HBAO_MAX_DISTANCE: f32 = 1.5; // Maximum influence distance (was 2.0)
 
 /// Bilateral blur sharpness (depth-weight exponent).
-const BLUR_SHARPNESS: f32 = 1000.0;
+const BLUR_SHARPNESS: f32 = 300.0;  // was 1000.0 — softer edge transitions
 
 // ====================================================================
 //  UBO layout — must match hbao.comp HBAOParams
@@ -115,11 +115,14 @@ impl HbaoPass {
     ///
     /// `depth_image_view` — the engine's shared depth image view
     ///   (D32_SFLOAT, DEPTH aspect).
+    /// `normal_image_view` — G-buffer view-space normal (R16G16_SFLOAT,
+    ///   octahedral encoded, written by depth pre-pass).
     /// `proj` / `inv_proj` — camera projection matrices.
     pub fn new(
         device: &Device,
         allocator: &mut GpuAllocator,
         depth_image_view: vk::ImageView,
+        normal_image_view: vk::ImageView,
         extent: vk::Extent2D,
         proj: [[f32; 4]; 4],
         inv_proj: [[f32; 4]; 4],
@@ -182,15 +185,16 @@ impl HbaoPass {
 
         // ---- Descriptor pool ----
         // Need: 3 sets total (hbao, blur_h, blur_v)
-        // HBAO set:   1 COMBINED_IMAGE_SAMPLER (depth) + 1 STORAGE_IMAGE (ao) + 1 UBO
+        // HBAO set:   1 COMBINED_IMAGE_SAMPLER (depth) + 1 STORAGE_IMAGE (ao)
+        //           + 1 UBO + 1 COMBINED_IMAGE_SAMPLER (normal)
         // Blur H set: 2 STORAGE_IMAGE (in, out) + 1 COMBINED_IMAGE_SAMPLER (depth)
         // Blur V set: 2 STORAGE_IMAGE (in, out) + 1 COMBINED_IMAGE_SAMPLER (depth)
-        // Totals:     3 COMBINED_IMAGE_SAMPLER, 5 STORAGE_IMAGE, 1 UNIFORM_BUFFER
+        // Totals:     4 COMBINED_IMAGE_SAMPLER, 5 STORAGE_IMAGE, 1 UNIFORM_BUFFER
 
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(3),
+                .descriptor_count(4),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(5),
@@ -211,6 +215,7 @@ impl HbaoPass {
         // binding 0: sampler2D depthTexture    (COMBINED_IMAGE_SAMPLER)
         // binding 1: image2D  aoTexture        (STORAGE_IMAGE)
         // binding 2: uniform  HBAOParams       (UNIFORM_BUFFER)
+        // binding 3: sampler2D normalTexture   (COMBINED_IMAGE_SAMPLER)
 
         let hbao_bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -226,6 +231,11 @@ impl HbaoPass {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
@@ -293,6 +303,7 @@ impl HbaoPass {
         Self::write_hbao_descriptors(
             device, hbao_set,
             depth_image_view, depth_sampler,
+            normal_image_view, depth_sampler, // reuse NEAREST sampler for normals
             ao_storage_view,
             params_buffer, std::mem::size_of::<HbaoParamsUbo>() as u64,
         );
@@ -368,7 +379,8 @@ impl HbaoPass {
     ///
     /// **Pre-condition:** depth image is in
     /// `DEPTH_STENCIL_READ_ONLY_OPTIMAL` layout (caller inserts the
-    /// barrier after the depth pre-pass ends).
+    /// barrier after the depth pre-pass ends).  Normal image is in
+    /// `SHADER_READ_ONLY_OPTIMAL` (caller transitions after depth pass).
     ///
     /// **Post-condition:** AO image is in `SHADER_READ_ONLY_OPTIMAL`,
     /// ready for the PBR fragment shader.  Depth image remains in
@@ -578,13 +590,14 @@ impl HbaoPass {
     // ================================================================
 
     /// Recreate AO images and update descriptors for new resolution.
-    /// The depth image view is passed because it is also recreated
-    /// during swapchain resize.
+    /// The depth and normal image views are passed because they are
+    /// also recreated during swapchain resize.
     pub fn resize(
         &mut self,
         device: &Device,
         allocator: &mut GpuAllocator,
         depth_image_view: vk::ImageView,
+        normal_image_view: vk::ImageView,
         extent: vk::Extent2D,
         proj: [[f32; 4]; 4],
         inv_proj: [[f32; 4]; 4],
@@ -623,6 +636,7 @@ impl HbaoPass {
         Self::write_hbao_descriptors(
             device, self.hbao_set,
             depth_image_view, self.depth_sampler,
+            normal_image_view, self.depth_sampler,
             self.ao_storage_view,
             self.params_buffer,
             std::mem::size_of::<HbaoParamsUbo>() as u64,
@@ -737,8 +751,6 @@ impl HbaoPass {
 
     /// Create a full-resolution R8_UNORM image for AO storage.
     /// Returns (image, memory, storage_view, sampled_view).
-    /// `sampled_view` uses the same image but in a format suitable
-    /// for COMBINED_IMAGE_SAMPLER.  Both views share the same format.
     fn create_ao_image(
         device: &Device,
         allocator: &GpuAllocator,
@@ -794,7 +806,6 @@ impl HbaoPass {
             )?
         };
 
-        // For COMBINED_IMAGE_SAMPLER — same view format works.
         let sampled_view = unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -852,6 +863,8 @@ impl HbaoPass {
         set: vk::DescriptorSet,
         depth_view: vk::ImageView,
         depth_sampler: vk::Sampler,
+        normal_view: vk::ImageView,
+        normal_sampler: vk::Sampler,
         ao_storage_view: vk::ImageView,
         params_buffer: vk::Buffer,
         params_size: u64,
@@ -860,6 +873,11 @@ impl HbaoPass {
             .sampler(depth_sampler)
             .image_view(depth_view)
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+
+        let normal_info = vk::DescriptorImageInfo::default()
+            .sampler(normal_sampler)
+            .image_view(normal_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
         let ao_info = vk::DescriptorImageInfo::default()
             .image_view(ao_storage_view)
@@ -886,6 +904,11 @@ impl HbaoPass {
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&ubo_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&normal_info)),
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }

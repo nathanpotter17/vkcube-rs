@@ -25,6 +25,8 @@ layout(binding = 2, set = 0) uniform HBAOParams {
     vec4  params;       // x: radius, y: bias, z: intensity, w: max_distance
 } hbao;
 
+layout(binding = 3, set = 0) uniform sampler2D normalTexture;
+
 // ---- Constants ----
 
 const float PI       = 3.14159265359;
@@ -62,30 +64,26 @@ vec3 reconstructViewPos(vec2 uv, float depth) {
     return view.xyz / view.w;
 }
 
-// Reconstruct view-space normal from depth buffer using
-// best-fit cross-product of neighbouring positions.
-// Selects the derivative direction with the smallest depth
-// discontinuity to avoid edge artefacts.
+// Decode octahedral-encoded view-space normal from G-buffer.
+vec3 octDecode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        n.xy = (1.0 - abs(n.yx)) * vec2(
+            n.x >= 0.0 ? 1.0 : -1.0,
+            n.y >= 0.0 ? 1.0 : -1.0
+        );
+    }
+    return normalize(n);
+}
+
 vec3 reconstructNormal(vec2 uv, vec3 P, float centerDepth) {
-    vec2 texel = hbao.resolution.zw;
-
-    float dL = texture(depthTexture, uv - vec2(texel.x, 0.0)).r;
-    float dR = texture(depthTexture, uv + vec2(texel.x, 0.0)).r;
-    float dT = texture(depthTexture, uv - vec2(0.0, texel.y)).r;
-    float dB = texture(depthTexture, uv + vec2(0.0, texel.y)).r;
-
-    vec3 PL = reconstructViewPos(uv - vec2(texel.x, 0.0), dL);
-    vec3 PR = reconstructViewPos(uv + vec2(texel.x, 0.0), dR);
-    vec3 PT = reconstructViewPos(uv - vec2(0.0, texel.y), dT);
-    vec3 PB = reconstructViewPos(uv + vec2(0.0, texel.y), dB);
-
-    // Pick the neighbour closer in depth to the center.
-    vec3 dX = (abs(dR - centerDepth) < abs(dL - centerDepth))
-              ? (PR - P) : (P - PL);
-    vec3 dY = (abs(dB - centerDepth) < abs(dT - centerDepth))
-              ? (PB - P) : (P - PT);
-
-    return normalize(cross(dX, dY));
+    // Read the actual geometry normal from the G-buffer instead of
+    // reconstructing from depth derivatives. Eliminates artifacts on
+    // large steep surfaces where depth-gradient-based reconstruction
+    // oscillates between neighbors.
+    vec2 encoded = texture(normalTexture, uv).rg;
+    return octDecode(encoded);
 }
 
 // ---- Main AO kernel ----
@@ -97,63 +95,64 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
     float sinA        = sin(randomAngle);
     mat2  rotMat      = mat2(cosA, -sinA, sinA, cosA);
 
-    float viewDist    = -P.z; // View space: camera looks -Z.
+    float viewDist    = -P.z;
     float worldRadius = hbao.params.x;
     float bias        = hbao.params.y;
     float intensity   = hbao.params.z;
     float maxDist     = hbao.params.w;
 
-    // Screen-space radius in pixels — shrinks with distance.
     float radiusPixels = worldRadius * hbao.resolution.x
                          / max(viewDist, 1.0);
-    // Clamp to prevent excessively large or tiny kernels.
     radiusPixels = clamp(radiusPixels, 2.0, 256.0);
 
     float stepSize = radiusPixels / float(NUM_STEPS);
+
+    // ---- Depth-gradient edge detection ----
+    vec2 texel = hbao.resolution.zw;
+    float dL = texture(depthTexture, uv - vec2(texel.x, 0.0)).r;
+    float dR = texture(depthTexture, uv + vec2(texel.x, 0.0)).r;
+    float dT = texture(depthTexture, uv - vec2(0.0, texel.y)).r;
+    float dB = texture(depthTexture, uv + vec2(0.0, texel.y)).r;
+    float centerDepth = texture(depthTexture, uv).r;
+
+    float maxDepthDiff = max(max(abs(dL - centerDepth), abs(dR - centerDepth)),
+                             max(abs(dT - centerDepth), abs(dB - centerDepth)));
+    float edgeAttenuation = 1.0 - smoothstep(0.02, 0.08, maxDepthDiff);
 
     float ao = 0.0;
 
     for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
         vec2 direction = rotMat * BASE_DIRS[dir];
 
-        // Track the maximum sine of the horizon elevation.
-        // Start at the bias angle to suppress self-occlusion.
         float tanHorizon = bias;
         float sinHorizon = tanHorizon / sqrt(1.0 + tanHorizon * tanHorizon);
 
         for (int step = 1; step <= NUM_STEPS; ++step) {
-            // Jittered step offset — avoids banding along ray.
             float t = float(step) + noise * 0.5 - 0.25;
             vec2 sampleUV = uv + direction * t * stepSize
                             * hbao.resolution.zw;
 
-            // Discard out-of-screen samples.
             if (any(lessThan(sampleUV, vec2(0.0)))
              || any(greaterThan(sampleUV, vec2(1.0))))
                 continue;
 
             float sampleDepth = texture(depthTexture, sampleUV).r;
-            if (sampleDepth >= 1.0 - EPSILON) continue; // skybox
+            if (sampleDepth >= 1.0 - EPSILON) continue;
 
             vec3  S    = reconstructViewPos(sampleUV, sampleDepth);
             vec3  V    = S - P;
             float dist = length(V);
 
-            // Skip samples beyond maximum influence distance.
             if (dist > maxDist) continue;
 
-            // Horizon angle in tangent form.
             float tanS = V.z / max(length(V.xy), EPSILON);
             float sinS = tanS / sqrt(1.0 + tanS * tanS);
 
             if (sinS > sinHorizon) {
-                // Distance-based falloff: quadratic decay.
                 float falloff = 1.0 - (dist * dist)
                                 / (maxDist * maxDist);
                 falloff = max(falloff, 0.0);
 
-                // Accumulate occlusion weighted by how much the
-                // horizon rose above the previous maximum.
                 ao += (sinS - sinHorizon) * falloff;
 
                 sinHorizon = sinS;
@@ -162,10 +161,12 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
         }
     }
 
-    // Normalise and apply intensity.
+    // Fixed denominator — directions that only sampled sky contribute
+    // zero occlusion, which is correct (no geometry = no occlusion).
+    // edgeAttenuation handles the silhouette halo separately.
     ao = ao / float(NUM_DIRECTIONS) * intensity;
+    ao *= edgeAttenuation;
 
-    // Return visibility (1 = fully lit, 0 = fully occluded).
     return 1.0 - clamp(ao, 0.0, 1.0);
 }
 

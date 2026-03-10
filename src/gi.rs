@@ -18,8 +18,10 @@
 
 use ash::{vk, Device};
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::ptr::NonNull;
 use std::time::Instant;
+use image::ImageDecoder;
 use crate::light::{cube_face_matrices, LightManager};
 use crate::memory::{BufferHandle, GpuAllocator, ImageHandle, MemoryContext, MemoryLocation};
 use crate::world::SectorCoord;
@@ -27,6 +29,9 @@ use crate::world::SectorCoord;
 // ====================================================================
 //  Constants
 // ====================================================================
+
+/// HDR Blending term
+pub const BLEND_TERM: f32 = 0.5;
 
 /// World-space distance between adjacent SH probes (meters).
 pub const PROBE_SPACING: f32 = 32.0;
@@ -49,6 +54,25 @@ pub const ENV_MAP_SIZE: u32 = 128;
 /// Number of mip levels for the pre-filtered specular map.
 /// log2(128) + 1 = 8 mips, but we only need ~6 for roughness mapping.
 pub const ENV_MAP_MIP_LEVELS: u32 = 7;
+
+// ---- HDR environment map constants (Phase 6b) ----
+
+/// Face resolution for HDR cubemap derived from equirectangular source.
+/// For a 2048×1024 equirect → 512×512 per face.
+pub const HDR_CUBEMAP_FACE_SIZE: u32 = 512;
+
+/// Base resolution for HDR pre-filtered specular mip chain.
+pub const HDR_PREFILTER_BASE_SIZE: u32 = 256;
+
+/// Number of mip levels for the HDR pre-filtered specular map.
+pub const HDR_PREFILTER_MIP_LEVELS: u32 = 6;
+
+/// Irradiance output face size for HDR convolution.
+pub const HDR_IRRADIANCE_SIZE: u32 = 32;
+
+/// Default luminance clamp for HDR firefly prevention (§6.3.6).
+/// Applied per-pixel before convolution to prevent energy spikes.
+pub const HDR_LUMINANCE_CLAMP: f32 = 100.0;
 
 /// Resolution of the probe capture cubemap (per face, in pixels).
 pub const PROBE_CAPTURE_SIZE: u32 = 32;
@@ -254,7 +278,7 @@ impl GpuProbeGridParams {
         Self {
             grid_origin: [origin[0], origin[1], origin[2], spacing],
             grid_dims: [dims_x, dims_z, probe_count, 0],
-            probe_config: [probe_height, 1.0, time_of_day, 0.0],
+            probe_config: [probe_height, BLEND_TERM, time_of_day, 0.0],
         }
     }
 }
@@ -802,6 +826,331 @@ fn sample_cubemap(faces: &[Vec<u8>], size: usize, dir: [f32; 3]) -> [f32; 3] {
 }
 
 // ====================================================================
+//  HDR Environment Map Helpers (Phase 6b)
+// ====================================================================
+
+/// Clamp luminance of an HDR pixel to prevent firefly artefacts (§6.3.6).
+///
+/// Preserves hue by scaling RGB proportionally when luminance exceeds the
+/// threshold.  Default threshold is `HDR_LUMINANCE_CLAMP` (100.0).
+fn clamp_luminance(pixel: &mut [f32; 4], max_luminance: f32) {
+    let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+    if lum > max_luminance && lum > 0.0 {
+        let scale = max_luminance / lum;
+        pixel[0] *= scale;
+        pixel[1] *= scale;
+        pixel[2] *= scale;
+    }
+}
+
+/// Load an equirectangular `.hdr` file from disk, returning RGBA f32 pixels
+/// and (width, height).
+///
+/// Uses the `image` crate's HDR decoder via `ImageDecoder::read_image()`.
+/// The decoder outputs Rgb32F (12 bytes/pixel); we expand to RGBA with A=1.0.
+fn load_hdr_equirect(path: &Path) -> Result<(Vec<[f32; 4]>, u32, u32), Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use image::ImageDecoder;
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let decoder = image::codecs::hdr::HdrDecoder::new(reader)?;
+    let (width, height) = decoder.dimensions();
+
+    // Rgb32F: 3 channels × 4 bytes = 12 bytes per pixel.
+    let num_pixels = (width as usize) * (height as usize);
+    let mut raw = vec![0u8; num_pixels * 12];
+    decoder.read_image(&mut raw)?;
+
+    // Reinterpret [u8] as [f32] (little-endian on all Vulkan targets).
+    // Safety: raw is aligned to u8, we read 3 f32s at a time via from_le_bytes.
+    let mut pixels = Vec::with_capacity(num_pixels);
+    for i in 0..num_pixels {
+        let base = i * 12;
+        let r = f32::from_le_bytes([raw[base],     raw[base + 1],  raw[base + 2],  raw[base + 3]]);
+        let g = f32::from_le_bytes([raw[base + 4], raw[base + 5],  raw[base + 6],  raw[base + 7]]);
+        let b = f32::from_le_bytes([raw[base + 8], raw[base + 9],  raw[base + 10], raw[base + 11]]);
+        pixels.push([r, g, b, 1.0]);
+    }
+
+    println!(
+        "[GI-HDR] Loaded equirect '{}': {}×{}, {} pixels",
+        path.display(), width, height, pixels.len(),
+    );
+
+    Ok((pixels, width, height))
+}
+
+/// Sample an equirectangular map with bilinear interpolation.
+///
+/// `dir` must be normalized.  Returns RGB from the RGBA pixels.
+fn sample_equirect(pixels: &[[f32; 4]], width: u32, height: u32, dir: [f32; 3]) -> [f32; 3] {
+    // Standard equirectangular projection: (atan2(z, x), asin(y))
+    let theta = dir[2].atan2(dir[0]); // [-π, π]
+    let phi = dir[1].asin();           // [-π/2, π/2]
+
+    // Map to [0, 1] UV coordinates.
+    let u = 0.5 + theta / (2.0 * std::f32::consts::PI);
+    let v = 0.5 - phi / std::f32::consts::PI;
+
+    // Bilinear sample.
+    let fx = u * (width as f32) - 0.5;
+    let fy = v * (height as f32) - 0.5;
+
+    let x0 = (fx.floor() as i32).rem_euclid(width as i32) as u32;
+    let y0 = (fy.floor() as i32).clamp(0, height as i32 - 1) as u32;
+    let x1 = (x0 + 1) % width;
+    let y1 = (y0 + 1).min(height - 1);
+
+    let tx = fx - fx.floor();
+    let ty = fy - fy.floor();
+
+    let idx = |x: u32, y: u32| -> usize { (y * width + x) as usize };
+
+    let p00 = pixels[idx(x0, y0)];
+    let p10 = pixels[idx(x1, y0)];
+    let p01 = pixels[idx(x0, y1)];
+    let p11 = pixels[idx(x1, y1)];
+
+    let mut result = [0.0f32; 3];
+    for c in 0..3 {
+        let top = p00[c] * (1.0 - tx) + p10[c] * tx;
+        let bot = p01[c] * (1.0 - tx) + p11[c] * tx;
+        result[c] = top * (1.0 - ty) + bot * ty;
+    }
+    result
+}
+
+/// Convert an equirectangular HDR map to 6 cubemap faces (f32 RGBA).
+///
+/// `face_size` = output resolution per face.
+/// Luminance clamping is applied to `equirect_pixels` before this call.
+pub fn equirect_to_cubemap_hdr(
+    equirect_pixels: &[[f32; 4]],
+    equirect_w: u32,
+    equirect_h: u32,
+    face_size: u32,
+) -> Vec<Vec<[f32; 4]>> {
+    let size = face_size as usize;
+    let mut faces = Vec::with_capacity(6);
+
+    for face in 0..6u32 {
+        let mut face_data = Vec::with_capacity(size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let v = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let dir = normalize3(cube_face_dir(face, u, v));
+                let rgb = sample_equirect(equirect_pixels, equirect_w, equirect_h, dir);
+                face_data.push([rgb[0], rgb[1], rgb[2], 1.0]);
+            }
+        }
+        faces.push(face_data);
+    }
+    faces
+}
+
+/// Sample an HDR cubemap (6 faces of `[f32; 4]`) at a given direction.
+fn sample_cubemap_hdr(faces: &[Vec<[f32; 4]>], face_size: usize, dir: [f32; 3]) -> [f32; 3] {
+    let ax = dir[0].abs();
+    let ay = dir[1].abs();
+    let az = dir[2].abs();
+
+    let (face, u, v) = if ax >= ay && ax >= az {
+        if dir[0] > 0.0 {
+            (0, -dir[2] / ax, -dir[1] / ax)
+        } else {
+            (1, dir[2] / ax, -dir[1] / ax)
+        }
+    } else if ay >= ax && ay >= az {
+        if dir[1] > 0.0 {
+            (2, dir[0] / ay, dir[2] / ay)
+        } else {
+            (3, dir[0] / ay, -dir[2] / ay)
+        }
+    } else if dir[2] > 0.0 {
+        (4, dir[0] / az, -dir[1] / az)
+    } else {
+        (5, -dir[0] / az, -dir[1] / az)
+    };
+
+    let px = ((u * 0.5 + 0.5) * face_size as f32).clamp(0.0, (face_size - 1) as f32) as usize;
+    let py = ((v * 0.5 + 0.5) * face_size as f32).clamp(0.0, (face_size - 1) as f32) as usize;
+    let idx = py * face_size + px;
+
+    if idx < faces[face].len() {
+        let p = faces[face][idx];
+        [p[0], p[1], p[2]]
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// Convolve an HDR cubemap into a diffuse irradiance cubemap (f32).
+///
+/// Uses cosine-weighted hemisphere sampling, identical to the RGBA8 path
+/// but operating on `[f32; 4]` data to preserve HDR range.
+pub fn convolve_irradiance_hdr(
+    faces: &[Vec<[f32; 4]>],
+    face_size: u32,
+    out_size: u32,
+) -> Vec<Vec<[f32; 4]>> {
+    let size = out_size as usize;
+    let src_size = face_size as usize;
+    let mut out_faces = Vec::with_capacity(6);
+
+    const NUM_SAMPLES: u32 = 256;
+
+    for face in 0..6u32 {
+        let mut pixels = Vec::with_capacity(size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let v = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let normal = normalize3(cube_face_dir(face, u, v));
+
+                let up = if normal[1].abs() < 0.999 { [0.0, 1.0, 0.0] }
+                         else { [0.0, 0.0, 1.0] };
+                let tangent = normalize3(cross3(up, normal));
+                let bitangent = cross3(normal, tangent);
+
+                let mut irradiance = [0.0f32; 3];
+                let mut total_weight = 0.0f32;
+
+                for i in 0..NUM_SAMPLES {
+                    let xi = hammersley(i, NUM_SAMPLES);
+                    let phi = 2.0 * std::f32::consts::PI * xi[0];
+                    let cos_theta = (1.0 - xi[1]).sqrt();
+                    let sin_theta = xi[1].sqrt();
+
+                    let local = [
+                        sin_theta * phi.cos(),
+                        sin_theta * phi.sin(),
+                        cos_theta,
+                    ];
+                    let world = [
+                        tangent[0] * local[0] + bitangent[0] * local[1] + normal[0] * local[2],
+                        tangent[1] * local[0] + bitangent[1] * local[1] + normal[1] * local[2],
+                        tangent[2] * local[0] + bitangent[2] * local[1] + normal[2] * local[2],
+                    ];
+
+                    let color = sample_cubemap_hdr(faces, src_size, world);
+                    irradiance[0] += color[0];
+                    irradiance[1] += color[1];
+                    irradiance[2] += color[2];
+                    total_weight += 1.0;
+                }
+
+                if total_weight > 0.0 {
+                    let inv = std::f32::consts::PI / total_weight;
+                    irradiance[0] *= inv;
+                    irradiance[1] *= inv;
+                    irradiance[2] *= inv;
+                }
+
+                pixels.push([irradiance[0], irradiance[1], irradiance[2], 1.0]);
+            }
+        }
+        out_faces.push(pixels);
+    }
+    out_faces
+}
+
+/// Generate a pre-filtered specular environment map at a given roughness (f32).
+///
+/// GGX importance-sampled prefilter, identical algorithm to the RGBA8 path
+/// but on `[f32; 4]` HDR data.
+pub fn prefilter_env_hdr(
+    faces: &[Vec<[f32; 4]>],
+    face_size: u32,
+    out_size: u32,
+    roughness: f32,
+) -> Vec<Vec<[f32; 4]>> {
+    let size = out_size as usize;
+    let src_size = face_size as usize;
+    let a = roughness * roughness;
+    let mut out_faces = Vec::with_capacity(6);
+
+    let num_samples: u32 = if roughness < 0.05 { 64 } else { 256 };
+
+    for face in 0..6u32 {
+        let mut pixels = Vec::with_capacity(size * size);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let v = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let n = normalize3(cube_face_dir(face, u, v));
+                let r_dir = n;
+                let v_dir = r_dir;
+
+                let up = if n[1].abs() < 0.999 { [0.0, 1.0, 0.0] }
+                         else { [0.0, 0.0, 1.0] };
+                let tangent = normalize3(cross3(up, n));
+                let bitangent = cross3(n, tangent);
+
+                let mut color = [0.0f32; 3];
+                let mut total_weight = 0.0f32;
+
+                for i in 0..num_samples {
+                    let xi = hammersley(i, num_samples);
+                    let h_local = importance_sample_ggx(xi, a);
+
+                    let h = [
+                        tangent[0] * h_local[0] + bitangent[0] * h_local[1] + n[0] * h_local[2],
+                        tangent[1] * h_local[0] + bitangent[1] * h_local[1] + n[1] * h_local[2],
+                        tangent[2] * h_local[0] + bitangent[2] * h_local[1] + n[2] * h_local[2],
+                    ];
+
+                    let v_dot_h = dot3(v_dir, h).max(0.0);
+                    let l = [
+                        2.0 * v_dot_h * h[0] - v_dir[0],
+                        2.0 * v_dot_h * h[1] - v_dir[1],
+                        2.0 * v_dot_h * h[2] - v_dir[2],
+                    ];
+                    let n_dot_l = dot3(n, l);
+
+                    if n_dot_l > 0.0 {
+                        let sample = sample_cubemap_hdr(faces, src_size, l);
+                        color[0] += sample[0] * n_dot_l;
+                        color[1] += sample[1] * n_dot_l;
+                        color[2] += sample[2] * n_dot_l;
+                        total_weight += n_dot_l;
+                    }
+                }
+
+                if total_weight > 0.0 {
+                    color[0] /= total_weight;
+                    color[1] /= total_weight;
+                    color[2] /= total_weight;
+                }
+
+                pixels.push([color[0], color[1], color[2], 1.0]);
+            }
+        }
+        out_faces.push(pixels);
+    }
+    out_faces
+}
+
+/// Convert HDR `[f32; 4]` face data to packed RGBA16F bytes for GPU upload.
+///
+/// Each pixel becomes 8 bytes (4 × u16 half-float).  Returns one `Vec<u8>`
+/// per face, suitable for `upload_cubemap_faces`.
+fn hdr_faces_to_f16_bytes(faces: &[Vec<[f32; 4]>]) -> Vec<Vec<u8>> {
+    faces.iter().map(|face_pixels| {
+        let mut bytes = Vec::with_capacity(face_pixels.len() * 8);
+        for pixel in face_pixels {
+            for &channel in pixel {
+                let half = f32_to_f16(channel);
+                bytes.extend_from_slice(&half.to_le_bytes());
+            }
+        }
+        bytes
+    }).collect()
+}
+
+// ====================================================================
 //  ProbeGrid — CPU-side probe management
 // ====================================================================
 
@@ -1082,14 +1431,21 @@ pub struct GIResources {
 
 impl GIResources {
     /// Create all GI textures: BRDF LUT, irradiance cube map, pre-filtered env map.
+    ///
+    /// `hdr_path`:
+    /// - `None`  → procedural gradient sky (RGBA8, current default, unchanged).
+    /// - `Some`  → load equirectangular `.hdr` file, convolve at R16G16B16A16_SFLOAT.
+    ///
+    /// Both paths produce identical descriptor bindings (9: irradiance, 10: prefiltered).
     pub fn new(
         device: &Device,
         memory_ctx: &mut MemoryContext,
         command_pool: vk::CommandPool,
         queue: vk::Queue,
+        hdr_path: Option<&Path>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let start = Instant::now();
-        // ---- BRDF LUT ----
+        // ---- BRDF LUT (shared by both paths) ----
         println!("[GI] Generating BRDF LUT ({}×{})...", BRDF_LUT_SIZE, BRDF_LUT_SIZE);
         let brdf_data = generate_brdf_lut();
         let brdf_alloc = memory_ctx.create_image_with_data(
@@ -1113,23 +1469,15 @@ impl GIResources {
                 None,
             )?
         };
-        let start2 = Instant::now();
-        // ---- Sky cube map generation ----
-        let sun_dir = normalize3([0.5, 0.7, 0.3]);
-        println!("[GI] Generating sky cube map ({}×{} per face)...", ENV_MAP_SIZE, ENV_MAP_SIZE);
-        let sky_faces = generate_sky_cubemap(sun_dir);
-        let start3 = Instant::now();
-        // ---- Irradiance cube map (diffuse convolution) ----
-        let irr_size = 32u32;
-        println!("[GI] Convolving irradiance cube map ({}×{})...", irr_size, irr_size);
-        let irr_faces = convolve_irradiance_cubemap(&sky_faces, irr_size);
 
-        let (irradiance_image, irradiance_memory, irradiance_view) =
-            create_cubemap_from_faces(
-                device, memory_ctx,
-                &irr_faces, irr_size, 1,
-                command_pool, queue,
-            )?;
+        // ---- Branch: procedural sky (None) vs HDR file (Some) ----
+        let (irradiance_image, irradiance_memory, irradiance_view,
+             prefiltered_image, prefiltered_memory, prefiltered_view,
+             prefilter_mip_count) = if let Some(path) = hdr_path {
+            Self::create_hdr_env_maps(device, memory_ctx, command_pool, queue, path)?
+        } else {
+            Self::create_procedural_env_maps(device, memory_ctx, command_pool, queue)?
+        };
 
         let irradiance_sampler = unsafe {
             device.create_sampler(
@@ -1145,8 +1493,63 @@ impl GIResources {
                 None,
             )?
         };
-        let start4 = Instant::now();
-        // ---- Pre-filtered specular env map (mip chain for roughness) ----
+
+        let prefiltered_sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .min_lod(0.0)
+                    .max_lod(prefilter_mip_count as f32),
+                None,
+            )?
+        };
+
+        println!("[GI] All resources initialized in {:.2}s.", start.elapsed().as_secs_f64());
+
+        Ok(Self {
+            brdf_lut_handle: brdf_alloc.handle,
+            brdf_lut_view: brdf_alloc.view,
+            brdf_lut_sampler,
+            irradiance_image, irradiance_memory, irradiance_view, irradiance_sampler,
+            prefiltered_image, prefiltered_memory, prefiltered_view, prefiltered_sampler,
+        })
+    }
+
+    /// Procedural gradient sky path (`hdr_path = None`).
+    ///
+    /// Generates RGBA8 sky cubemap, convolves irradiance and prefiltered specular.
+    /// Returns (irr_image, irr_mem, irr_view, pf_image, pf_mem, pf_view, mip_count).
+    fn create_procedural_env_maps(
+        device: &Device,
+        memory_ctx: &mut MemoryContext,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView,
+                 vk::Image, vk::DeviceMemory, vk::ImageView, u32),
+               Box<dyn std::error::Error>> {
+        let sun_dir = normalize3([0.5, 0.7, 0.3]);
+        println!("[GI] Generating procedural sky cube map ({}×{} per face)...", ENV_MAP_SIZE, ENV_MAP_SIZE);
+        let sky_faces = generate_sky_cubemap(sun_dir);
+
+        // ---- Irradiance (diffuse convolution) ----
+        let irr_size = 32u32;
+        println!("[GI] Convolving irradiance cube map ({}×{})...", irr_size, irr_size);
+        let irr_faces = convolve_irradiance_cubemap(&sky_faces, irr_size);
+
+        let (irradiance_image, irradiance_memory, irradiance_view) =
+            create_cubemap_from_faces(
+                device, memory_ctx,
+                &irr_faces, irr_size, 1,
+                vk::Format::R8G8B8A8_UNORM,
+                command_pool, queue,
+            )?;
+
+        // ---- Pre-filtered specular (mip chain for roughness) ----
         println!("[GI] Pre-filtering specular env map ({} mip levels)...", ENV_MAP_MIP_LEVELS);
         let mut prefilter_mips: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ENV_MAP_MIP_LEVELS as usize);
         for mip in 0..ENV_MAP_MIP_LEVELS {
@@ -1160,39 +1563,90 @@ impl GIResources {
             create_cubemap_from_mips(
                 device, memory_ctx,
                 &prefilter_mips, ENV_MAP_SIZE, ENV_MAP_MIP_LEVELS,
+                vk::Format::R8G8B8A8_UNORM,
                 command_pool, queue,
             )?;
 
-        let prefiltered_sampler = unsafe {
-            device.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .min_lod(0.0)
-                    .max_lod(ENV_MAP_MIP_LEVELS as f32),
-                None,
-            )?
-        };
+        Ok((irradiance_image, irradiance_memory, irradiance_view,
+            prefiltered_image, prefiltered_memory, prefiltered_view,
+            ENV_MAP_MIP_LEVELS))
+    }
 
-        println!("[GI] All resources initialized.");
-        println!("        [GI-BRDF LUT] took {}sec
-        [GI-SkyMap LUT] took {}sec
-        [GI-IrrMap] took {}sec
-        [GI-IBL] took {}sec", start.elapsed().as_secs(), 
-                  start2.elapsed().as_secs(), start3.elapsed().as_secs(), 
-                  start4.elapsed().as_secs());
+    /// HDR environment map path (`hdr_path = Some`).
+    ///
+    /// Loads equirectangular `.hdr`, converts to cubemap, convolves at R16G16B16A16_SFLOAT.
+    /// Returns (irr_image, irr_mem, irr_view, pf_image, pf_mem, pf_view, mip_count).
+    fn create_hdr_env_maps(
+        device: &Device,
+        memory_ctx: &mut MemoryContext,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        path: &Path,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView,
+                 vk::Image, vk::DeviceMemory, vk::ImageView, u32),
+               Box<dyn std::error::Error>> {
+        let hdr_format = vk::Format::R16G16B16A16_SFLOAT;
 
-        Ok(Self {
-            brdf_lut_handle: brdf_alloc.handle,
-            brdf_lut_view: brdf_alloc.view,
-            brdf_lut_sampler,
-            irradiance_image, irradiance_memory, irradiance_view, irradiance_sampler,
-            prefiltered_image, prefiltered_memory, prefiltered_view, prefiltered_sampler,
-        })
+        // ---- 1. Load equirectangular HDR ----
+        let (mut equirect_pixels, eq_w, eq_h) = load_hdr_equirect(path)?;
+
+        // ---- 2. Luminance clamp (§6.3.6) ----
+        println!("[GI-HDR] Clamping luminance (max={})...", HDR_LUMINANCE_CLAMP);
+        for pixel in &mut equirect_pixels {
+            clamp_luminance(pixel, HDR_LUMINANCE_CLAMP);
+        }
+
+        // ---- 3. Equirect → cubemap ----
+        let face_size = (eq_w / 4).max(1);
+        println!("[GI-HDR] Converting equirect to cubemap ({}×{} per face)...", face_size, face_size);
+        let hdr_faces = equirect_to_cubemap_hdr(&equirect_pixels, eq_w, eq_h, face_size);
+        // Drop equirect data — no longer needed.
+        drop(equirect_pixels);
+
+        // ---- 4. Irradiance convolution (f32 → f16 bytes) ----
+        let irr_size = HDR_IRRADIANCE_SIZE;
+        println!("[GI-HDR] Convolving irradiance cube map ({}×{})...", irr_size, irr_size);
+        let irr_hdr_faces = convolve_irradiance_hdr(&hdr_faces, face_size, irr_size);
+        let irr_f16_faces = hdr_faces_to_f16_bytes(&irr_hdr_faces);
+
+        let (irradiance_image, irradiance_memory, irradiance_view) =
+            create_cubemap_from_faces(
+                device, memory_ctx,
+                &irr_f16_faces, irr_size, 1,
+                hdr_format,
+                command_pool, queue,
+            )?;
+
+        // ---- 5. Pre-filtered specular (mip chain, f32 → f16 bytes) ----
+        let pf_base = HDR_PREFILTER_BASE_SIZE;
+        let pf_mips = HDR_PREFILTER_MIP_LEVELS;
+        println!("[GI-HDR] Pre-filtering specular env map (base={}, {} mip levels)...", pf_base, pf_mips);
+        let mut prefilter_mip_bytes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(pf_mips as usize);
+        for mip in 0..pf_mips {
+            let mip_size = (pf_base >> mip).max(1);
+            let roughness = mip as f32 / (pf_mips - 1).max(1) as f32;
+            let pf_faces = prefilter_env_hdr(&hdr_faces, face_size, mip_size, roughness);
+            prefilter_mip_bytes.push(hdr_faces_to_f16_bytes(&pf_faces));
+        }
+
+        let (prefiltered_image, prefiltered_memory, prefiltered_view) =
+            create_cubemap_from_mips(
+                device, memory_ctx,
+                &prefilter_mip_bytes, pf_base, pf_mips,
+                hdr_format,
+                command_pool, queue,
+            )?;
+
+        let src_mb = (face_size * face_size * 8 * 6) as f64 / (1024.0 * 1024.0);
+        let irr_kb = (irr_size * irr_size * 8 * 6) as f64 / 1024.0;
+        println!(
+            "[GI-HDR] Done. Source cubemap {:.1} MB, irradiance {:.0} KB, prefiltered {} mips",
+            src_mb, irr_kb, pf_mips,
+        );
+
+        Ok((irradiance_image, irradiance_memory, irradiance_view,
+            prefiltered_image, prefiltered_memory, prefiltered_view,
+            pf_mips))
     }
 
     pub fn destroy(&self, device: &Device) {
@@ -1516,21 +1970,35 @@ impl ProbeBakeTarget {
 //  Vulkan Cube Map Creation Helpers
 // ====================================================================
 
+/// Return bytes-per-pixel for the cubemap formats we support.
+fn format_bytes_per_pixel(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => 4,
+        vk::Format::R16G16B16A16_SFLOAT => 8,
+        _ => panic!("Unsupported cubemap format: {:?}", format),
+    }
+}
+
 /// Create a VkImage cube map from 6 face images (single mip level).
+///
+/// `format` — `R8G8B8A8_UNORM` for procedural sky, `R16G16B16A16_SFLOAT` for HDR.
 fn create_cubemap_from_faces(
     device: &Device,
     memory_ctx: &mut MemoryContext,
     faces: &[Vec<u8>],
     size: u32,
     mip_levels: u32,
+    format: vk::Format,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), Box<dyn std::error::Error>> {
     assert_eq!(faces.len(), 6);
 
+    let bytes_per_pixel = format_bytes_per_pixel(format);
+
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::R8G8B8A8_UNORM)
+        .format(format)
         .extent(vk::Extent3D { width: size, height: size, depth: 1 })
         .mip_levels(mip_levels)
         .array_layers(6)
@@ -1555,14 +2023,14 @@ fn create_cubemap_from_faces(
     unsafe { device.bind_image_memory(image, memory, 0)? };
 
     // Upload faces via staging.
-    upload_cubemap_faces(device, memory_ctx, image, faces, size, 0, command_pool, queue)?;
+    upload_cubemap_faces(device, memory_ctx, image, faces, size, 0, bytes_per_pixel, command_pool, queue)?;
 
     let view = unsafe {
         device.create_image_view(
             &vk::ImageViewCreateInfo::default()
                 .image(image)
                 .view_type(vk::ImageViewType::CUBE)
-                .format(vk::Format::R8G8B8A8_UNORM)
+                .format(format)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -1578,18 +2046,23 @@ fn create_cubemap_from_faces(
 }
 
 /// Create a VkImage cube map with multiple mip levels.
+///
+/// `format` — `R8G8B8A8_UNORM` for procedural sky, `R16G16B16A16_SFLOAT` for HDR.
 fn create_cubemap_from_mips(
     device: &Device,
     memory_ctx: &mut MemoryContext,
     mips: &[Vec<Vec<u8>>], // [mip_level][face] -> pixel data
     base_size: u32,
     mip_levels: u32,
+    format: vk::Format,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), Box<dyn std::error::Error>> {
+    let bytes_per_pixel = format_bytes_per_pixel(format);
+
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::R8G8B8A8_UNORM)
+        .format(format)
         .extent(vk::Extent3D { width: base_size, height: base_size, depth: 1 })
         .mip_levels(mip_levels)
         .array_layers(6)
@@ -1616,7 +2089,7 @@ fn create_cubemap_from_mips(
     // Upload each mip level.
     for (mip, faces) in mips.iter().enumerate() {
         let mip_size = (base_size >> mip).max(1);
-        upload_cubemap_faces(device, memory_ctx, image, faces, mip_size, mip as u32, command_pool, queue)?;
+        upload_cubemap_faces(device, memory_ctx, image, faces, mip_size, mip as u32, bytes_per_pixel, command_pool, queue)?;
     }
 
     let view = unsafe {
@@ -1624,7 +2097,7 @@ fn create_cubemap_from_mips(
             &vk::ImageViewCreateInfo::default()
                 .image(image)
                 .view_type(vk::ImageViewType::CUBE)
-                .format(vk::Format::R8G8B8A8_UNORM)
+                .format(format)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -1640,6 +2113,8 @@ fn create_cubemap_from_mips(
 }
 
 /// Upload 6 face images to a cube map at a specific mip level.
+///
+/// `bytes_per_pixel` — 4 for RGBA8, 8 for RGBA16F.
 fn upload_cubemap_faces(
     device: &Device,
     memory_ctx: &mut MemoryContext,
@@ -1647,10 +2122,11 @@ fn upload_cubemap_faces(
     faces: &[Vec<u8>],
     size: u32,
     mip_level: u32,
+    bytes_per_pixel: u32,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let face_bytes = (size * size * 4) as usize;
+    let face_bytes = (size * size * bytes_per_pixel) as usize;
 
     // Concatenate all 6 faces into one staging upload.
     let total_bytes = face_bytes * 6;

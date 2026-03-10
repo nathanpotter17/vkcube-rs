@@ -15,5 +15,5 @@ path = "src/lib.rs"
 ash = { version = "0.38", features = ["linked"] }
 sdl2 = { version = "0.37", features = ["bundled", "raw-window-handle"] }
 gltf = { version = "1.4", features = ["KHR_materials_emissive_strength", "KHR_materials_specular"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
 mikktspace = "0.3.0"
