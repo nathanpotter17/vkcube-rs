@@ -493,10 +493,12 @@ impl World {
             let dist_sq = if let Some(sec) = self.sectors.get(&(sx, sz)) {
                 sec.distance_sq_to_point_xz(camera_xz)
             } else {
-                let center_x = sx as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
-                let center_z = sz as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
-                let dx = center_x - camera_xz[0];
-                let dz = center_z - camera_xz[1];
+                let x0 = sx as f32 * SECTOR_SIZE;
+                let x1 = x0 + SECTOR_SIZE;
+                let z0 = sz as f32 * SECTOR_SIZE;
+                let z1 = z0 + SECTOR_SIZE;
+                let dx = (x0 - camera_xz[0]).max(0.0).max(camera_xz[0] - x1);
+                let dz = (z0 - camera_xz[1]).max(0.0).max(camera_xz[1] - z1);
                 dx * dx + dz * dz
             };
             if dist_sq > r_sq { continue; }
