@@ -40,6 +40,10 @@ pub struct DeviceContext {
     pub min_ubo_alignment: u64,
     pub debug_utils: Option<debug_utils::Instance>,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    /// Nanoseconds per GPU timestamp tick (from VkPhysicalDeviceLimits).
+    pub timestamp_period: f32,
+    /// Number of valid bits in timestamp queries for the graphics queue family.
+    pub timestamp_valid_bits: u32,
 }
 
 unsafe extern "system" fn debug_callback(
@@ -266,6 +270,15 @@ impl DeviceContext {
                 instance.get_physical_device_properties(physical_device);
             let min_ubo_alignment =
                 device_properties.limits.min_uniform_buffer_offset_alignment;
+            let timestamp_period = device_properties.limits.timestamp_period;
+
+            // timestampValidBits for the graphics queue family.
+            let gfx_family_props =
+                instance.get_physical_device_queue_family_properties(physical_device);
+            let timestamp_valid_bits = gfx_family_props
+                .get(graphics_family as usize)
+                .map(|p| p.timestamp_valid_bits)
+                .unwrap_or(64);
 
             // ---- swapchain ----
 
@@ -405,6 +418,8 @@ impl DeviceContext {
                 min_ubo_alignment,
                 debug_utils,
                 debug_messenger,
+                timestamp_period,
+                timestamp_valid_bits,
             })
         }
     }

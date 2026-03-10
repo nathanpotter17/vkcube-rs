@@ -11,3 +11,5 @@ pub mod renderer;
 pub mod scene;
 pub mod loader;
 pub mod postprocess;
+pub mod profiler;
+pub mod overlay;

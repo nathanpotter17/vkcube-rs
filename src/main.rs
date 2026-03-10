@@ -12,20 +12,21 @@ use simmerlib::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n╔════════════════════════════════════╗");
+    println!("\n╔══════════════════════════════════╗");
     println!("║        VULKAN RENDERER             ║");
     println!("║   VMA-Style Memory Architecture    ║");
     println!("║   + Async Streaming & Budgeting    ║");
     println!("╠════════════════════════════════════╣");
     println!("║  Controls (UE5 fly mode):          ║");
     println!("║    RMB + Mouse  = Look around      ║");
-    println!("║    W/A/S/D      = Move              ║");
-    println!("║    Q / E        = Down / Up         ║");
-    println!("║    Shift        = Move fast         ║");
-    println!("║    Scroll       = Adjust speed      ║");
-    println!("║    L            = Spawn point light ║");
-    println!("║    G            = Spawn geometry    ║");
-    println!("║    Escape       = Quit              ║");
+    println!("║    W/A/S/D      = Move             ║");
+    println!("║    Q / E        = Down / Up        ║");
+    println!("║    Shift        = Move fast        ║");
+    println!("║    Scroll       = Adjust speed     ║");
+    println!("║    L            = Spawn point light║");
+    println!("║    G            = Spawn geometry   ║");
+    println!("║    O            = Toggle overlay   ║");
+    println!("║    Escape       = Quit             ║");
     println!("╚════════════════════════════════════╝");
 
     // SDL2
@@ -122,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match kc {
                         sdl2::keyboard::Keycode::L => actions.push(InputAction::SpawnLight),
                         sdl2::keyboard::Keycode::G => actions.push(InputAction::SpawnGeometry),
+                        sdl2::keyboard::Keycode::O => actions.push(InputAction::ToggleOverlay),
                         _ => {}
                     }
                 }

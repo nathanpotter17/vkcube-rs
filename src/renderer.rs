@@ -29,6 +29,8 @@ use crate::world::{
 };
 use crate::loader::GltfLoader;
 use crate::postprocess::HbaoPass;
+use crate::profiler::{GpuProfiler, PassId};
+use crate::overlay::DebugOverlay;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -205,6 +207,8 @@ pub struct Renderer {
 
     hbao_pass: HbaoPass,
     has_hdr_skybox: bool,
+    profiler: GpuProfiler,
+    overlay: DebugOverlay,
 }
 
 impl Renderer {
@@ -371,6 +375,8 @@ impl Renderer {
         let hbao_blur_comp_spv: &[u8] = include_bytes!("../shaders/compiled/hbao_blur.comp.spv");
         let skybox_vert_spv: &[u8] = include_bytes!("../shaders/compiled/skybox.vert.spv");
         let skybox_frag_spv: &[u8] = include_bytes!("../shaders/compiled/skybox.frag.spv");
+        let overlay_vert_spv: &[u8] = include_bytes!("../shaders/compiled/overlay.vert.spv");
+        let overlay_frag_spv: &[u8] = include_bytes!("../shaders/compiled/overlay.frag.spv");
 
         let probe_bake_target = ProbeBakeTarget::new(
             &device, &memory_ctx.allocator, render_passes.probe_capture,
@@ -404,6 +410,22 @@ impl Renderer {
             inv_proj,
             hbao_comp_spv,
             hbao_blur_comp_spv,
+        )?;
+
+        let profiler = GpuProfiler::new(
+            &device,
+            device_ctx.timestamp_period,
+            device_ctx.timestamp_valid_bits,
+        )?;
+
+        let overlay = DebugOverlay::new(
+            &device,
+            &memory_ctx.allocator,
+            render_passes.lighting,
+            device_ctx.command_pool,
+            device_ctx.queue,
+            overlay_vert_spv,
+            overlay_frag_spv,
         )?;
 
         let global_ubo_size = std::mem::size_of::<GlobalUbo>() as u64;
@@ -499,6 +521,8 @@ impl Renderer {
             normal_image, normal_memory, normal_view,
             hbao_pass,
             has_hdr_skybox: hdr_path.is_some(),
+            profiler,
+            overlay,
         })
     }
 
@@ -809,6 +833,8 @@ impl Renderer {
             self.drain_deferred_frees();
             self.scene.update(dt, input);
             self.update_dynamic_lights(dt);
+            // Phase 7: Read GPU timestamp results from previous frame in this slot.
+            self.profiler.read_results(&self.device, self.current_frame);
             self.memory_ctx.ring.begin_frame(self.current_frame);
 
             let view_mat = self.scene.camera.get_view_matrix();
@@ -863,6 +889,9 @@ impl Renderer {
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
 
+            // Phase 7: Reset timestamp queries for this frame slot.
+            self.profiler.reset_queries(&self.device, cmd, self.current_frame);
+
             let viewport = vk::Viewport { x:0.0, y:0.0,
                 width: device_ctx.swapchain_extent.width as f32,
                 height: device_ctx.swapchain_extent.height as f32,
@@ -886,9 +915,32 @@ impl Renderer {
                 );
             }
 
+            // Phase 7: Collect overlay stats.
+            if self.overlay.visible {
+                self.overlay.collect_profiler_stats(&self.profiler);
+                self.overlay.stats.sectors_ready = self.world.ready_sector_count();
+                self.overlay.stats.sectors_streaming = self.world.streaming_sector_count();
+                self.overlay.stats.sectors_unloaded = self.world.sectors.values()
+                    .filter(|s| s.state == SectorState::Unloaded).count();
+                self.overlay.stats.in_flight_uploads = self.pending_sectors.len();
+                self.overlay.stats.pool_used_mb = self.memory_ctx.allocator.total_used() as f32 / (1024.0 * 1024.0);
+                self.overlay.stats.pool_allocated_mb = self.memory_ctx.allocator.total_allocated() as f32 / (1024.0 * 1024.0);
+                self.overlay.stats.budget_mb = self.memory_ctx.budget.budget_bytes() as f32 / (1024.0 * 1024.0);
+                self.overlay.stats.tracked_mb = self.memory_ctx.budget.tracked_bytes() as f32 / (1024.0 * 1024.0);
+                self.overlay.stats.lights_total = self.light_manager.total_count();
+                self.overlay.stats.lights_active = active_light_count;
+                self.overlay.stats.lights_shadow = self.shadow_budget.active_shadow_count();
+                self.overlay.stats.draw_calls_opaque = self.world.opaque_draws.len();
+                self.overlay.stats.draw_calls_shadow = self.world.shadow_draws.len();
+                self.overlay.stats.staging_fill_pct = self.memory_ctx.transfer.staging_fill_ratio() * 100.0;
+                self.overlay.stats.ring_fill_pct = self.memory_ctx.ring.frame_fill_ratio() * 100.0;
+                self.overlay.stats.frame_dt_ms = dt * 1000.0;
+            }
+
             // ============================================================
             //  PASS 0: Shadow Pass
             // ============================================================
+            self.profiler.begin_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
             // ---- Sun directional shadow (single 2D depth pass) ----
             {
@@ -998,6 +1050,8 @@ impl Renderer {
                     self.device.cmd_end_render_pass(cmd);
                 }
             }
+
+            self.profiler.end_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
             // ============================================================
             //  PASS 0.5: GPU Probe Cubemap Capture + SH Projection (Phase 3)
@@ -1122,6 +1176,8 @@ impl Renderer {
             // ============================================================
             //  PASS 1: Depth Pre-Pass + G-Buffer Normal
             // ============================================================
+            self.profiler.begin_pass(&self.device, cmd, PassId::Depth, self.current_frame);
+
             // Attachment 0: R16G16_SFLOAT normal (octahedral encoded)
             // Attachment 1: D32_SFLOAT depth
             // Clear normal to (0.5, 0.5) = octEncode(0,0,1) — benign default for sky pixels.
@@ -1145,9 +1201,13 @@ impl Renderer {
             self.record_draw_list(cmd, &opaque_draws, view_mat, proj_mat);
             self.device.cmd_end_render_pass(cmd);
 
+            self.profiler.end_pass(&self.device, cmd, PassId::Depth, self.current_frame);
+
             // ============================================================
             //  PASS 1.5: HBAO (Phase 6)
             // ============================================================
+            self.profiler.begin_pass(&self.device, cmd, PassId::Hbao, self.current_frame);
+
             //
             // Transition depth to read-only and normal to shader-read for
             // compute sampling, dispatch HBAO + bilateral blur, then
@@ -1180,9 +1240,13 @@ impl Renderer {
             self.hbao_pass.dispatch(&self.device, cmd);
             HbaoPass::barrier_depth_to_attachment(&self.device, cmd, device_ctx.depth_image);
 
+            self.profiler.end_pass(&self.device, cmd, PassId::Hbao, self.current_frame);
+
             // ============================================================
             //  PASS 2: Cluster Assignment Compute
             // ============================================================
+            self.profiler.begin_pass(&self.device, cmd, PassId::Cluster, self.current_frame);
+
             self.device.cmd_fill_buffer(cmd, self.lighting_buffers.index_ssbo_buffers[self.current_frame], 0, 16, 0);
             let fb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE);
@@ -1200,9 +1264,13 @@ impl Renderer {
                 vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(),
                 std::slice::from_ref(&pc), &[], &[]);
 
+            self.profiler.end_pass(&self.device, cmd, PassId::Cluster, self.current_frame);
+
             // ============================================================
             //  PASS 3: Lighting Pass
             // ============================================================
+            self.profiler.begin_pass(&self.device, cmd, PassId::Lighting, self.current_frame);
+
             let lc = [
                 vk::ClearValue{color:vk::ClearColorValue{float32:[0.01,0.01,0.015,1.0]}},
                 vk::ClearValue{depth_stencil:vk::ClearDepthStencilValue{depth:1.0,stencil:0}},
@@ -1236,7 +1304,23 @@ impl Renderer {
                 self.device.cmd_draw(cmd, 36, 1, 0, 0);
             }
 
+            // Phase 7: Debug overlay (renders inside the lighting pass).
+            self.overlay.record_commands(
+                &self.device, cmd, &mut self.memory_ctx.ring,
+                device_ctx.swapchain_extent.width as f32,
+                device_ctx.swapchain_extent.height as f32,
+            );
+
             self.device.cmd_end_render_pass(cmd);
+
+            // Phase 7: End lighting pass timing (after render pass to include
+            // overlay cost within the pass measurement).
+            self.profiler.end_pass(&self.device, cmd, PassId::Lighting, self.current_frame);
+
+            // Phase 7: Post pass (placeholder for future bloom/tonemap/FXAA).
+            self.profiler.begin_pass(&self.device, cmd, PassId::Post, self.current_frame);
+            self.profiler.end_pass(&self.device, cmd, PassId::Post, self.current_frame);
+
             self.device.end_command_buffer(cmd)?;
 
             // ---- Submit + Present ----
@@ -1298,6 +1382,10 @@ impl Renderer {
             match action {
                 InputAction::SpawnLight => self.spawn_random_light(),
                 InputAction::SpawnGeometry => self.spawn_random_geometry(),
+                InputAction::ToggleOverlay => {
+                    self.overlay.visible = !self.overlay.visible;
+                    println!("[Overlay] {}", if self.overlay.visible { "shown" } else { "hidden" });
+                }
             }
         }
     }
@@ -1555,6 +1643,8 @@ impl Drop for Renderer {
         self.device.free_memory(self.normal_memory, None);
         self.hbao_pass.destroy(&self.device, &mut self.memory_ctx.allocator);
         self.probe_bake_target.destroy(&self.device);
+        self.profiler.destroy(&self.device);
+        self.overlay.destroy(&self.device);
         // probe_grid SSBO freed via allocator on MemoryContext drop
         self.lighting_buffers.destroy(&mut self.memory_ctx.allocator);
     }}

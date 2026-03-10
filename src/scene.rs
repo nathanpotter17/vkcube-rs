@@ -106,6 +106,7 @@ pub type UniformBufferObject = PerDrawUbo;
 pub enum InputAction {
     SpawnLight,
     SpawnGeometry,
+    ToggleOverlay,
 }
 
 /// Per-frame input state built by main.rs from SDL2 events.

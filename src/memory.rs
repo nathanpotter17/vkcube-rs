@@ -1019,6 +1019,11 @@ impl RingBuffer {
         }
         Some(slice)
     }
+
+    /// Current frame's fill ratio (0.0 – 1.0).
+    pub fn frame_fill_ratio(&self) -> f32 {
+        self.frame_offset as f32 / self.frame_size as f32
+    }
 }
 
 // ====================================================================
@@ -1514,6 +1519,11 @@ impl TransferQueue {
             );
         }
     }
+
+    /// Current staging ring fill ratio (0.0 – 1.0).
+    pub fn staging_fill_ratio(&self) -> f32 {
+        self.staging_offset as f32 / self.staging_size as f32
+    }
 }
 
 impl Drop for TransferQueue {
@@ -1647,6 +1657,11 @@ impl MemoryBudget {
 
     pub fn tracked_bytes(&self) -> u64 {
         self.usage.values().map(|r| r.size).sum()
+    }
+
+    /// The configured VRAM budget in bytes.
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
     }
 }
 
