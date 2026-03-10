@@ -1,17 +1,13 @@
-// Phase 3 PBR Fragment Shader — Clustered Shading + Shadows + GI
+// Phase 4 PBR Fragment Shader — Clustered Shading + Shadows + GI + TBN Normal Mapping
 // Compile: glslangValidator -V pbr.frag -o compiled/basic.frag.spv
 //
-// Phase 2 features retained:
-//   - Clustered shading lookup (set 0, bindings 1-4)
-//   - Point / spot / directional light evaluation
-//   - Shadow cube map sampling (set 2, binding 0)
-//   - Cook-Torrance specular BRDF
-//
-// Phase 3 additions:
-//   - SH probe grid for diffuse GI (set 0, bindings 6-7)
-//   - BRDF LUT for split-sum IBL (set 0, binding 8)
-//   - Irradiance cube map for diffuse IBL (set 0, binding 9)
-//   - Pre-filtered environment map for specular IBL (set 0, binding 10)
+// Phase 4 additions:
+//   - TBN normal mapping via fragTangent/fragBitangent from vertex shader
+//   - getShadingNormal() constructs TBN matrix, samples normal_tex when slot > 0
+//   - ORM unpacking: metallic_roughness_tex R=occlusion, G=roughness, B=metallic
+//   - Emissive texture multiplication when emissive_tex > 0
+//   - AO texture sampling when ao_tex > 0
+//   - ACES filmic tone mapping (replaces Reinhard from Phase 3)
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -21,6 +17,8 @@ layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec2 fragUV;
 layout(location = 3) in vec3 fragColor;
 layout(location = 4) flat in uint fragMaterialId;
+layout(location = 5) in vec3 fragTangent;      // Phase 4
+layout(location = 6) in vec3 fragBitangent;    // Phase 4
 
 layout(location = 0) out vec4 outColor;
 
@@ -164,6 +162,60 @@ const float SH_Y22  = 0.546274;
 
 // Maximum number of pre-filtered env map mip levels.
 const float MAX_REFLECTION_LOD = 6.0;
+
+// Material flags (must match material.rs).
+const uint FLAG_DOUBLE_SIDED = 1u;
+const uint FLAG_ALPHA_BLEND  = 2u;
+const uint FLAG_ALPHA_CUTOFF = 4u;
+
+// ====================================================================
+//  ACES Filmic Tone Mapping (Phase 4: replaces Reinhard)
+// ====================================================================
+
+// sRGB → ACEScg (approximate AP1 working space).
+// Fitted RRT+ODT from Stephen Hill's ACES reference implementation.
+vec3 acesFilm(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// ====================================================================
+//  Phase 4: TBN Normal Mapping
+// ====================================================================
+
+/// Construct the shading normal from the TBN basis and normal map.
+/// When normal_tex == 0 (no normal map), returns the interpolated
+/// geometric normal.  Uses gl_FrontFacing for double-sided materials.
+vec3 getShadingNormal(MaterialData mat) {
+    vec3 N = normalize(fragNormal);
+    vec3 T = normalize(fragTangent);
+    vec3 B = normalize(fragBitangent);
+
+    // Flip normal for back faces (double-sided materials).
+    if (!gl_FrontFacing && (mat.flags & FLAG_DOUBLE_SIDED) != 0u) {
+        N = -N;
+        T = -T;
+        B = -B;
+    }
+
+    if (mat.normal_tex > 0u) {
+        // Sample tangent-space normal from the normal map.
+        vec3 tangentNormal = texture(textures[nonuniformEXT(mat.normal_tex)], fragUV).rgb;
+        tangentNormal = tangentNormal * 2.0 - 1.0;
+        tangentNormal.xy *= mat.normal_scale;
+        tangentNormal = normalize(tangentNormal);
+
+        // Transform from tangent space to world space via TBN matrix.
+        mat3 TBN = mat3(T, B, N);
+        N = normalize(TBN * tangentNormal);
+    }
+
+    return N;
+}
 
 // ====================================================================
 //  PBR BRDF functions
@@ -398,17 +450,38 @@ vec3 evaluateLight(
 void main() {
     MaterialData mat = materialBuf.materials[fragMaterialId];
 
+    // ---- Base color (albedo texture × vertex color × material factor) ----
     vec4 baseColor = mat.base_color * vec4(fragColor, 1.0);
     if (mat.albedo_tex > 0u) {
         baseColor *= texture(textures[nonuniformEXT(mat.albedo_tex)], fragUV);
     }
-    if ((mat.flags & 4u) != 0u && baseColor.a < mat.alpha_cutoff) discard;
+    if ((mat.flags & FLAG_ALPHA_CUTOFF) != 0u && baseColor.a < mat.alpha_cutoff) discard;
 
-    vec3 N = normalize(fragNormal);
+    // ---- Phase 4: Shading normal via TBN ----
+    vec3 N = getShadingNormal(mat);
     vec3 V = normalize(frame.camera_pos.xyz - fragWorldPos);
+
+    // ---- Phase 4: ORM unpacking ----
+    // When metallic_roughness_tex is bound, sample it.
+    // glTF convention: R = occlusion, G = roughness, B = metallic.
     float metallic  = mat.metallic;
-    float roughness = max(mat.roughness, 0.04);
-    vec3  albedo    = baseColor.rgb;
+    float roughness = mat.roughness;
+    float ao        = mat.ao;
+
+    if (mat.metallic_roughness_tex > 0u) {
+        vec4 orm = texture(textures[nonuniformEXT(mat.metallic_roughness_tex)], fragUV);
+        ao        *= orm.r;    // Occlusion channel
+        roughness *= orm.g;    // Roughness channel
+        metallic  *= orm.b;    // Metallic channel
+    }
+
+    // Phase 4: Separate AO texture (when present, overrides ORM occlusion).
+    if (mat.ao_tex > 0u) {
+        ao = texture(textures[nonuniformEXT(mat.ao_tex)], fragUV).r;
+    }
+
+    roughness = max(roughness, 0.04);
+    vec3  albedo = baseColor.rgb;
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     float NdotV = max(dot(N, V), 0.0);
 
@@ -438,13 +511,18 @@ void main() {
     vec3 indirectSpecular = sampleSpecularIBL(R, roughness, F_env, brdf);
 
     // ---- Compose ----
-    float ao = mat.ao;
     vec3 ambient = (diffuseGI + indirectSpecular) * ao;
+
+    // ---- Phase 4: Emissive texture multiplication ----
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;
+    if (mat.emissive_tex > 0u) {
+        emissive *= texture(textures[nonuniformEXT(mat.emissive_tex)], fragUV).rgb;
+    }
+
     vec3 color = ambient + Lo + emissive;
 
-    // Tone mapping (Reinhard; ACES in Phase 6).
-    color = color / (color + vec3(1.0));
+    // ---- Phase 4: ACES Filmic Tone Mapping (replaces Reinhard) ----
+    color = acesFilm(color);
     // Gamma correction.
     color = pow(color, vec3(1.0 / 2.2));
 

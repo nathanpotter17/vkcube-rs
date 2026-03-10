@@ -18,7 +18,7 @@ use crate::pipeline::{
     DescriptorLayouts, FrameDescriptors, FrameLightingBuffers, PassFramebuffers,
     Pipelines, RenderPasses,
 };
-use crate::scene::{InputAction, InputState, Scene, UniformBufferObject, Vertex};
+use crate::scene::{InputAction, InputState, Scene, PerDrawUbo, Vertex};
 use crate::texture::TextureManager;
 use crate::world::{
     Aabb, DrawCommand, LodChain, MeshRange, ObjectDescriptor, RenderFlags,
@@ -266,7 +266,7 @@ impl Renderer {
 
         let global_ubo_size = std::mem::size_of::<GlobalUbo>() as u64;
         let cluster_params_size = std::mem::size_of::<ClusterParamsUbo>() as u64;
-        let per_draw_ubo_size = std::mem::size_of::<UniformBufferObject>() as u64;
+        let per_draw_ubo_size = std::mem::size_of::<PerDrawUbo>() as u64;
         let material_ssbo_size = (material_library.count() * std::mem::size_of::<MaterialData>()) as u64;
         let probe_grid_params_size = std::mem::size_of::<GpuProbeGridParams>() as u64;
 
@@ -756,11 +756,24 @@ impl Renderer {
                 self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
                 self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
 
-                // Bind set 3 per-draw UBO (only need per-object).
+                // Shadow shaders read view/proj from set 0 binding 0.
+                let sun_global = GlobalUbo {
+                    view: sun_view, proj: sun_proj,
+                    camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
+                    sun_light_vp: sun_vp,
+                    sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                };
+                let sun_g_off = self.memory_ctx.ring.push_data(&sun_global).expect("Ring: sun shadow GlobalUbo").offset as u32;
+                let sun_dyn_off = [sun_g_off, c_off, p_off];
+                self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout, 0,
+                    &[self.frame_descriptors.per_frame_sets[self.current_frame]], &sun_dyn_off);
+
+                // Bind set 3 per-draw with model + material_id only.
                 for draw in &self.world.shadow_draws {
                     self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
                     self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                    let ubo = UniformBufferObject::new(draw.transform, sun_view, sun_proj, 0);
+                    let ubo = PerDrawUbo::new(draw.transform, 0);
                     let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: sun shadow UBO");
                     self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.layout, 3,
@@ -783,6 +796,17 @@ impl Renderer {
 
                 for face in 0..6u32 {
                     let (fv, fp) = cube_face_matrices(lp, light.radius, face);
+
+                    // Phase 4: Push per-face GlobalUbo with face view/proj.
+                    let face_global = GlobalUbo {
+                        view: fv, proj: fp,
+                        camera_pos: [lp[0], lp[1], lp[2], self.global_frame as f32],
+                        sun_light_vp: sun_vp,
+                        sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                    };
+                    let face_g_off = self.memory_ctx.ring.push_data(&face_global).expect("Ring: shadow face GlobalUbo").offset as u32;
+                    let face_dyn_off = [face_g_off, c_off, p_off];
+
                     let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue{depth:1.0,stencil:0} }];
                     let rp = vk::RenderPassBeginInfo::default()
                         .render_pass(self.render_passes.shadow)
@@ -796,6 +820,11 @@ impl Renderer {
                         vk::ShaderStageFlags::VERTEX|vk::ShaderStageFlags::FRAGMENT, 0,
                         std::slice::from_raw_parts(&push as *const _ as *const u8, std::mem::size_of_val(&push)));
 
+                    // Bind set 0 with face-specific dynamic offsets.
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.layout, 0,
+                        &[self.frame_descriptors.per_frame_sets[self.current_frame]], &face_dyn_off);
+
                     for draw in &self.world.shadow_draws {
                         let oi = draw.object_id.0 as usize;
                         if oi >= self.world.objects.len() { continue; }
@@ -804,7 +833,7 @@ impl Renderer {
 
                         self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
                         self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                        let ubo = UniformBufferObject::new(draw.transform, fv, fp, 0);
+                        let ubo = PerDrawUbo::new(draw.transform, 0);
                         let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: shadow UBO");
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 3,
@@ -837,6 +866,17 @@ impl Renderer {
                     // Render 6 cubemap faces.
                     for face in 0..6u32 {
                         let (face_view, face_proj) = face_matrices[face as usize];
+
+                        // Phase 4: Push per-face GlobalUbo with probe face view/proj.
+                        let probe_global = GlobalUbo {
+                            view: face_view, proj: face_proj,
+                            camera_pos: [probe_pos[0], probe_pos[1], probe_pos[2], self.global_frame as f32],
+                            sun_light_vp: sun_vp,
+                            sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                        };
+                        let probe_g_off = self.memory_ctx.ring.push_data(&probe_global).expect("Ring: probe GlobalUbo").offset as u32;
+                        let probe_dyn_off = [probe_g_off, c_off, p_off];
+
                         let clear = [
                             vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } },
                             vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
@@ -852,21 +892,22 @@ impl Renderer {
                         self.device.cmd_set_viewport(cmd, 0, &[pv]);
                         self.device.cmd_set_scissor(cmd, 0, &[ps]);
 
-                        // Bind descriptor sets (same as lighting pass — set 0 has lights, set 1 textures, set 2 shadows).
+                        // Phase 4: Bind set 0 with probe-face-specific dynamic offsets.
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 0,
-                            &[self.frame_descriptors.per_frame_sets[self.current_frame]], &dyn_off);
+                            &[self.frame_descriptors.per_frame_sets[self.current_frame]], &probe_dyn_off);
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 1, &[self.texture_manager.descriptor_set], &[]);
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 2,
                             &[self.frame_descriptors.shadow_map_sets[self.current_frame]], &[]);
 
-                        // Draw all opaque objects with probe view/proj.
+                        // Draw all opaque objects with probe view/proj (from set 0).
                         for draw in &self.world.opaque_draws {
                             self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
                             self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                            let ubo = UniformBufferObject::new(draw.transform, face_view, face_proj, draw.material_id);
+                            // Phase 4: PerDrawUbo — model + material_id only.
+                            let ubo = PerDrawUbo::new(draw.transform, draw.material_id);
                             let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: probe capture UBO");
                             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                                 self.pipelines.layout, 3,
@@ -1012,8 +1053,10 @@ impl Renderer {
     }
 
     /// Record draw calls using per-object offsets (first_index, vertex_offset).
+    /// Phase 4: Uses PerDrawUbo (model + material_id only, 80 bytes).
+    /// View/proj are read from the per-frame GlobalUbo at set 0.
     fn record_draw_list(&mut self, cmd: vk::CommandBuffer, draws: &[DrawCommand],
-        view_mat: [[f32;4];4], proj_mat: [[f32;4];4]) -> u32 {
+        _view_mat: [[f32;4];4], _proj_mat: [[f32;4];4]) -> u32 {
         let mut count = 0u32;
         let mut bound_vb: Option<vk::Buffer> = None;
         let mut bound_ib: Option<vk::Buffer> = None;
@@ -1029,7 +1072,8 @@ impl Renderer {
                 bound_ib = Some(draw.index_buffer);
             }
 
-            let ubo = UniformBufferObject::new(draw.transform, view_mat, proj_mat, draw.material_id);
+            // Phase 4: PerDrawUbo — model + material_id only.
+            let ubo = PerDrawUbo::new(draw.transform, draw.material_id);
             let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: per-draw UBO");
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                 self.pipelines.layout, 3,

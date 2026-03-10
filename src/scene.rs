@@ -2,26 +2,42 @@ use ash::vk;
 
 // ===== Vertex =====
 
+/// Phase 4: Extended vertex layout (60 bytes).
+///
+/// Added `tangent: [f32; 4]` (xyz = tangent direction, w = handedness ±1)
+/// after `normal` for TBN basis construction. Bitangent is reconstructed
+/// in the vertex shader as `cross(N, T.xyz) * T.w`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub uv: [f32; 2],
-    pub color: [f32; 3],
+    pub position: [f32; 3],   // offset 0,  location 0
+    pub normal: [f32; 3],     // offset 12, location 1
+    pub tangent: [f32; 4],    // offset 24, location 2  [Phase 4]
+    pub uv: [f32; 2],         // offset 40, location 3
+    pub color: [f32; 3],      // offset 48, location 4
 }
+
+const _: () = assert!(std::mem::size_of::<Vertex>() == 60);
 
 impl Vertex {
     pub fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-        Self { position, normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color }
+        Self { position, normal: [0.0, 1.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0], uv: [0.0, 0.0], color }
     }
 
     pub fn with_normal(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Self {
-        Self { position, normal, uv: [0.0, 0.0], color }
+        Self { position, normal, tangent: [1.0, 0.0, 0.0, 1.0], uv: [0.0, 0.0], color }
     }
 
     pub fn full(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], color: [f32; 3]) -> Self {
-        Self { position, normal, uv, color }
+        Self { position, normal, tangent: [1.0, 0.0, 0.0, 1.0], uv, color }
+    }
+
+    /// Full constructor including explicit tangent vector.
+    pub fn with_tangent(
+        position: [f32; 3], normal: [f32; 3], tangent: [f32; 4],
+        uv: [f32; 2], color: [f32; 3],
+    ) -> Self {
+        Self { position, normal, tangent, uv, color }
     }
 
     pub fn binding_description() -> vk::VertexInputBindingDescription {
@@ -31,40 +47,58 @@ impl Vertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
+    pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 5] {
         [
+            // location 0: vec3 position @ offset 0
             vk::VertexInputAttributeDescription::default()
                 .binding(0).location(0).format(vk::Format::R32G32B32_SFLOAT).offset(0),
+            // location 1: vec3 normal @ offset 12
             vk::VertexInputAttributeDescription::default()
                 .binding(0).location(1).format(vk::Format::R32G32B32_SFLOAT).offset(12),
+            // location 2: vec4 tangent @ offset 24  [Phase 4]
             vk::VertexInputAttributeDescription::default()
-                .binding(0).location(2).format(vk::Format::R32G32_SFLOAT).offset(24),
+                .binding(0).location(2).format(vk::Format::R32G32B32A32_SFLOAT).offset(24),
+            // location 3: vec2 uv @ offset 40
             vk::VertexInputAttributeDescription::default()
-                .binding(0).location(3).format(vk::Format::R32G32B32_SFLOAT).offset(32),
+                .binding(0).location(3).format(vk::Format::R32G32_SFLOAT).offset(40),
+            // location 4: vec3 color @ offset 48
+            vk::VertexInputAttributeDescription::default()
+                .binding(0).location(4).format(vk::Format::R32G32B32_SFLOAT).offset(48),
         ]
     }
 }
 
-// ===== UBO =====
+// ===== Per-Draw UBO (Phase 4: slimmed — view/proj moved to set 0 GlobalUbo) =====
 
+/// Per-draw dynamic UBO pushed into the ring buffer per draw call.
+///
+/// Phase 4: removed redundant `view` and `proj` matrices which duplicate
+/// the per-frame UBO at set 0 binding 0.  Shadow and probe passes now
+/// push a per-face GlobalUbo and rebind set 0 instead.
+///
+/// Layout (80 bytes, std140):
+///   mat4 model       (64 bytes)
+///   uint materialId  (4 bytes)
+///   uint _pad[3]     (12 bytes)
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct UniformBufferObject {
+pub struct PerDrawUbo {
     pub model: [[f32; 4]; 4],
-    pub view: [[f32; 4]; 4],
-    pub proj: [[f32; 4]; 4],
     pub material_id: u32,
     pub _pad: [u32; 3],
 }
 
-impl UniformBufferObject {
-    pub fn new(
-        model: [[f32; 4]; 4], view: [[f32; 4]; 4],
-        proj: [[f32; 4]; 4], material_id: u32,
-    ) -> Self {
-        Self { model, view, proj, material_id, _pad: [0; 3] }
+const _: () = assert!(std::mem::size_of::<PerDrawUbo>() == 80);
+
+impl PerDrawUbo {
+    pub fn new(model: [[f32; 4]; 4], material_id: u32) -> Self {
+        Self { model, material_id, _pad: [0; 3] }
     }
 }
+
+/// Backward-compatible alias.  Old code that references `UniformBufferObject`
+/// can migrate incrementally.
+pub type UniformBufferObject = PerDrawUbo;
 
 // ===== Input =====
 
@@ -289,11 +323,9 @@ impl Scene {
         ]
     }
 
-    pub fn get_ubo(&self, material_id: u32) -> UniformBufferObject {
-        UniformBufferObject::new(
-            identity_matrix(), self.camera.get_view_matrix(),
-            self.camera.get_projection_matrix(), material_id,
-        )
+    /// Phase 4: returns PerDrawUbo (model + material_id only).
+    pub fn get_ubo(&self, material_id: u32) -> PerDrawUbo {
+        PerDrawUbo::new(identity_matrix(), material_id)
     }
 }
 

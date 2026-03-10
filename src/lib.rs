@@ -9,3 +9,4 @@ pub mod pipeline;
 pub mod world;
 pub mod renderer;
 pub mod scene;
+pub mod loader;

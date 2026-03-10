@@ -1,4 +1,4 @@
-// Phase 3: Probe Capture Fragment Shader
+// Phase 4: Probe Capture Fragment Shader
 // Compile: glslangValidator -V probe_capture.frag -o compiled/probe_capture.frag.spv
 //
 // Renders the scene from a probe's viewpoint into a low-res HDR cubemap.
@@ -7,6 +7,12 @@
 //   - No GI/IBL/probe sampling (would be circular dependency)
 //   - Output is raw linear HDR (no tone mapping, no gamma correction)
 //   - This ensures the SH projection captures accurate radiance
+//
+// Phase 4 changes:
+//   - TBN normal mapping (same as pbr.frag)
+//   - ORM unpacking, emissive texture
+//   - view/proj from per-frame UBO (set 0) — probe eye extracted from frame.view
+//   - Per-draw UBO (set 3) reduced to model + materialId only
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -16,6 +22,8 @@ layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec2 fragUV;
 layout(location = 3) in vec3 fragColor;
 layout(location = 4) flat in uint fragMaterialId;
+layout(location = 5) in vec3 fragTangent;      // Phase 4
+layout(location = 6) in vec3 fragBitangent;    // Phase 4
 
 layout(location = 0) out vec4 outColor;
 
@@ -52,7 +60,7 @@ struct GpuLight {
 };
 
 // ---- Descriptor Set 0: Per-frame globals ----
-// Same layout as pbr.frag — reuses the same pipeline layout.
+// Phase 4: Probe passes rebind set 0 per face with the probe's face view/proj.
 
 layout(set = 0, binding = 0) uniform PerFrameUBO {
     mat4 view;
@@ -85,22 +93,11 @@ layout(set = 1, binding = 0) uniform sampler2D textures[];
 layout(set = 2, binding = 0) uniform samplerCubeArray shadowCubeMaps;
 layout(set = 2, binding = 1) uniform sampler2D sunShadowMap;
 
-// ---- Descriptor Set 3: Per-draw dynamic UBO ----
-// We extract the probe eye position from the view matrix here,
-// since frame.camera_pos is the MAIN camera, not the probe.
-layout(set = 3, binding = 0) uniform PerDrawUBO {
-    mat4 model;
-    mat4 view;
-    mat4 proj;
-    uint materialId;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
-} draw;
-
 // ---- Constants ----
 const float PI = 3.14159265358979;
 const float SHADOW_BIAS = 0.005;
+const uint FLAG_DOUBLE_SIDED = 1u;
+const uint FLAG_ALPHA_CUTOFF = 4u;
 
 // ====================================================================
 //  Extract eye position from view matrix
@@ -112,6 +109,30 @@ vec3 getEyeFromViewMatrix(mat4 V) {
     mat3 rot = mat3(V);
     vec3 t = vec3(V[3]);
     return -transpose(rot) * t;
+}
+
+// ====================================================================
+//  Phase 4: TBN Normal Mapping (same as pbr.frag)
+// ====================================================================
+
+vec3 getShadingNormal(MaterialData mat) {
+    vec3 N = normalize(fragNormal);
+    vec3 T = normalize(fragTangent);
+    vec3 B = normalize(fragBitangent);
+
+    if (!gl_FrontFacing && (mat.flags & FLAG_DOUBLE_SIDED) != 0u) {
+        N = -N; T = -T; B = -B;
+    }
+
+    if (mat.normal_tex > 0u) {
+        vec3 tangentNormal = texture(textures[nonuniformEXT(mat.normal_tex)], fragUV).rgb;
+        tangentNormal = tangentNormal * 2.0 - 1.0;
+        tangentNormal.xy *= mat.normal_scale;
+        tangentNormal = normalize(tangentNormal);
+        mat3 TBN = mat3(T, B, N);
+        N = normalize(TBN * tangentNormal);
+    }
+    return N;
 }
 
 // ====================================================================
@@ -237,15 +258,32 @@ void main() {
     if (mat.albedo_tex > 0u) {
         baseColor *= texture(textures[nonuniformEXT(mat.albedo_tex)], fragUV);
     }
-    if ((mat.flags & 4u) != 0u && baseColor.a < mat.alpha_cutoff) discard;
+    if ((mat.flags & FLAG_ALPHA_CUTOFF) != 0u && baseColor.a < mat.alpha_cutoff) discard;
 
-    vec3 N = normalize(fragNormal);
-    // V is computed from the PROBE position (extracted from per-draw view matrix).
-    vec3 probeEye = getEyeFromViewMatrix(draw.view);
+    // Phase 4: TBN normal mapping.
+    vec3 N = getShadingNormal(mat);
+
+    // V is computed from the PROBE position (extracted from per-frame view matrix).
+    // Phase 4: was draw.view, now frame.view (set 0 is rebound per probe face).
+    vec3 probeEye = getEyeFromViewMatrix(frame.view);
     vec3 V = normalize(probeEye - fragWorldPos);
+
+    // Phase 4: ORM unpacking.
     float metallic  = mat.metallic;
-    float roughness = max(mat.roughness, 0.04);
-    vec3  albedo    = baseColor.rgb;
+    float roughness = mat.roughness;
+    float ao        = mat.ao;
+    if (mat.metallic_roughness_tex > 0u) {
+        vec4 orm = texture(textures[nonuniformEXT(mat.metallic_roughness_tex)], fragUV);
+        ao        *= orm.r;
+        roughness *= orm.g;
+        metallic  *= orm.b;
+    }
+    if (mat.ao_tex > 0u) {
+        ao = texture(textures[nonuniformEXT(mat.ao_tex)], fragUV).r;
+    }
+
+    roughness = max(roughness, 0.04);
+    vec3  albedo = baseColor.rgb;
     vec3  F0 = mix(vec3(0.04), albedo, metallic);
 
     // ---- Iterate ALL active lights (no cluster lookup) ----
@@ -256,10 +294,13 @@ void main() {
     }
 
     // Minimal ambient floor (no GI — we're PRODUCING the GI data).
-    vec3 ambient = albedo * vec3(0.015, 0.015, 0.02) * mat.ao;
+    vec3 ambient = albedo * vec3(0.015, 0.015, 0.02) * ao;
 
-    // Emissive.
+    // Phase 4: Emissive texture multiplication.
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;
+    if (mat.emissive_tex > 0u) {
+        emissive *= texture(textures[nonuniformEXT(mat.emissive_tex)], fragUV).rgb;
+    }
 
     // Raw linear HDR — NO tone mapping, NO gamma.
     // The SH projection needs the actual radiance values.

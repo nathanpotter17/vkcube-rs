@@ -1802,6 +1802,325 @@ impl MemoryContext {
 
         Ok(alloc)
     }
+    
+    /// Phase 4 (§4.6): Generate a full mip chain for a 2D image via a blit chain.
+    ///
+    /// Each mip level is blitted from the previous at half resolution.
+    /// The image must be in `TRANSFER_DST_OPTIMAL` layout on entry.
+    /// On exit, all mip levels are in `SHADER_READ_ONLY_OPTIMAL`.
+    ///
+    /// The image must have been created with `TRANSFER_SRC | TRANSFER_DST`
+    /// usage flags. The format must support `FORMAT_FEATURE_BLIT_SRC`
+    /// and `FORMAT_FEATURE_BLIT_DST` (all uncompressed color formats do).
+    pub fn generate_mipmaps(
+        &self,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        mip_levels: u32,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if mip_levels <= 1 {
+            // Single-mip image — just transition to shader-read.
+            unsafe {
+                let cmd = self.begin_one_time_cmd(command_pool)?;
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[],
+                    std::slice::from_ref(&barrier),
+                );
+                self.end_one_time_cmd(cmd, command_pool, queue)?;
+            }
+            return Ok(());
+        }
+
+        unsafe {
+            let cmd = self.begin_one_time_cmd(command_pool)?;
+
+            let mut mip_width = width as i32;
+            let mut mip_height = height as i32;
+
+            for level in 1..mip_levels {
+                // Transition mip level (level-1) from TRANSFER_DST → TRANSFER_SRC
+                // so it can be the blit source.
+                let barrier_to_src = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level - 1,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[],
+                    std::slice::from_ref(&barrier_to_src),
+                );
+
+                // Blit from (level-1) to (level).
+                let next_width = (mip_width / 2).max(1);
+                let next_height = (mip_height / 2).max(1);
+
+                let blit = vk::ImageBlit {
+                    src_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: level - 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: mip_width, y: mip_height, z: 1 },
+                    ],
+                    dst_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: level,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offsets: [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: next_width, y: next_height, z: 1 },
+                    ],
+                };
+
+                self.device.cmd_blit_image(
+                    cmd,
+                    image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    image, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    std::slice::from_ref(&blit),
+                    vk::Filter::LINEAR,
+                );
+
+                // Transition mip level (level-1) from TRANSFER_SRC → SHADER_READ_ONLY
+                let barrier_to_shader = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level - 1,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[],
+                    std::slice::from_ref(&barrier_to_shader),
+                );
+
+                mip_width = next_width;
+                mip_height = next_height;
+            }
+
+            // Transition the last mip level from TRANSFER_DST → SHADER_READ_ONLY.
+            let final_barrier = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_levels - 1,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[],
+                std::slice::from_ref(&final_barrier),
+            );
+
+            self.end_one_time_cmd(cmd, command_pool, queue)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compute the number of mip levels for a 2D image.
+    pub fn compute_mip_levels(width: u32, height: u32) -> u32 {
+        ((width.max(height) as f32).log2().floor() as u32) + 1
+    }
+
+    /// Allocate a device-local image with mip chain, upload base mip,
+    /// generate remaining mips via blit, and return in SHADER_READ_ONLY.
+    ///
+    /// The image is created with SAMPLED | TRANSFER_DST | TRANSFER_SRC usage.
+    pub fn create_image_with_mipmaps(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<ImageAllocation, Box<dyn std::error::Error>> {
+        let mip_levels = Self::compute_mip_levels(width, height);
+        let size = data.len() as u64;
+        assert!(size <= self.staging_size);
+
+        let alloc = self.allocator.create_image(
+            width, height, format,
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
+            mip_levels,
+            MemoryLocation::GpuOnly,
+        )?;
+
+        // Copy data into staging buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging_mapped.as_ptr(),
+                data.len(),
+            );
+        }
+
+        unsafe {
+            let cmd = self.begin_one_time_cmd(command_pool)?;
+
+            // Transition ALL mip levels to TRANSFER_DST_OPTIMAL.
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(alloc.image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: mip_levels,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[],
+                std::slice::from_ref(&barrier),
+            );
+
+            // Copy staging → base mip (level 0).
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                self.staging_buffer,
+                alloc.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+
+            self.device.end_command_buffer(cmd)?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&cmd));
+            self.device.queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+            self.device.queue_wait_idle(queue)?;
+            self.device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        }
+
+        // Now generate the mip chain (transitions all levels to SHADER_READ_ONLY).
+        self.generate_mipmaps(alloc.image, width, height, mip_levels, command_pool, queue)?;
+
+        Ok(alloc)
+    }
+
+    // ---- One-time command buffer helpers ----
+
+    fn begin_one_time_cmd(
+        &self,
+        command_pool: vk::CommandPool,
+    ) -> Result<vk::CommandBuffer, Box<dyn std::error::Error>> {
+        unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = self.device.allocate_command_buffers(&info)?[0];
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            Ok(cmd)
+        }
+    }
+
+    fn end_one_time_cmd(
+        &self,
+        cmd: vk::CommandBuffer,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            self.device.end_command_buffer(cmd)?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&cmd));
+            self.device.queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+            self.device.queue_wait_idle(queue)?;
+            self.device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for MemoryContext {
