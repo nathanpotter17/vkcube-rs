@@ -27,6 +27,7 @@ use crate::world::{
     SECTOR_SIZE, STREAMING_RADIUS, generate_sector_objects,
     demo_transform, make_cube, make_pyramid, make_column,
 };
+use crate::loader::GltfLoader;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -54,6 +55,10 @@ const SPAWN_LIGHT_HEIGHT_MAX: f32 = 15.0;
 
 /// Sentinel sector base for dynamic spawns (high i32 range to avoid collision).
 const DYNAMIC_SECTOR_BASE: i32 = i32::MAX - 5000;
+
+/// Sentinel sector base for glTF asset loads.  Must be >= DYNAMIC_SECTOR_BASE
+/// so existing eviction filters (`c.0 < DYNAMIC_SECTOR_BASE`) protect these sectors.
+const GLTF_SECTOR_BASE: i32 = i32::MAX - 4000;
 
 /// Deferred buffer deletion entry.  Buffers freed during eviction may
 /// still be referenced by in-flight command buffers.  We delay the
@@ -185,6 +190,12 @@ pub struct Renderer {
     /// Buffers queued for delayed free.  Drained after fence wait each
     /// frame once `global_frame - entry.frame >= MAX_FRAMES_IN_FLIGHT`.
     deferred_frees: Vec<DeferredFree>,
+
+    // ---- glTF asset buffer tracking ----
+    /// Buffer handles from glTF asset loads.  Tracked for VRAM budget
+    /// visibility and explicit cleanup.  These live outside the sector
+    /// batching path (each mesh owns its own VB/IB).
+    gltf_buffer_handles: Vec<BufferHandle>,
 }
 
 impl Renderer {
@@ -196,7 +207,7 @@ impl Renderer {
         let aspect = device_ctx.swapchain_extent.width as f32
             / device_ctx.swapchain_extent.height as f32;
         let scene = Scene::new(aspect);
-        let world = World::new();
+        let mut world = World::new();
 
         // ---- Materials ----
 
@@ -228,7 +239,103 @@ impl Renderer {
         material_ssbo.upload(&material_library);
         material_library.clear_dirty();
 
-        let texture_manager = TextureManager::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
+        let mut texture_manager = TextureManager::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
+
+        // ================================================================
+        //  Phase 4: glTF asset loading — test model at world center
+        // ================================================================
+        let mut gltf_buffer_handles: Vec<BufferHandle> = Vec::new();
+        {
+            let gltf_path = std::path::Path::new("assets/models/ubg/utility_box_02_1k.gltf");
+            if gltf_path.exists() {
+                match GltfLoader::load(
+                    gltf_path,
+                    &mut material_library,
+                    &mut texture_manager,
+                    &mut memory_ctx,
+                    device_ctx.command_pool,
+                    device_ctx.queue,
+                ) {
+                    Ok(asset) => {
+                        // Sentinel sector for glTF assets — never evicted.
+                        let gltf_sector: SectorCoord = (GLTF_SECTOR_BASE, 0);
+                        world.sectors.entry(gltf_sector)
+                            .or_insert_with(|| Sector::new(gltf_sector));
+                        if let Some(sec) = world.sectors.get_mut(&gltf_sector) {
+                            sec.state = SectorState::Ready;
+                        }
+
+                        // Place the model at the exact center of the scene.
+                        // identity_matrix() → position (0, 0, 0), scale 1, no rotation.
+                        let model_transform = crate::scene::identity_matrix();
+
+                        for mesh in &asset.meshes {
+                            // Each LoadedMesh has its own VB/IB (not sector-batched).
+                            // MeshRange starts at offset 0 within each buffer.
+                            let mesh_range = MeshRange {
+                                vertex_buffer: mesh.vertex_alloc.buffer,
+                                index_buffer: mesh.index_alloc.buffer,
+                                first_index: 0,
+                                index_count: mesh.index_count,
+                                vertex_offset: 0,
+                            };
+
+                            // Compute world-space AABB from the mesh's local AABB
+                            // transformed by the model matrix.
+                            let bounds = Aabb::new(
+                                [
+                                    mesh.aabb_min[0] + model_transform[3][0],
+                                    mesh.aabb_min[1] + model_transform[3][1],
+                                    mesh.aabb_min[2] + model_transform[3][2],
+                                ],
+                                [
+                                    mesh.aabb_max[0] + model_transform[3][0],
+                                    mesh.aabb_max[1] + model_transform[3][1],
+                                    mesh.aabb_max[2] + model_transform[3][2],
+                                ],
+                            );
+
+                            let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
+
+                            world.add_object(
+                                gltf_sector,
+                                bounds,
+                                LodChain::single(mesh_range),
+                                model_transform,
+                                mesh.material_id,
+                                flags,
+                            );
+
+                            // Track buffer handles for VRAM budget visibility.
+                            memory_ctx.budget.track(mesh.vertex_alloc.handle, mesh.vertex_alloc.size, 0);
+                            memory_ctx.budget.track(mesh.index_alloc.handle, mesh.index_alloc.size, 0);
+                            gltf_buffer_handles.push(mesh.vertex_alloc.handle);
+                            gltf_buffer_handles.push(mesh.index_alloc.handle);
+                        }
+
+                        println!(
+                            "[Renderer] glTF '{}' loaded: {} meshes, {} materials, {} textures → placed at world center",
+                            gltf_path.display(),
+                            asset.meshes.len(),
+                            asset.material_names.len(),
+                            asset.texture_names.len(),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[Renderer] glTF load failed for '{}': {}", gltf_path.display(), e);
+                    }
+                }
+            } else {
+                println!("[Renderer] glTF test asset '{}' not found — skipping", gltf_path.display());
+            }
+        }
+
+        // Re-upload material SSBO if glTF loading added new materials.
+        if material_library.is_dirty() {
+            material_ssbo.upload(&material_library);
+            material_library.clear_dirty();
+        }
+
         let mut light_manager = LightManager::new();
         let shadow_budget = ShadowBudgetManager::new();
         let descriptor_layouts = DescriptorLayouts::new(&device, texture_manager.descriptor_set_layout)?;
@@ -352,6 +459,7 @@ impl Renderer {
             spawned_geometry_count: 0,
             next_dynamic_sector: 0,
             deferred_frees: Vec::new(),
+            gltf_buffer_handles,
         })
     }
 
@@ -1240,6 +1348,11 @@ impl Drop for Renderer {
         // so all command buffers have completed.
         for entry in self.deferred_frees.drain(..) {
             self.memory_ctx.allocator.free_buffer(entry.handle);
+        }
+        // Free glTF asset buffers (VB/IB per mesh primitive).
+        for handle in self.gltf_buffer_handles.drain(..) {
+            self.memory_ctx.budget.untrack(handle);
+            self.memory_ctx.allocator.free_buffer(handle);
         }
         for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
         for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
