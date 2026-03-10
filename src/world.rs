@@ -486,16 +486,16 @@ pub struct ObjectDescriptor {
 
 // ---- Ground colour palette ----
 
-fn tile_ground_color(cx: i32, cz: i32) -> [f32; 3] {
+pub fn tile_ground_color(cx: i32, cz: i32) -> [f32; 3] {
     const P: [[f32;3];8] = [[0.15; 3]; 8];
     P[((cx.wrapping_mul(7))^(cz.wrapping_mul(13))).unsigned_abs() as usize % P.len()]
 }
 
 // ---- Geometry primitives ----
 
-struct RawMesh { vertices: Vec<Vertex>, indices: Vec<u32>, transform: [[f32;4];4], material_id: u32 }
+pub struct RawMesh { pub vertices: Vec<Vertex>, pub indices: Vec<u32>, pub transform: [[f32;4];4], pub material_id: u32 }
 
-fn make_ground_plane(cx: i32, cz: i32) -> RawMesh {
+pub fn make_ground_plane(cx: i32, cz: i32) -> RawMesh {
     let x0 = cx as f32*GROUND_TILE_SIZE; let z0 = cz as f32*GROUND_TILE_SIZE;
     let x1 = x0+GROUND_TILE_SIZE; let z1 = z0+GROUND_TILE_SIZE;
     let c = tile_ground_color(cx,cz); let n = [0.0,1.0,0.0];
@@ -509,7 +509,7 @@ fn make_ground_plane(cx: i32, cz: i32) -> RawMesh {
     }
 }
 
-fn make_cube(base_color: [f32;3], material_id: u32) -> RawMesh {
+pub fn make_cube(base_color: [f32;3], material_id: u32) -> RawMesh {
     let t = |r:f32,g:f32,b:f32| [(base_color[0]*0.5+r*0.5).min(1.0),(base_color[1]*0.5+g*0.5).min(1.0),(base_color[2]*0.5+b*0.5).min(1.0)];
     let p: [[f32;3];8] = [[-0.5,0.0,0.5],[0.5,0.0,0.5],[0.5,1.0,0.5],[-0.5,1.0,0.5],
         [0.5,0.0,-0.5],[-0.5,0.0,-0.5],[-0.5,1.0,-0.5],[0.5,1.0,-0.5]];
@@ -525,7 +525,7 @@ fn make_cube(base_color: [f32;3], material_id: u32) -> RawMesh {
     RawMesh { vertices: vs, indices: is, transform: identity_matrix(), material_id }
 }
 
-fn make_pyramid(color: [f32;3], height: f32, material_id: u32) -> RawMesh {
+pub fn make_pyramid(color: [f32;3], height: f32, material_id: u32) -> RawMesh {
     let s=0.5; let apex=[0.0,height,0.0];
     let bl=[-s,0.0,-s]; let br=[s,0.0,-s]; let fr=[s,0.0,s]; let fl=[-s,0.0,s];
     let (mut vs, mut is) = (Vec::new(), Vec::new());
@@ -544,7 +544,7 @@ fn make_pyramid(color: [f32;3], height: f32, material_id: u32) -> RawMesh {
     RawMesh { vertices: vs, indices: is, transform: identity_matrix(), material_id }
 }
 
-fn make_column(color: [f32;3], height: f32, radius: f32, material_id: u32) -> RawMesh {
+pub fn make_column(color: [f32;3], height: f32, radius: f32, material_id: u32) -> RawMesh {
     const S: usize = 8;
     let (mut vs, mut is) = (Vec::new(), Vec::new());
     let tc = [(color[0]*1.2).min(1.0),(color[1]*1.2).min(1.0),(color[2]*1.2).min(1.0)];
@@ -576,8 +576,8 @@ fn make_column(color: [f32;3], height: f32, radius: f32, material_id: u32) -> Ra
     RawMesh { vertices: vs, indices: is, transform: identity_matrix(), material_id }
 }
 
-fn cross_vec3(a:[f32;3],b:[f32;3])->[f32;3]{[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}
-fn normalize_vec3(v:[f32;3])->[f32;3]{let l=(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();if l>0.0{[v[0]/l,v[1]/l,v[2]/l]}else{[0.0,1.0,0.0]}}
+pub fn cross_vec3(a:[f32;3],b:[f32;3])->[f32;3]{[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}
+pub fn normalize_vec3(v:[f32;3])->[f32;3]{let l=(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();if l>0.0{[v[0]/l,v[1]/l,v[2]/l]}else{[0.0,1.0,0.0]}}
 
 #[allow(dead_code)]
 const OBJ_MATS: [u32; 8] = [2,3,4,5,6,7,8,9];
@@ -586,10 +586,11 @@ const OBJ_MATS: [u32; 8] = [2,3,4,5,6,7,8,9];
 //  Public API: generate ObjectDescriptors for a 256 m sector
 // ====================================================================
 
-/// Demo scene: exactly 4 ground tiles meeting at the world origin,
-/// plus hand-placed large geometry of varying types and materials.
+/// Demo scene: 4 ground tiles meeting at the world origin.
 /// Only sectors (-1,-1), (-1,0), (0,-1), (0,0) produce content;
 /// all other sectors return empty.
+///
+/// Scene starts with ground only — geometry is spawned interactively via keybinds.
 pub fn generate_sector_objects(sector: SectorCoord) -> Vec<ObjectDescriptor> {
     const DEMO_SECTORS: [(i32,i32); 4] = [(-1,-1), (0,-1), (-1,0), (0,0)];
     if !DEMO_SECTORS.contains(&sector) {
@@ -600,7 +601,6 @@ pub fn generate_sector_objects(sector: SectorCoord) -> Vec<ObjectDescriptor> {
     let mut result = Vec::new();
 
     // ---- One ground tile per sector ----
-    // Tile coord = sector coord → 4 tiles covering [-64,64]×[-64,64].
     let raw = make_ground_plane(sector.0, sector.1);
     let bounds = Aabb::from_vertices(&raw.vertices, &raw.transform);
     result.push(ObjectDescriptor {
@@ -608,51 +608,12 @@ pub fn generate_sector_objects(sector: SectorCoord) -> Vec<ObjectDescriptor> {
         material_id: raw.material_id, flags, bounds,
     });
 
-    // ---- Curated geometry per quadrant ----
-    match sector {
-        // NW quadrant: [-64,0] × [-64,0]
-        (-1, -1) => {
-            push_cube(&mut result, flags, [-40.0, 0.0, -35.0], 5.0, 0.0, [0.95,0.93,0.88], 2);  // polished_metal
-            push_column(&mut result, flags, [-20.0, 0.0, -50.0], 3.0, 8.0, 0.6, 0.0, [0.95,0.64,0.54], 4); // copper
-            push_pyramid(&mut result, flags, [-50.0, 0.0, -15.0], 3.5, 2.5, 0.8, [0.12,0.12,0.14], 8); // rubber
-        }
-        // NE quadrant: [0,64] × [-64,0]
-        (0, -1) => {
-            push_pyramid(&mut result, flags, [25.0, 0.0, -40.0], 7.0, 2.0, 0.0, [0.92,0.90,0.85], 9); // marble — massive
-            push_cube(&mut result, flags, [48.0, 0.0, -15.0], 3.5, 0.5, [0.12,0.35,0.85], 6); // ceramic_blue
-            push_column(&mut result, flags, [12.0, 0.0, -55.0], 2.5, 12.0, 0.4, 1.2, [0.55,0.52,0.50], 3); // rough_stone — tall spire
-        }
-        // SW quadrant: [-64,0] × [0,64]
-        (-1, 0) => {
-            push_column(&mut result, flags, [-38.0, 0.0, 30.0], 4.0, 5.0, 0.8, 0.3, [0.55,0.52,0.50], 3); // rough_stone — wide
-            push_cube(&mut result, flags, [-12.0, 0.0, 42.0], 2.5, 0.0, [1.0,0.85,0.4], 10); // emissive_warm
-            push_pyramid(&mut result, flags, [-52.0, 0.0, 52.0], 4.0, 3.0, 2.0, [0.85,0.15,0.12], 5); // ceramic_red
-        }
-        // SE quadrant: [0,64] × [0,64]
-        (0, 0) => {
-            push_column(&mut result, flags, [30.0, 0.0, 35.0], 6.0, 10.0, 0.5, 0.0, [1.0,0.76,0.33], 7); // gold — landmark
-            push_pyramid(&mut result, flags, [52.0, 0.0, 48.0], 4.0, 2.5, 1.5, [0.85,0.15,0.12], 5); // ceramic_red
-            push_cube(&mut result, flags, [15.0, 0.0, 55.0], 3.0, 0.9, [0.4,0.7,1.0], 11); // emissive_cool
-        }
-        _ => {}
-    }
-
-    // ---- Objects near the origin (placed in whichever quadrant they fall in) ----
-    if sector == (-1, -1) {
-        // Small column just SW of origin.
-        push_column(&mut result, flags, [-5.0, 0.0, -8.0], 2.0, 4.0, 0.5, 0.0, [0.95,0.64,0.54], 4);
-    }
-    if sector == (0, 0) {
-        // Small cube just SE of origin.
-        push_cube(&mut result, flags, [7.0, 0.0, 6.0], 1.8, 0.4, [1.0,0.76,0.33], 7);
-    }
-
     result
 }
 
 // ---- Demo helper: push transformed object into result ----
 
-fn push_cube(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+pub fn push_cube(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
              pos: [f32; 3], scale: f32, y_rot: f32, color: [f32; 3], mat: u32) {
     let raw = make_cube(color, mat);
     let transform = demo_transform(pos, scale, y_rot);
@@ -663,7 +624,7 @@ fn push_cube(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
     });
 }
 
-fn push_pyramid(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+pub fn push_pyramid(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
                 pos: [f32; 3], scale: f32, height: f32, y_rot: f32,
                 color: [f32; 3], mat: u32) {
     let raw = make_pyramid(color, height, mat);
@@ -675,7 +636,7 @@ fn push_pyramid(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
     });
 }
 
-fn push_column(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+pub fn push_column(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
                pos: [f32; 3], scale: f32, height: f32, radius: f32,
                y_rot: f32, color: [f32; 3], mat: u32) {
     let raw = make_column(color, height, radius, mat);
@@ -688,7 +649,7 @@ fn push_column(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
 }
 
 /// Build a Y-axis rotation + uniform scale + translation matrix.
-fn demo_transform(pos: [f32; 3], scale: f32, y_rot: f32) -> [[f32; 4]; 4] {
+pub fn demo_transform(pos: [f32; 3], scale: f32, y_rot: f32) -> [[f32; 4]; 4] {
     let cos = y_rot.cos();
     let sin = y_rot.sin();
     [

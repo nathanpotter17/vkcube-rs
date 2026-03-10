@@ -18,13 +18,14 @@ use crate::pipeline::{
     DescriptorLayouts, FrameDescriptors, FrameLightingBuffers, PassFramebuffers,
     Pipelines, RenderPasses,
 };
-use crate::scene::{Scene, UniformBufferObject, Vertex};
+use crate::scene::{InputAction, InputState, Scene, UniformBufferObject, Vertex};
 use crate::texture::TextureManager;
 use crate::world::{
-    Aabb, DrawCommand, LodChain, MeshRange, RenderFlags,
-    RenderObjectId, SectorCoord, SectorState, World,
+    Aabb, DrawCommand, LodChain, MeshRange, ObjectDescriptor, RenderFlags,
+    RenderObjectId, Sector, SectorCoord, SectorState, World,
     EVICTION_RADIUS, GROUND_TILE_SIZE, MAX_SECTOR_STARTS_PER_FRAME,
     SECTOR_SIZE, STREAMING_RADIUS, generate_sector_objects,
+    demo_transform, make_cube, make_pyramid, make_column,
 };
 
 #[repr(C)]
@@ -35,6 +36,64 @@ struct GlobalUbo {
     camera_pos: [f32; 4],
     sun_light_vp: [[f32; 4]; 4],  // sun shadow light-space view-projection
     sun_direction: [f32; 4],       // xyz = normalized direction, w = shadow_enabled (1.0/0.0)
+}
+
+// ====================================================================
+//  Dynamic spawn limits and PRNG
+// ====================================================================
+
+/// Max user-spawned point lights (L key).
+const MAX_SPAWNED_LIGHTS: usize = 32;
+/// Max user-spawned geometry objects (G key).
+const MAX_SPAWNED_GEOMETRY: usize = 50;
+/// Spawn radius around camera (XZ plane).
+const SPAWN_RADIUS: f32 = 40.0;
+/// Spawn height range for lights.
+const SPAWN_LIGHT_HEIGHT_MIN: f32 = 3.0;
+const SPAWN_LIGHT_HEIGHT_MAX: f32 = 15.0;
+
+/// Sentinel sector base for dynamic spawns (high i32 range to avoid collision).
+const DYNAMIC_SECTOR_BASE: i32 = i32::MAX - 5000;
+
+/// The 4 permanent demo ground-tile sectors.  These must never be evicted
+/// because their `world_center()` (SECTOR_SIZE=256-based) doesn't match
+/// their actual geometry footprint (GROUND_TILE_SIZE=64-based).  Evicting
+/// them triggers an infinite evict→reload loop.
+const DEMO_SECTORS: [(i32, i32); 4] = [(-1, -1), (0, -1), (-1, 0), (0, 0)];
+
+/// Deferred buffer deletion entry.  Buffers freed during eviction may
+/// still be referenced by in-flight command buffers.  We delay the
+/// actual `free_buffer` call until `MAX_FRAMES_IN_FLIGHT` frames have
+/// elapsed, guaranteeing all referencing submissions have completed
+/// their fence wait.
+struct DeferredFree {
+    handle: BufferHandle,
+    frame: u64,
+}
+
+/// Minimal xorshift64 PRNG — no crate dependency.
+struct SimpleRng { s: u64 }
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self { Self { s: seed.max(1) } }
+    fn next_u64(&mut self) -> u64 {
+        self.s ^= self.s << 13;
+        self.s ^= self.s >> 7;
+        self.s ^= self.s << 17;
+        self.s
+    }
+    /// Uniform f32 in [0, 1).
+    fn f32(&mut self) -> f32 {
+        (self.next_u64() & 0xFF_FFFF) as f32 / 16_777_216.0
+    }
+    /// Uniform f32 in [lo, hi).
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + self.f32() * (hi - lo)
+    }
+    /// Pick a random element from a slice.
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[(self.next_u64() as usize) % items.len()]
+    }
 }
 
 // ====================================================================
@@ -116,6 +175,22 @@ pub struct Renderer {
 
     current_frame: usize,
     global_frame: u64,
+
+    // ---- Dynamic spawn state ----
+    rng: SimpleRng,
+    /// Number of user-spawned point lights so far.
+    spawned_light_count: usize,
+    /// Sentinel sector coord for spawned light tracking.
+    spawned_light_sector: SectorCoord,
+    /// Number of user-spawned geometry objects so far.
+    spawned_geometry_count: usize,
+    /// Incrementing sector-coord offset for each geometry spawn batch.
+    next_dynamic_sector: i32,
+
+    // ---- Deferred buffer deletion queue ----
+    /// Buffers queued for delayed free.  Drained after fence wait each
+    /// frame once `global_frame - entry.frame >= MAX_FRAMES_IN_FLIGHT`.
+    deferred_frees: Vec<DeferredFree>,
 }
 
 impl Renderer {
@@ -231,23 +306,9 @@ impl Renderer {
         let sun_light = Light::directional(sun_dir, SUN_COLOR, SUN_INTENSITY);
         light_manager.register((i32::MAX, i32::MAX), vec![sun_light]);
 
-        // ---- Demo: Static lights (fixed positions around the scene) ----
-        let static_sector: (i32, i32) = (i32::MAX - 1, i32::MAX - 1);
-        {
-            let mut sl1 = Light::point([-30.0, 10.0, -30.0], [1.0, 0.92, 0.80], 150.0, 60.0);
-            sl1.shadow_capable = true;
-            let mut sl2 = Light::point([30.0, 12.0, -30.0], [0.6, 0.8, 1.0], 120.0, 50.0);
-            sl2.shadow_capable = true;
-            let mut sl3 = Light::point([-30.0, 11.0, 30.0], [1.0, 0.85, 0.55], 130.0, 55.0);
-            sl3.shadow_capable = true;
-            let mut sl4 = Light::point([30.0, 9.0, 30.0], [0.5, 1.0, 0.6], 100.0, 45.0);
-            sl4.shadow_capable = true;
-            light_manager.register(static_sector, vec![sl1, sl2, sl3, sl4]);
-        }
-
         // ---- Demo: Dynamic orbiting lights ----
         // Registered under a sentinel sector, tracked for per-frame position updates.
-        // Speeds (0.37, -0.53, 0.71 rad/s) are all distinct from camera (0.12 rad/s).
+        // Speeds (0.37, -0.53, 0.71 rad/s) are all distinct primes for visual variety.
         let dynamic_sector: (i32, i32) = (i32::MAX - 2, i32::MAX - 2);
         let dynamic_light_indices;
         {
@@ -260,8 +321,21 @@ impl Renderer {
             dynamic_light_indices = light_manager.register(dynamic_sector, vec![dl1, dl2, dl3]);
         }
 
-        println!("[Renderer] Demo scene initialized. {} materials, {} SH probes, sun shadow {}×{}. Streaming: {}m. Lights: {} static + {} dynamic",
-            material_library.count(), probe_grid.probe_count(), SUN_SHADOW_SIZE, SUN_SHADOW_SIZE, STREAMING_RADIUS, 4, dynamic_light_indices.len());
+        // Sentinel sector for user-spawned lights.
+        let spawned_light_sector: SectorCoord = (i32::MAX - 3, i32::MAX - 3);
+
+        // Seed RNG from system time (coarse but sufficient for spawn scatter).
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+
+        println!(
+            "[Renderer] Scene initialized: ground + {} animated lights. {} materials, {} SH probes.  \
+             Keybinds: L=light (max {}), G=geometry (max {})",
+            dynamic_light_indices.len(), material_library.count(),
+            probe_grid.probe_count(), MAX_SPAWNED_LIGHTS, MAX_SPAWNED_GEOMETRY,
+        );
 
         Ok(Self {
             device, memory_ctx, scene, world,
@@ -278,6 +352,12 @@ impl Renderer {
             frame_descriptors, command_buffers,
             image_available, render_finished, in_flight_fences,
             current_frame: 0, global_frame: 0,
+            rng: SimpleRng::new(seed),
+            spawned_light_count: 0,
+            spawned_light_sector,
+            spawned_geometry_count: 0,
+            next_dynamic_sector: 0,
+            deferred_frees: Vec::new(),
         })
     }
 
@@ -438,12 +518,10 @@ impl Renderer {
     }
 
     fn register_sector_lights(&mut self, sector: SectorCoord) {
-        // Demo scene: static and dynamic lights are registered globally
-        // in Renderer::new(), not per-sector.  Only register per-tile
-        // lights for non-demo sectors (currently none — all 4 demo
-        // sectors are handled by the global light setup).
-        const DEMO_SECTORS: [(i32,i32); 4] = [(-1,-1), (0,-1), (-1,0), (0,0)];
-        if DEMO_SECTORS.contains(&sector) {
+        // Demo scene: orbiting lights are registered globally in
+        // Renderer::new(), not per-sector.  Skip demo sectors and all
+        // sentinel sectors used for global lights / dynamic spawns.
+        if DEMO_SECTORS.contains(&sector) || sector.0 >= DYNAMIC_SECTOR_BASE || sector.0 >= i32::MAX - 10 {
             return;
         }
         // Fallback: original per-tile light placement for non-demo sectors.
@@ -500,6 +578,13 @@ impl Renderer {
         let r2 = EVICTION_RADIUS * EVICTION_RADIUS;
         let to_evict: Vec<SectorCoord> = self.world.sectors.iter()
             .filter(|(_, s)| s.state == SectorState::Ready)
+            // Never evict sentinel sectors (global lights, dynamic spawns).
+            .filter(|&(&c, _)| c.0 < DYNAMIC_SECTOR_BASE && c.0 < i32::MAX - 10)
+            // Never evict the 4 permanent demo ground tiles.  Their
+            // world_center (SECTOR_SIZE=256) doesn't match their geometry
+            // footprint (GROUND_TILE_SIZE=64), so distance checks are
+            // wrong and cause an evict→reload thrash loop.
+            .filter(|&(&c, _)| !DEMO_SECTORS.contains(&c))
             .filter(|(_, s)| {
                 let c = s.world_center();
                 (c[0]-camera_xz[0]).powi(2) + (c[1]-camera_xz[1]).powi(2) > r2
@@ -507,15 +592,17 @@ impl Renderer {
             .map(|(&c,_)| c).collect();
 
         for coord in to_evict {
-            // Free the 2 sector-level buffer handles.
+            // Defer buffer deletion — these buffers may still be bound in
+            // command buffers from the previous MAX_FRAMES_IN_FLIGHT frames.
+            // Immediate free causes VUID-vkDestroyBuffer-buffer-00922.
             if let Some(sec) = self.world.sectors.get(&coord) {
                 if let Some(vh) = sec.vertex_handle {
-                    self.memory_ctx.allocator.free_buffer(vh);
                     self.memory_ctx.budget.untrack(vh);
+                    self.deferred_frees.push(DeferredFree { handle: vh, frame: self.global_frame });
                 }
                 if let Some(ih) = sec.index_handle {
-                    self.memory_ctx.allocator.free_buffer(ih);
                     self.memory_ctx.budget.untrack(ih);
+                    self.deferred_frees.push(DeferredFree { handle: ih, frame: self.global_frame });
                 }
             }
 
@@ -524,9 +611,35 @@ impl Renderer {
             // Phase 3: Invalidate probes affected by evicted sector.
             self.probe_grid.invalidate_sector(coord);
 
+            // Remove from HashMap entirely so `prioritized_unloaded_sectors`
+            // won't find it and re-stream it.  `update_sector_grid` will
+            // re-insert when the camera is within STREAMING_RADIUS.
+            self.world.sectors.remove(&coord);
+
             if !ids.is_empty() {
                 println!("[Renderer] Evicted sector ({},{}) — {} objects", coord.0, coord.1, ids.len());
             }
+        }
+    }
+
+    /// Drain the deferred buffer deletion queue.  Called after
+    /// `wait_for_fences` so we know the current frame-slot's previous
+    /// submission has completed.  With MAX_FRAMES_IN_FLIGHT=2 and both
+    /// slots having cycled, all commands referencing these buffers are done.
+    fn drain_deferred_frees(&mut self) {
+        let cutoff = self.global_frame.saturating_sub(MAX_FRAMES_IN_FLIGHT as u64);
+        // Collect handles to free (avoids borrow conflict with retain).
+        let mut to_free: Vec<BufferHandle> = Vec::new();
+        self.deferred_frees.retain(|entry| {
+            if entry.frame <= cutoff {
+                to_free.push(entry.handle);
+                false
+            } else {
+                true
+            }
+        });
+        for handle in to_free {
+            self.memory_ctx.allocator.free_buffer(handle);
         }
     }
 
@@ -534,8 +647,11 @@ impl Renderer {
     //  Frame rendering
     // ================================================================
 
-    pub fn render(&mut self, device_ctx: &DeviceContext) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn render(&mut self, device_ctx: &DeviceContext, input: &InputState, dt: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.global_frame += 1;
+
+        // ---- Process keybind actions ----
+        self.process_actions(input);
 
         self.update_streaming();
         self.poll_uploads();
@@ -550,8 +666,11 @@ impl Renderer {
 
         unsafe {
             self.device.wait_for_fences(&[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
-            self.scene.update(0.016);
-            self.update_dynamic_lights(0.016);
+            // Safe to free buffers now — both frame slots have cycled
+            // since these buffers were last referenced.
+            self.drain_deferred_frees();
+            self.scene.update(dt, input);
+            self.update_dynamic_lights(dt);
             self.memory_ctx.ring.begin_frame(self.current_frame);
 
             let frustum = self.scene.camera.extract_frustum_planes();
@@ -607,16 +726,15 @@ impl Renderer {
             // ---- Stats ----
             if self.global_frame % 60 == 0 {
                 println!(
-                    "[Frame {:>5}] sectors: {}/{} (stream:{} fail:{})  objects: {}  draws: {} opq + {} shd  lights: {}/{}  shadows: {}  tex: {}/{}  probes: {} (bake_q: {})",
+                    "[Frame {:>5}] cam:[{:.1},{:.1},{:.1}] spd:{:.0}  objects: {}  draws: {} opq + {} shd  lights: {}/{}  shadows: {}  spawned: {} lights, {} geom  probes: {} (bake_q: {})",
                     self.global_frame,
-                    self.world.ready_sector_count(), self.world.sectors.len(),
-                    self.world.streaming_sector_count(),
-                    self.world.sectors.values().filter(|s| s.state == SectorState::Failed).count(),
+                    camera_pos[0], camera_pos[1], camera_pos[2],
+                    self.scene.camera.move_speed,
                     self.world.total_objects(),
                     self.world.opaque_draws.len(), self.world.shadow_draws.len(),
                     active_light_count, self.light_manager.total_count(),
                     self.shadow_budget.active_shadow_count(),
-                    self.texture_manager.active_count(), self.texture_manager.pending_count(),
+                    self.spawned_light_count, self.spawned_geometry_count,
                     self.probe_grid.probe_count(),
                     self.probe_grid.pending_bake_count(),
                 );
@@ -930,6 +1048,134 @@ impl Renderer {
         count
     }
 
+    // ================================================================
+    //  Keybind action processing
+    // ================================================================
+
+    fn process_actions(&mut self, input: &InputState) {
+        for action in &input.actions {
+            match action {
+                InputAction::SpawnLight => self.spawn_random_light(),
+                InputAction::SpawnGeometry => self.spawn_random_geometry(),
+            }
+        }
+    }
+
+    /// Spawn a shadow-enabled point light at a random position near the camera.
+    fn spawn_random_light(&mut self) {
+        if self.spawned_light_count >= MAX_SPAWNED_LIGHTS {
+            println!("[Spawn] Light limit reached ({}/{})", self.spawned_light_count, MAX_SPAWNED_LIGHTS);
+            return;
+        }
+
+        let cam = self.scene.camera.position;
+        let x = cam[0] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
+        let y = self.rng.range(SPAWN_LIGHT_HEIGHT_MIN, SPAWN_LIGHT_HEIGHT_MAX);
+        let z = cam[2] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
+
+        // Random warm-to-cool color.
+        let r = self.rng.range(0.3, 1.0);
+        let g = self.rng.range(0.3, 1.0);
+        let b = self.rng.range(0.3, 1.0);
+
+        let intensity = self.rng.range(80.0, 250.0);
+        let radius = self.rng.range(25.0, 60.0);
+
+        let mut light = Light::point([x, y, z], [r, g, b], intensity, radius);
+        light.shadow_capable = true;
+
+        self.light_manager.register(self.spawned_light_sector, vec![light]);
+        self.spawned_light_count += 1;
+
+        println!(
+            "[Spawn] Light #{} at [{:.1}, {:.1}, {:.1}] color=[{:.2},{:.2},{:.2}] I={:.0} R={:.0}",
+            self.spawned_light_count, x, y, z, r, g, b, intensity, radius,
+        );
+    }
+
+    /// Spawn a random geometry object (cube, pyramid, or column) near the camera.
+    /// Uses the existing async sector upload path with a unique sentinel sector coord.
+    fn spawn_random_geometry(&mut self) {
+        if self.spawned_geometry_count >= MAX_SPAWNED_GEOMETRY {
+            println!("[Spawn] Geometry limit reached ({}/{})", self.spawned_geometry_count, MAX_SPAWNED_GEOMETRY);
+            return;
+        }
+
+        let cam = self.scene.camera.position;
+        let x = cam[0] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
+        let z = cam[2] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
+        let pos = [x, 0.0, z];
+
+        // Random shape.
+        let shape: u32 = (self.rng.next_u64() % 3) as u32;
+        // Material palette: 2=polished_metal 3=rough_stone 4=copper 5=ceramic_red
+        //   6=ceramic_blue 7=gold 8=rubber 9=marble 10=emissive_warm 11=emissive_cool
+        let mat = self.rng.pick(&[2u32, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+
+        let r = self.rng.range(0.3, 1.0);
+        let g = self.rng.range(0.3, 1.0);
+        let b = self.rng.range(0.3, 1.0);
+        let color = [r, g, b];
+
+        let scale = self.rng.range(1.5, 6.0);
+        let y_rot = self.rng.range(0.0, std::f32::consts::TAU);
+
+        let raw = match shape {
+            0 => make_cube(color, mat),
+            1 => {
+                let height = self.rng.range(1.5, 3.0);
+                make_pyramid(color, height, mat)
+            }
+            _ => {
+                let height = self.rng.range(3.0, 12.0);
+                let radius = self.rng.range(0.3, 0.8);
+                make_column(color, height, radius, mat)
+            }
+        };
+
+        let transform = demo_transform(pos, scale, y_rot);
+        let bounds = Aabb::from_vertices(&raw.vertices, &transform);
+        let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
+
+        let descriptor = ObjectDescriptor {
+            vertices: raw.vertices,
+            indices: raw.indices,
+            transform,
+            material_id: mat,
+            flags,
+            bounds,
+        };
+
+        // Unique sector coord for this spawn batch.
+        let sector_coord: SectorCoord = (DYNAMIC_SECTOR_BASE + self.next_dynamic_sector, 0);
+        self.next_dynamic_sector += 1;
+
+        // Insert sector into world.
+        self.world.sectors.entry(sector_coord)
+            .or_insert_with(|| Sector::new(sector_coord));
+        if let Some(sec) = self.world.sectors.get_mut(&sector_coord) {
+            sec.state = SectorState::Unloaded;
+        }
+
+        let shape_name = match shape { 0 => "cube", 1 => "pyramid", _ => "column" };
+
+        match self.upload_sector_batch(sector_coord, vec![descriptor]) {
+            Ok(()) => {
+                self.spawned_geometry_count += 1;
+                println!(
+                    "[Spawn] Geometry #{} ({}) at [{:.1}, 0, {:.1}] scale={:.1} mat={}",
+                    self.spawned_geometry_count, shape_name, x, z, scale, mat,
+                );
+            }
+            Err(e) => {
+                eprintln!("[Spawn] Geometry upload failed: {}", e);
+                if let Some(sec) = self.world.sectors.get_mut(&sector_coord) {
+                    sec.state = SectorState::Failed;
+                }
+            }
+        }
+    }
+
     pub fn recreate_framebuffers(&mut self, device_ctx: &DeviceContext) -> Result<(), Box<dyn std::error::Error>> {
         unsafe { self.device.device_wait_idle()? };
         self.framebuffers.destroy(&self.device);
@@ -954,6 +1200,11 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) { unsafe {
         let _ = self.device.device_wait_idle();
+        // Flush any remaining deferred buffer deletions — device is idle
+        // so all command buffers have completed.
+        for entry in self.deferred_frees.drain(..) {
+            self.memory_ctx.allocator.free_buffer(entry.handle);
+        }
         for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
         for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
         for &s in &self.image_available { self.device.destroy_semaphore(s, None); }
