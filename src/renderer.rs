@@ -92,6 +92,11 @@ pub struct Renderer {
     sun_shadow: SunShadow,
     sun_direction: [f32; 3],
 
+    /// Global indices into LightManager for lights that orbit each frame.
+    dynamic_light_indices: Vec<usize>,
+    /// Accumulated time for dynamic light animation (independent of camera).
+    dynamic_light_time: f32,
+
     // Phase 3: Global Illumination
     probe_grid: ProbeGrid,
     gi_resources: GIResources,
@@ -164,7 +169,7 @@ impl Renderer {
         let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
 
         // Phase 3: Global Illumination resources.
-        let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [32.0, 32.0])?;
+        let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
         let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
 
         let vert_spv = include_bytes!("../shaders/compiled/basic.vert.spv");
@@ -226,8 +231,37 @@ impl Renderer {
         let sun_light = Light::directional(sun_dir, SUN_COLOR, SUN_INTENSITY);
         light_manager.register((i32::MAX, i32::MAX), vec![sun_light]);
 
-        println!("[Renderer] Phase 3 initialized. {} materials, {} SH probes, sun shadow {}×{}. Streaming: {}m",
-            material_library.count(), probe_grid.probe_count(), SUN_SHADOW_SIZE, SUN_SHADOW_SIZE, STREAMING_RADIUS);
+        // ---- Demo: Static lights (fixed positions around the scene) ----
+        let static_sector: (i32, i32) = (i32::MAX - 1, i32::MAX - 1);
+        {
+            let mut sl1 = Light::point([-30.0, 10.0, -30.0], [1.0, 0.92, 0.80], 150.0, 60.0);
+            sl1.shadow_capable = true;
+            let mut sl2 = Light::point([30.0, 12.0, -30.0], [0.6, 0.8, 1.0], 120.0, 50.0);
+            sl2.shadow_capable = true;
+            let mut sl3 = Light::point([-30.0, 11.0, 30.0], [1.0, 0.85, 0.55], 130.0, 55.0);
+            sl3.shadow_capable = true;
+            let mut sl4 = Light::point([30.0, 9.0, 30.0], [0.5, 1.0, 0.6], 100.0, 45.0);
+            sl4.shadow_capable = true;
+            light_manager.register(static_sector, vec![sl1, sl2, sl3, sl4]);
+        }
+
+        // ---- Demo: Dynamic orbiting lights ----
+        // Registered under a sentinel sector, tracked for per-frame position updates.
+        // Speeds (0.37, -0.53, 0.71 rad/s) are all distinct from camera (0.12 rad/s).
+        let dynamic_sector: (i32, i32) = (i32::MAX - 2, i32::MAX - 2);
+        let dynamic_light_indices;
+        {
+            let mut dl1 = Light::point([25.0, 6.0, 0.0], [1.0, 0.7, 0.3], 200.0, 40.0);
+            dl1.shadow_capable = true;
+            let mut dl2 = Light::point([0.0, 8.0, 35.0], [0.3, 0.5, 1.0], 180.0, 45.0);
+            dl2.shadow_capable = true;
+            let mut dl3 = Light::point([18.0, 4.0, 0.0], [1.0, 0.3, 0.8], 160.0, 35.0);
+            dl3.shadow_capable = true;
+            dynamic_light_indices = light_manager.register(dynamic_sector, vec![dl1, dl2, dl3]);
+        }
+
+        println!("[Renderer] Demo scene initialized. {} materials, {} SH probes, sun shadow {}×{}. Streaming: {}m. Lights: {} static + {} dynamic",
+            material_library.count(), probe_grid.probe_count(), SUN_SHADOW_SIZE, SUN_SHADOW_SIZE, STREAMING_RADIUS, 4, dynamic_light_indices.len());
 
         Ok(Self {
             device, memory_ctx, scene, world,
@@ -237,6 +271,8 @@ impl Renderer {
             shadow_assignments: HashMap::new(),
             sun_shadow,
             sun_direction: sun_dir,
+            dynamic_light_indices,
+            dynamic_light_time: 0.0,
             probe_grid, gi_resources, probe_bake_target,
             descriptor_layouts, render_passes, pipelines, framebuffers,
             frame_descriptors, command_buffers,
@@ -402,6 +438,15 @@ impl Renderer {
     }
 
     fn register_sector_lights(&mut self, sector: SectorCoord) {
+        // Demo scene: static and dynamic lights are registered globally
+        // in Renderer::new(), not per-sector.  Only register per-tile
+        // lights for non-demo sectors (currently none — all 4 demo
+        // sectors are handled by the global light setup).
+        const DEMO_SECTORS: [(i32,i32); 4] = [(-1,-1), (0,-1), (-1,0), (0,0)];
+        if DEMO_SECTORS.contains(&sector) {
+            return;
+        }
+        // Fallback: original per-tile light placement for non-demo sectors.
         let tiles = (SECTOR_SIZE / GROUND_TILE_SIZE) as i32;
         let bx = sector.0 * tiles;
         let bz = sector.1 * tiles;
@@ -414,6 +459,41 @@ impl Renderer {
             lights.push(l);
         }}
         self.light_manager.register(sector, lights);
+    }
+
+    /// Per-frame position update for orbiting demo lights.
+    ///
+    /// Three lights orbit the origin at different radii, heights, and angular
+    /// velocities — all deliberately different from the camera rotation speed
+    /// (0.12 rad/s) so the dynamic lighting effect is clearly visible.
+    ///
+    /// Light 0: radius 25 m, height 6 m, speed  0.37 rad/s  (warm)
+    /// Light 1: radius 35 m, height 8 m, speed −0.53 rad/s  (cool, reverse)
+    /// Light 2: radius 18 m, height 4 m, speed  0.71 rad/s  (magenta)
+    fn update_dynamic_lights(&mut self, dt: f32) {
+        self.dynamic_light_time += dt;
+        let t = self.dynamic_light_time;
+
+        struct Orbit { radius: f32, height: f32, speed: f32 }
+        const ORBITS: [Orbit; 3] = [
+            Orbit { radius: 25.0, height: 6.0, speed:  0.37 },
+            Orbit { radius: 35.0, height: 8.0, speed: -0.53 },
+            Orbit { radius: 18.0, height: 4.0, speed:  0.71 },
+        ];
+
+        for (i, orb) in ORBITS.iter().enumerate() {
+            if i >= self.dynamic_light_indices.len() { break; }
+            let idx = self.dynamic_light_indices[i];
+            let angle = t * orb.speed;
+            let new_pos = [
+                orb.radius * angle.cos(),
+                orb.height,
+                orb.radius * angle.sin(),
+            ];
+            if let Some(light) = self.light_manager.get_mut(idx) {
+                light.position = new_pos;
+            }
+        }
     }
 
     fn evict_distant_sectors(&mut self, camera_xz: [f32; 2]) {
@@ -471,6 +551,7 @@ impl Renderer {
         unsafe {
             self.device.wait_for_fences(&[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
             self.scene.update(0.016);
+            self.update_dynamic_lights(0.016);
             self.memory_ctx.ring.begin_frame(self.current_frame);
 
             let frustum = self.scene.camera.extract_frustum_planes();

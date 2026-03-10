@@ -539,6 +539,12 @@ impl LightManager {
         self.lights.get(index)
     }
 
+    /// Mutable access to a light by global index.
+    /// Used for per-frame position updates on dynamic lights.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Light> {
+        self.lights.get_mut(index)
+    }
+
     /// Total registered lights.
     pub fn total_count(&self) -> usize {
         self.lights.len()

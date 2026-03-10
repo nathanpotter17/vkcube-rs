@@ -78,18 +78,22 @@ pub struct Camera {
     pub far: f32,
 }
 
-const ORBIT_RADIUS: f32 = 25.0;
-const ORBIT_HEIGHT: f32 = 18.0;
-const TARGET_Y: f32 = 1.0;
-const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.08;
+/// Camera sits at the world origin (meeting point of 4 demo tiles)
+/// elevated to 8 m, slowly rotating to survey the scene.
+const CAMERA_HEIGHT: f32 = 8.0;
+/// How far ahead the look-target sits (ground-level ring).
+const LOOK_DISTANCE: f32 = 20.0;
+const LOOK_TARGET_Y: f32 = 2.0;
+/// Camera rotation speed — deliberately different from all light orbit speeds.
+const CAMERA_SPEED_RAD_PER_SEC: f32 = 0.12;
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
         Self {
-            position: [ORBIT_RADIUS, ORBIT_HEIGHT, 0.0],
-            target: [0.0, TARGET_Y, 0.0],
+            position: [0.0, CAMERA_HEIGHT, 0.0],
+            target: [LOOK_DISTANCE, LOOK_TARGET_Y, 0.0],
             up: [0.0, 1.0, 0.0],
-            fov: 60.0, aspect, near: 0.1, far: 800.0,
+            fov: 60.0, aspect, near: 0.1, far: 200.0,
         }
     }
 
@@ -169,17 +173,20 @@ impl Scene {
 
     pub fn update(&mut self, delta_time: f32) {
         self.prev_camera_pos = self.camera.position;
-        self.rotation += delta_time * ORBIT_SPEED_RAD_PER_SEC;
+        self.rotation += delta_time * CAMERA_SPEED_RAD_PER_SEC;
         self.frame_number += 1;
+
+        // Camera fixed at world origin, elevated.
+        self.camera.position = [0.0, CAMERA_HEIGHT, 0.0];
+
+        // Target rotates around origin on the ground plane.
         let cos_r = self.rotation.cos();
         let sin_r = self.rotation.sin();
-        let center_x = 32.0;
-        let center_z = 32.0;
-        self.camera.position = [
-            center_x + ORBIT_RADIUS * cos_r, ORBIT_HEIGHT,
-            center_z + ORBIT_RADIUS * sin_r,
+        self.camera.target = [
+            LOOK_DISTANCE * cos_r,
+            LOOK_TARGET_Y,
+            LOOK_DISTANCE * sin_r,
         ];
-        self.camera.target = [center_x, TARGET_Y, center_z];
     }
 
     pub fn camera_velocity_xz(&self) -> [f32; 2] {

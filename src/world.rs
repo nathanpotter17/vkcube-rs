@@ -36,8 +36,8 @@ const DEFAULT_LOD_THRESHOLDS_SQ: [f32; MAX_LOD_LEVELS] = [
     6_400.0, 40_000.0, 250_000.0, f32::MAX,
 ];
 
-pub const STREAMING_RADIUS: f32 = 640.0;
-pub const EVICTION_RADIUS: f32 = 768.0;
+pub const STREAMING_RADIUS: f32 = 200.0;
+pub const EVICTION_RADIUS: f32 = 250.0;
 pub const MAX_SECTOR_STARTS_PER_FRAME: usize = 2;
 
 // ====================================================================
@@ -484,35 +484,10 @@ pub struct ObjectDescriptor {
     pub bounds: Aabb,
 }
 
-// ---- Deterministic RNG ----
-
-struct TileRng { state: u64 }
-impl TileRng {
-    fn new(a: i32, b: i32) -> Self {
-        let mut s = (a as u64).wrapping_mul(0x9E3779B97F4A7C15)
-            ^ (b as u64).wrapping_mul(0x517CC1B727220A95);
-        s = s.wrapping_add(0x6A09E667F3BCC908);
-        Self { state: s }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.state;
-        z = (z^(z>>30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z^(z>>27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z>>31)
-    }
-    fn next_f32(&mut self) -> f32 { (self.next_u64()>>40) as f32 / (1u64<<24) as f32 }
-    fn range_f32(&mut self, lo: f32, hi: f32) -> f32 { lo + self.next_f32()*(hi-lo) }
-    fn range_usize(&mut self, n: usize) -> usize { (self.next_u64() % n as u64) as usize }
-}
-
 // ---- Ground colour palette ----
 
 fn tile_ground_color(cx: i32, cz: i32) -> [f32; 3] {
-    const P: [[f32;3];8] = [
-        [0.25,0.55,0.22],[0.30,0.50,0.18],[0.35,0.58,0.25],[0.22,0.48,0.20],
-        [0.40,0.56,0.28],[0.28,0.52,0.24],[0.32,0.60,0.22],[0.26,0.46,0.26],
-    ];
+    const P: [[f32;3];8] = [[0.15; 3]; 8];
     P[((cx.wrapping_mul(7))^(cz.wrapping_mul(13))).unsigned_abs() as usize % P.len()]
 }
 
@@ -604,93 +579,122 @@ fn make_column(color: [f32;3], height: f32, radius: f32, material_id: u32) -> Ra
 fn cross_vec3(a:[f32;3],b:[f32;3])->[f32;3]{[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}
 fn normalize_vec3(v:[f32;3])->[f32;3]{let l=(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();if l>0.0{[v[0]/l,v[1]/l,v[2]/l]}else{[0.0,1.0,0.0]}}
 
+#[allow(dead_code)]
 const OBJ_MATS: [u32; 8] = [2,3,4,5,6,7,8,9];
 
 // ====================================================================
 //  Public API: generate ObjectDescriptors for a 256 m sector
 // ====================================================================
 
-/// Non-uniform procedural generation.  Ground tiles in a 4×4 grid for
-/// seamless coverage, then scattered objects placed freely using noise.
-/// Objects intentionally ignore tile boundaries — a large column near
-/// a tile edge is perfectly fine.
+/// Demo scene: exactly 4 ground tiles meeting at the world origin,
+/// plus hand-placed large geometry of varying types and materials.
+/// Only sectors (-1,-1), (-1,0), (0,-1), (0,0) produce content;
+/// all other sectors return empty.
 pub fn generate_sector_objects(sector: SectorCoord) -> Vec<ObjectDescriptor> {
-    let tiles = (SECTOR_SIZE / GROUND_TILE_SIZE) as i32;
-    let bx = sector.0 * tiles;
-    let bz = sector.1 * tiles;
-    let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
+    const DEMO_SECTORS: [(i32,i32); 4] = [(-1,-1), (0,-1), (-1,0), (0,0)];
+    if !DEMO_SECTORS.contains(&sector) {
+        return Vec::new();
+    }
 
+    let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
     let mut result = Vec::new();
 
-    // Ground planes — still tiled for seamless coverage.
-    for dx in 0..tiles { for dz in 0..tiles {
-        let raw = make_ground_plane(bx+dx, bz+dz);
-        let bounds = Aabb::from_vertices(&raw.vertices, &raw.transform);
-        result.push(ObjectDescriptor {
-            vertices: raw.vertices, indices: raw.indices, transform: raw.transform,
-            material_id: raw.material_id, flags, bounds,
-        });
-    }}
+    // ---- One ground tile per sector ----
+    // Tile coord = sector coord → 4 tiles covering [-64,64]×[-64,64].
+    let raw = make_ground_plane(sector.0, sector.1);
+    let bounds = Aabb::from_vertices(&raw.vertices, &raw.transform);
+    result.push(ObjectDescriptor {
+        vertices: raw.vertices, indices: raw.indices, transform: raw.transform,
+        material_id: raw.material_id, flags, bounds,
+    });
 
-    // Scattered objects — noise-based placement across the full sector.
-    let mut rng = TileRng::new(sector.0, sector.1);
-    let origin_x = sector.0 as f32 * SECTOR_SIZE;
-    let origin_z = sector.1 as f32 * SECTOR_SIZE;
+    // ---- Curated geometry per quadrant ----
+    match sector {
+        // NW quadrant: [-64,0] × [-64,0]
+        (-1, -1) => {
+            push_cube(&mut result, flags, [-40.0, 0.0, -35.0], 5.0, 0.0, [0.95,0.93,0.88], 2);  // polished_metal
+            push_column(&mut result, flags, [-20.0, 0.0, -50.0], 3.0, 8.0, 0.6, 0.0, [0.95,0.64,0.54], 4); // copper
+            push_pyramid(&mut result, flags, [-50.0, 0.0, -15.0], 3.5, 2.5, 0.8, [0.12,0.12,0.14], 8); // rubber
+        }
+        // NE quadrant: [0,64] × [-64,0]
+        (0, -1) => {
+            push_pyramid(&mut result, flags, [25.0, 0.0, -40.0], 7.0, 2.0, 0.0, [0.92,0.90,0.85], 9); // marble — massive
+            push_cube(&mut result, flags, [48.0, 0.0, -15.0], 3.5, 0.5, [0.12,0.35,0.85], 6); // ceramic_blue
+            push_column(&mut result, flags, [12.0, 0.0, -55.0], 2.5, 12.0, 0.4, 1.2, [0.55,0.52,0.50], 3); // rough_stone — tall spire
+        }
+        // SW quadrant: [-64,0] × [0,64]
+        (-1, 0) => {
+            push_column(&mut result, flags, [-38.0, 0.0, 30.0], 4.0, 5.0, 0.8, 0.3, [0.55,0.52,0.50], 3); // rough_stone — wide
+            push_cube(&mut result, flags, [-12.0, 0.0, 42.0], 2.5, 0.0, [1.0,0.85,0.4], 10); // emissive_warm
+            push_pyramid(&mut result, flags, [-52.0, 0.0, 52.0], 4.0, 3.0, 2.0, [0.85,0.15,0.12], 5); // ceramic_red
+        }
+        // SE quadrant: [0,64] × [0,64]
+        (0, 0) => {
+            push_column(&mut result, flags, [30.0, 0.0, 35.0], 6.0, 10.0, 0.5, 0.0, [1.0,0.76,0.33], 7); // gold — landmark
+            push_pyramid(&mut result, flags, [52.0, 0.0, 48.0], 4.0, 2.5, 1.5, [0.85,0.15,0.12], 5); // ceramic_red
+            push_cube(&mut result, flags, [15.0, 0.0, 55.0], 3.0, 0.9, [0.4,0.7,1.0], 11); // emissive_cool
+        }
+        _ => {}
+    }
 
-    // Number of objects varies per sector (15–40).
-    let obj_count = 15 + rng.range_usize(26);
-
-    for _ in 0..obj_count {
-        // Position: anywhere in the 256 m sector.
-        let x = origin_x + rng.range_f32(2.0, SECTOR_SIZE - 2.0);
-        let z = origin_z + rng.range_f32(2.0, SECTOR_SIZE - 2.0);
-
-        // Type: weighted random.
-        let kind = rng.range_usize(10);
-        let mat = OBJ_MATS[rng.range_usize(OBJ_MATS.len())];
-
-        // Scale varies significantly — some tiny, some large.
-        let base_scale = rng.range_f32(0.8, 3.5);
-
-        // Occasional large landmark (1 in 10).
-        let scale = if kind == 0 { base_scale * 2.5 } else { base_scale };
-
-        let raw = match kind {
-            0..=3 => {
-                let c = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
-                make_cube(c, mat)
-            }
-            4..=6 => {
-                let c = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
-                let h = rng.range_f32(1.0, 3.0);
-                make_pyramid(c, h, mat)
-            }
-            _ => {
-                let c = [rng.next_f32(), rng.next_f32(), rng.next_f32()];
-                let h = rng.range_f32(2.0, 8.0);
-                let r = rng.range_f32(0.3, 0.8);
-                make_column(c, h, r, mat)
-            }
-        };
-
-        // Y rotation for variety.
-        let angle = rng.range_f32(0.0, std::f32::consts::TAU);
-        let cos = angle.cos();
-        let sin = angle.sin();
-
-        let transform = [
-            [scale*cos,  0.0, scale*sin, 0.0],
-            [0.0,        scale, 0.0,     0.0],
-            [-scale*sin, 0.0, scale*cos, 0.0],
-            [x,          0.0, z,         1.0],
-        ];
-
-        let bounds = Aabb::from_vertices(&raw.vertices, &transform);
-        result.push(ObjectDescriptor {
-            vertices: raw.vertices, indices: raw.indices, transform,
-            material_id: raw.material_id, flags, bounds,
-        });
+    // ---- Objects near the origin (placed in whichever quadrant they fall in) ----
+    if sector == (-1, -1) {
+        // Small column just SW of origin.
+        push_column(&mut result, flags, [-5.0, 0.0, -8.0], 2.0, 4.0, 0.5, 0.0, [0.95,0.64,0.54], 4);
+    }
+    if sector == (0, 0) {
+        // Small cube just SE of origin.
+        push_cube(&mut result, flags, [7.0, 0.0, 6.0], 1.8, 0.4, [1.0,0.76,0.33], 7);
     }
 
     result
+}
+
+// ---- Demo helper: push transformed object into result ----
+
+fn push_cube(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+             pos: [f32; 3], scale: f32, y_rot: f32, color: [f32; 3], mat: u32) {
+    let raw = make_cube(color, mat);
+    let transform = demo_transform(pos, scale, y_rot);
+    let bounds = Aabb::from_vertices(&raw.vertices, &transform);
+    result.push(ObjectDescriptor {
+        vertices: raw.vertices, indices: raw.indices, transform,
+        material_id: mat, flags, bounds,
+    });
+}
+
+fn push_pyramid(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+                pos: [f32; 3], scale: f32, height: f32, y_rot: f32,
+                color: [f32; 3], mat: u32) {
+    let raw = make_pyramid(color, height, mat);
+    let transform = demo_transform(pos, scale, y_rot);
+    let bounds = Aabb::from_vertices(&raw.vertices, &transform);
+    result.push(ObjectDescriptor {
+        vertices: raw.vertices, indices: raw.indices, transform,
+        material_id: mat, flags, bounds,
+    });
+}
+
+fn push_column(result: &mut Vec<ObjectDescriptor>, flags: RenderFlags,
+               pos: [f32; 3], scale: f32, height: f32, radius: f32,
+               y_rot: f32, color: [f32; 3], mat: u32) {
+    let raw = make_column(color, height, radius, mat);
+    let transform = demo_transform(pos, scale, y_rot);
+    let bounds = Aabb::from_vertices(&raw.vertices, &transform);
+    result.push(ObjectDescriptor {
+        vertices: raw.vertices, indices: raw.indices, transform,
+        material_id: mat, flags, bounds,
+    });
+}
+
+/// Build a Y-axis rotation + uniform scale + translation matrix.
+fn demo_transform(pos: [f32; 3], scale: f32, y_rot: f32) -> [[f32; 4]; 4] {
+    let cos = y_rot.cos();
+    let sin = y_rot.sin();
+    [
+        [scale * cos,  0.0, scale * sin, 0.0],
+        [0.0,          scale, 0.0,       0.0],
+        [-scale * sin, 0.0, scale * cos, 0.0],
+        [pos[0],       pos[1], pos[2],   1.0],
+    ]
 }
