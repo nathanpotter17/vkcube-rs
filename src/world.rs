@@ -40,6 +40,10 @@ pub const STREAMING_RADIUS: f32 = 200.0;
 pub const EVICTION_RADIUS: f32 = 250.0;
 pub const MAX_SECTOR_STARTS_PER_FRAME: usize = 2;
 
+/// Extra padding added to sector content bounds to prevent border-mesh
+/// pop-in/out.  Matches plan §6.4 "Expanded AABB for Border Meshes".
+pub const SECTOR_BORDER_PADDING: f32 = 4.0;
+
 // ====================================================================
 //  Sector
 // ====================================================================
@@ -64,6 +68,10 @@ pub struct Sector {
     pub vertex_handle: Option<BufferHandle>,
     /// Shared index buffer handle for all objects in this sector.
     pub index_handle: Option<BufferHandle>,
+    /// Actual world-space AABB of all geometry in this sector (XYZ).
+    /// `None` when sector has no registered objects (Unloaded/Streaming).
+    /// Includes SECTOR_BORDER_PADDING margin for border meshes.
+    pub content_bounds: Option<Aabb>,
 }
 
 impl Sector {
@@ -71,9 +79,12 @@ impl Sector {
         Self {
             coord, state: SectorState::Unloaded, objects: Vec::new(),
             priority: 0.0, vertex_handle: None, index_handle: None,
+            content_bounds: None,
         }
     }
 
+    /// Theoretical center of the 256 m grid cell.  Used only as a fallback
+    /// when no content bounds are available (e.g. before objects are loaded).
     #[inline]
     pub fn world_center(&self) -> [f32; 2] {
         [
@@ -82,29 +93,92 @@ impl Sector {
         ]
     }
 
+    /// Expand the sector's content AABB to include `object_aabb`.
+    /// Adds SECTOR_BORDER_PADDING margin on each axis.
+    pub fn grow_bounds(&mut self, object_aabb: &Aabb) {
+        match self.content_bounds {
+            Some(ref mut cb) => {
+                for i in 0..3 {
+                    cb.min[i] = cb.min[i].min(object_aabb.min[i] - SECTOR_BORDER_PADDING);
+                    cb.max[i] = cb.max[i].max(object_aabb.max[i] + SECTOR_BORDER_PADDING);
+                }
+            }
+            None => {
+                self.content_bounds = Some(Aabb::new(
+                    [
+                        object_aabb.min[0] - SECTOR_BORDER_PADDING,
+                        object_aabb.min[1] - SECTOR_BORDER_PADDING,
+                        object_aabb.min[2] - SECTOR_BORDER_PADDING,
+                    ],
+                    [
+                        object_aabb.max[0] + SECTOR_BORDER_PADDING,
+                        object_aabb.max[1] + SECTOR_BORDER_PADDING,
+                        object_aabb.max[2] + SECTOR_BORDER_PADDING,
+                    ],
+                ));
+            }
+        }
+    }
+
+    /// Minimum squared distance from `point_xz` (camera XZ) to the sector's
+    /// actual content footprint.  Returns 0.0 if the camera is inside.
+    ///
+    /// Falls back to theoretical 256 m cell center-point distance when
+    /// `content_bounds` is `None` (sector has no loaded geometry yet).
+    #[inline]
+    pub fn distance_sq_to_point_xz(&self, point_xz: [f32; 2]) -> f32 {
+        if let Some(ref cb) = self.content_bounds {
+            // Project to XZ plane — cb.min[0]/max[0] = X, cb.min[2]/max[2] = Z.
+            let dx = (cb.min[0] - point_xz[0]).max(0.0).max(point_xz[0] - cb.max[0]);
+            let dz = (cb.min[2] - point_xz[1]).max(0.0).max(point_xz[1] - cb.max[2]);
+            dx * dx + dz * dz
+        } else {
+            // No content bounds — fall back to center-point distance.
+            let c = self.world_center();
+            let dx = c[0] - point_xz[0];
+            let dz = c[1] - point_xz[1];
+            dx * dx + dz * dz
+        }
+    }
+
+    /// Compute streaming priority.  Uses actual content bounds when available;
+    /// falls back to theoretical 256 m AABB for sectors not yet loaded.
     pub fn compute_priority(
         &mut self, camera_xz: [f32; 2], camera_velocity_xz: [f32; 2],
         frustum: &[[f32; 4]; 6],
     ) {
-        let center = self.world_center();
-        let dx = center[0] - camera_xz[0];
-        let dz = center[1] - camera_xz[1];
-        let dist_sq = dx * dx + dz * dz;
+        // ---- Distance component (inverse quadratic) ----
+        let dist_sq = self.distance_sq_to_point_xz(camera_xz);
         let mut p = 1.0 / (dist_sq + 1.0);
 
-        let half = SECTOR_SIZE * 0.5;
-        if aabb_visible(frustum,
-            [center[0]-half, -100.0, center[1]-half],
-            [center[0]+half, 1000.0, center[1]+half],
-        ) { p *= 2.0; }
+        // ---- Frustum visibility boost (2×) ----
+        let visible = if let Some(ref cb) = self.content_bounds {
+            aabb_visible(frustum, cb.min, cb.max)
+        } else {
+            let center = self.world_center();
+            let half = SECTOR_SIZE * 0.5;
+            aabb_visible(frustum,
+                [center[0] - half, -100.0, center[1] - half],
+                [center[0] + half, 1000.0, center[1] + half],
+            )
+        };
+        if visible { p *= 2.0; }
 
-        let vel_len_sq = camera_velocity_xz[0]*camera_velocity_xz[0]
-            + camera_velocity_xz[1]*camera_velocity_xz[1];
+        // ---- Velocity prediction ----
+        let center = if let Some(ref cb) = self.content_bounds {
+            [(cb.min[0] + cb.max[0]) * 0.5, (cb.min[2] + cb.max[2]) * 0.5]
+        } else {
+            self.world_center()
+        };
+        let dx = center[0] - camera_xz[0];
+        let dz = center[1] - camera_xz[1];
+        let vel_len_sq = camera_velocity_xz[0] * camera_velocity_xz[0]
+            + camera_velocity_xz[1] * camera_velocity_xz[1];
         if vel_len_sq > 0.001 {
-            let inv_dist = 1.0 / dist_sq.sqrt().max(0.001);
+            let dir_dist = (dx * dx + dz * dz).sqrt().max(0.001);
             let vel_len = vel_len_sq.sqrt();
-            let dot = (camera_velocity_xz[0]*dx*inv_dist
-                + camera_velocity_xz[1]*dz*inv_dist) / vel_len;
+            let dot = (camera_velocity_xz[0] * dx / dir_dist
+                + camera_velocity_xz[1] * dz / dir_dist) / vel_len;
             p *= 0.5 + (dot + 1.0) * 0.5;
         }
         self.priority = p;
@@ -346,7 +420,11 @@ impl World {
         }
         self.spatial.insert(id, &bounds);
         self.objects[idx] = obj;
-        if let Some(sec) = self.sectors.get_mut(&sector) { sec.objects.push(id); }
+        if let Some(sec) = self.sectors.get_mut(&sector) {
+            sec.objects.push(id);
+            // Grow sector content bounds to include this object's AABB.
+            sec.grow_bounds(&bounds);
+        }
         id
     }
 
@@ -356,6 +434,7 @@ impl World {
             sec.state = SectorState::Unloaded;
             sec.vertex_handle = None;
             sec.index_handle = None;
+            sec.content_bounds = None;  // Reset — will be rebuilt on reload.
             ids
         } else { Vec::new() };
         for &id in &ids {
@@ -409,14 +488,18 @@ impl World {
         let rc = (r/SECTOR_SIZE).ceil() as i32;
         let r_sq = r * r;
         for sx in (cx-rc)..=(cx+rc) { for sz in (cz-rc)..=(cz+rc) {
-            // Circular distance check — reject corner sectors that the
-            // boxy cell radius would include but that exceed the actual
-            // streaming radius.  Prevents load/evict thrashing.
-            let center_x = sx as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
-            let center_z = sz as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
-            let dx = center_x - camera_xz[0];
-            let dz = center_z - camera_xz[1];
-            if dx * dx + dz * dz > r_sq { continue; }
+            // For sectors already known, use actual content bounds if available.
+            // For new sectors, use theoretical center — conservative for discovery.
+            let dist_sq = if let Some(sec) = self.sectors.get(&(sx, sz)) {
+                sec.distance_sq_to_point_xz(camera_xz)
+            } else {
+                let center_x = sx as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
+                let center_z = sz as f32 * SECTOR_SIZE + SECTOR_SIZE * 0.5;
+                let dx = center_x - camera_xz[0];
+                let dz = center_z - camera_xz[1];
+                dx * dx + dz * dz
+            };
+            if dist_sq > r_sq { continue; }
             self.sectors.entry((sx,sz)).or_insert_with(|| Sector::new((sx,sz)));
         }}
     }

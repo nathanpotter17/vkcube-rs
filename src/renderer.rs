@@ -55,12 +55,6 @@ const SPAWN_LIGHT_HEIGHT_MAX: f32 = 15.0;
 /// Sentinel sector base for dynamic spawns (high i32 range to avoid collision).
 const DYNAMIC_SECTOR_BASE: i32 = i32::MAX - 5000;
 
-/// The 4 permanent demo ground-tile sectors.  These must never be evicted
-/// because their `world_center()` (SECTOR_SIZE=256-based) doesn't match
-/// their actual geometry footprint (GROUND_TILE_SIZE=64-based).  Evicting
-/// them triggers an infinite evict→reload loop.
-const DEMO_SECTORS: [(i32, i32); 4] = [(-1, -1), (0, -1), (-1, 0), (0, 0)];
-
 /// Deferred buffer deletion entry.  Buffers freed during eviction may
 /// still be referenced by in-flight command buffers.  We delay the
 /// actual `free_buffer` call until `MAX_FRAMES_IN_FLIGHT` frames have
@@ -518,10 +512,15 @@ impl Renderer {
     }
 
     fn register_sector_lights(&mut self, sector: SectorCoord) {
-        // Demo scene: orbiting lights are registered globally in
-        // Renderer::new(), not per-sector.  Skip demo sectors and all
-        // sentinel sectors used for global lights / dynamic spawns.
-        if DEMO_SECTORS.contains(&sector) || sector.0 >= DYNAMIC_SECTOR_BASE || sector.0 >= i32::MAX - 10 {
+        // Sentinel sectors (global lights, dynamic spawns) already have lights
+        // registered separately.  Skip them.
+        if sector.0 >= DYNAMIC_SECTOR_BASE || sector.0 >= i32::MAX - 10 {
+            return;
+        }
+        // Demo scene sectors near origin only contain ground tiles — no per-tile lights.
+        // In production, all non-sentinel sectors get procedural lights.
+        let is_demo_origin = sector.0.abs() <= 1 && sector.1.abs() <= 1;
+        if is_demo_origin {
             return;
         }
         // Fallback: original per-tile light placement for non-demo sectors.
@@ -580,15 +579,8 @@ impl Renderer {
             .filter(|(_, s)| s.state == SectorState::Ready)
             // Never evict sentinel sectors (global lights, dynamic spawns).
             .filter(|&(&c, _)| c.0 < DYNAMIC_SECTOR_BASE && c.0 < i32::MAX - 10)
-            // Never evict the 4 permanent demo ground tiles.  Their
-            // world_center (SECTOR_SIZE=256) doesn't match their geometry
-            // footprint (GROUND_TILE_SIZE=64), so distance checks are
-            // wrong and cause an evict→reload thrash loop.
-            .filter(|&(&c, _)| !DEMO_SECTORS.contains(&c))
-            .filter(|(_, s)| {
-                let c = s.world_center();
-                (c[0]-camera_xz[0]).powi(2) + (c[1]-camera_xz[1]).powi(2) > r2
-            })
+            // Use actual content AABB distance — eliminates need for DEMO_SECTORS hack.
+            .filter(|(_, s)| s.distance_sq_to_point_xz(camera_xz) > r2)
             .map(|(&c,_)| c).collect();
 
         for coord in to_evict {
