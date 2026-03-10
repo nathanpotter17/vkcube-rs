@@ -380,6 +380,75 @@ impl TextureManager {
         Ok(slot)
     }
 
+    /// Synchronous texture load WITH mip chain generation (§4.6).
+    ///
+    /// Creates the full mip chain via `create_image_with_mipmaps` in
+    /// `memory.rs`.  The image is allocated with SAMPLED | TRANSFER_DST |
+    /// TRANSFER_SRC usage flags, base mip is uploaded, then remaining
+    /// mips are generated via a blit chain.
+    ///
+    /// Use this for all glTF-loaded textures.  Use `load_sync` for
+    /// procedural textures that don't need mipmaps.
+    pub fn load_sync_mipmapped(
+        &mut self,
+        name: impl Into<String>,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        memory_ctx: &mut MemoryContext,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let name = name.into();
+
+        // Dedup: if already loaded, return existing slot.
+        if let Some(&slot) = self.name_to_slot.get(&name) {
+            return Ok(slot);
+        }
+
+        let slot = self
+            .free_slots
+            .pop()
+            .ok_or("TextureManager: no free slots")?;
+
+        // §4.6: Upload with mip chain generation.
+        let alloc = memory_ctx.create_image_with_mipmaps(
+            data, width, height, format, command_pool, queue,
+        )?;
+
+        // Write descriptor.
+        let image_info = vk::DescriptorImageInfo::default()
+            .sampler(self.default_sampler)
+            .image_view(alloc.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(slot)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info));
+
+        unsafe {
+            self.device.update_descriptor_sets(
+                std::slice::from_ref(&write),
+                &[],
+            );
+        }
+
+        self.slots.insert(slot, TextureSlot {
+            image_handle: alloc.handle,
+            image_view: alloc.view,
+            name: name.clone(),
+            width,
+            height,
+        });
+        self.name_to_slot.insert(name, slot);
+
+        Ok(slot)
+    }
+
     /// Release a texture slot and free its GPU resources.
     pub fn unload(&mut self, slot: u32, memory_ctx: &mut MemoryContext) {
         if slot == FALLBACK_TEXTURE_SLOT {

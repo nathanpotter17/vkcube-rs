@@ -506,6 +506,43 @@ impl World {
         }}
     }
 
+    /// Apply a buffer remap (from defragmentation) to all MeshRange
+    /// entries in all live RenderObjects.
+    ///
+    /// Call this immediately after `defragment_one_block` returns
+    /// `Some(remap)`.  Must run before the next `cull_and_select_lod`
+    /// call to prevent draw commands from binding destroyed buffers.
+    pub fn apply_buffer_remap(
+        &mut self,
+        remap: &HashMap<vk::Buffer, vk::Buffer>,
+    ) {
+        if remap.is_empty() { return; }
+
+        let mut remapped = 0usize;
+        for obj in &mut self.objects {
+            if !obj.alive { continue; }
+            for level in &mut obj.lod.levels {
+                if let Some(mesh) = level {
+                    if let Some(&new_vb) = remap.get(&mesh.vertex_buffer) {
+                        mesh.vertex_buffer = new_vb;
+                        remapped += 1;
+                    }
+                    if let Some(&new_ib) = remap.get(&mesh.index_buffer) {
+                        mesh.index_buffer = new_ib;
+                        remapped += 1;
+                    }
+                }
+            }
+        }
+
+        if remapped > 0 {
+            println!(
+                "[World] Buffer remap applied: {} MeshRange references updated",
+                remapped,
+            );
+        }
+    }
+
     pub fn prioritized_unloaded_sectors(
         &mut self, cam: [f32;2], vel: [f32;2], frustum: &[[f32;4];6],
     ) -> Vec<SectorCoord> {

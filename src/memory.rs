@@ -22,7 +22,7 @@ pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 /// Staging-belt size for CPU → GPU transfers.  The transfer queue uses a
 /// ring of staging memory so multiple uploads can be in-flight at once.
-const STAGING_BUFFER_SIZE: u64 = 32 * 1024 * 1024;
+const STAGING_BUFFER_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Maximum VRAM budget ratio.  When pool allocations exceed this fraction
 /// of the device-local heap, the budget system starts evicting.
@@ -215,9 +215,10 @@ impl PoolBlock {
 // ====================================================================
 //  GpuAllocator – VMA-style pool allocator
 // ====================================================================
-
+#[derive(Clone)] // this is safe, vk::buffer is actually just a handle
 struct AllocationRecord {
     buffer: vk::Buffer,
+    usage: vk::BufferUsageFlags,
     memory_type_index: u32,
     block_index: usize,
     offset: u64,
@@ -343,6 +344,7 @@ impl GpuAllocator {
             handle,
             AllocationRecord {
                 buffer,
+                usage,
                 memory_type_index,
                 block_index,
                 offset,
@@ -544,6 +546,254 @@ impl GpuAllocator {
             self.allocations.len(),
             self.image_allocations.len(),
         );
+    }
+
+    /// Phase 5 (§5.4): Defragment one pool block.
+    ///
+    /// Selects the block with the highest free-region count (most
+    /// fragmented), allocates a fresh block of the same memory type,
+    /// copies all live sub-allocations into the new block, and updates
+    /// all `BufferHandle` → `vk::Buffer` mappings in the handle table.
+    ///
+    /// **Caller contract:**
+    /// - Call only when no in-flight commands reference buffers in the
+    ///   fragmented block (after fence wait or during device idle).
+    /// - Apply the returned `BufferRemap` to all `MeshRange` entries in
+    ///   `World.objects[*].lod.levels[*]` via `World::apply_buffer_remap`.
+    ///   `DrawCommand` lists rebuild from `MeshRange` each frame, so they
+    ///   pick up new handles automatically.
+    ///
+    /// Returns `Ok(None)` if no block needs defragmentation (all blocks
+    /// have ≤ 2 free regions).
+    pub fn defragment_one_block(
+        &mut self,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<Option<HashMap<vk::Buffer, vk::Buffer>>, Box<dyn std::error::Error>> {
+        // ---- Find the most fragmented block ----
+        let mut worst_type: Option<u32> = None;
+        let mut worst_block_idx: usize = 0;
+        let mut worst_frag_count: usize = 0;
+
+        for (&mem_type, blocks) in &self.pools {
+            for (bi, block) in blocks.iter().enumerate() {
+                // ≤ 2 free regions = at most one hole.  Not worth moving.
+                if block.free_regions.len() > worst_frag_count
+                    && block.free_regions.len() > 2
+                {
+                    worst_type = Some(mem_type);
+                    worst_block_idx = bi;
+                    worst_frag_count = block.free_regions.len();
+                }
+            }
+        }
+
+        let mem_type = match worst_type {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // ---- Snapshot live allocations in the target block ----
+        //
+        // Clone safety: all fields are Copy.  The snapshot is read-only.
+        // Originals are overwritten (not removed) via the same key below.
+        let to_move: Vec<(BufferHandle, AllocationRecord)> = self.allocations
+            .iter()
+            .filter(|(_, rec)| {
+                rec.memory_type_index == mem_type
+                    && rec.block_index == worst_block_idx
+            })
+            .map(|(&handle, rec)| (handle, rec.clone()))
+            .collect();
+
+        if to_move.is_empty() {
+            return Ok(None);
+        }
+
+        let old_block_size = self.pools[&mem_type][worst_block_idx].size;
+        let should_map = self.pools[&mem_type][worst_block_idx].mapped_ptr.is_some();
+
+        // ---- Allocate fresh block ----
+        let new_block = PoolBlock::new(
+            &self.device, old_block_size, mem_type, should_map,
+        )?;
+        let blocks = self.pools.get_mut(&mem_type).unwrap();
+        let new_block_idx = blocks.len();
+        blocks.push(new_block);
+
+        // ---- Create new buffers + sub-allocate in new block ----
+        //
+        // Collect all state needed for the post-copy record update.
+        struct MovedBuffer {
+            handle: BufferHandle,
+            old_buffer: vk::Buffer,
+            old_offset: u64,
+            old_size: u64,
+            new_buffer: vk::Buffer,
+            new_offset: u64,
+            new_mapped_ptr: Option<NonNull<u8>>,
+            usage: vk::BufferUsageFlags,
+        }
+
+        let mut moved: Vec<MovedBuffer> = Vec::with_capacity(to_move.len());
+
+        for (handle, old_rec) in &to_move {
+            let blocks = self.pools.get_mut(&mem_type).unwrap();
+            let (new_offset, new_mapped_ptr) = blocks[new_block_idx]
+                .alloc(old_rec.size, 256) // §5.4: 256-byte minimum alloc class
+                .ok_or("Defrag: sub-alloc in new block failed")?;
+
+            let new_memory = blocks[new_block_idx].memory;
+
+            // Recreate with original usage + TRANSFER_SRC/DST for the copy.
+            let recreate_usage = old_rec.usage
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST;
+
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(old_rec.size)
+                .usage(recreate_usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let new_buffer = unsafe {
+                self.device.create_buffer(&buffer_info, None)?
+            };
+            unsafe {
+                self.device.bind_buffer_memory(new_buffer, new_memory, new_offset)?;
+            }
+
+            moved.push(MovedBuffer {
+                handle: *handle,
+                old_buffer: old_rec.buffer,
+                old_offset: old_rec.offset,
+                old_size: old_rec.size,
+                new_buffer,
+                new_offset,
+                new_mapped_ptr,
+                usage: old_rec.usage,
+            });
+        }
+
+        // ---- Record and submit copy commands ----
+        let cmd = unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = self.device.allocate_command_buffers(&info)?[0];
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            cmd
+        };
+
+        for m in &moved {
+            let region = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(m.old_size);
+            unsafe {
+                self.device.cmd_copy_buffer(
+                    cmd, m.old_buffer, m.new_buffer,
+                    std::slice::from_ref(&region),
+                );
+            }
+        }
+
+        unsafe {
+            self.device.end_command_buffer(cmd)?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&cmd));
+            self.device.queue_submit(
+                queue, std::slice::from_ref(&submit), vk::Fence::null(),
+            )?;
+            self.device.queue_wait_idle(queue)?;
+            self.device.free_command_buffers(
+                command_pool, std::slice::from_ref(&cmd),
+            );
+        }
+
+        // ---- GPU copy complete — update records, build remap ----
+        //
+        // For each moved buffer:
+        //   1. Destroy old VkBuffer (safe: queue_wait_idle done)
+        //   2. Free old sub-allocation in old block
+        //   3. Overwrite AllocationRecord IN-PLACE (same BufferHandle key)
+        //   4. Insert into remap table for caller
+        //
+        // Step 3 is what the prior version was missing.  BufferHandle
+        // remains valid — external code looking up by handle finds the
+        // new buffer.
+
+        let mut remap: HashMap<vk::Buffer, vk::Buffer> =
+            HashMap::with_capacity(moved.len());
+        let blocks = self.pools.get_mut(&mem_type).unwrap();
+
+        for m in &moved {
+            // 1. Destroy old VkBuffer.
+            unsafe { self.device.destroy_buffer(m.old_buffer, None); }
+
+            // 2. Return old sub-allocation to old block's free list.
+            blocks[worst_block_idx].free(m.old_offset, m.old_size);
+
+            // 3. Overwrite the record — same key, new buffer/offset/block.
+            if let Some(rec) = self.allocations.get_mut(&m.handle) {
+                rec.buffer = m.new_buffer;
+                rec.block_index = new_block_idx;
+                rec.offset = m.new_offset;
+                // size, usage, memory_type_index — unchanged.
+            }
+
+            // 4. Remap: callers holding raw vk::Buffer must translate.
+            remap.insert(m.old_buffer, m.new_buffer);
+        }
+
+        let frag_after = blocks[worst_block_idx].free_regions.len();
+        println!(
+            "[GpuAllocator] Defragmented block (type {}, idx {}): \
+             moved {} buffers, frag regions {} → {}",
+            mem_type, worst_block_idx, moved.len(),
+            worst_frag_count, frag_after,
+        );
+
+        Ok(Some(remap))
+    }
+
+    /// Phase 5 (§5.5): Query VK_EXT_memory_budget for actual
+    /// driver-reported budget values.
+    ///
+    /// Returns `(budget_bytes, usage_bytes)` for the device-local heap.
+    /// Returns `None` if the extension is unavailable or no device-local
+    /// heap is found.
+    pub fn query_memory_budget(
+        &self,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Option<(u64, u64)> {
+        let mut budget_props =
+            vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceMemoryProperties2::default()
+            .push_next(&mut budget_props);
+
+        unsafe {
+            instance.get_physical_device_memory_properties2(
+                physical_device, &mut props2,
+            );
+        }
+
+        for i in 0..props2.memory_properties.memory_heap_count as usize {
+            let heap = props2.memory_properties.memory_heaps[i];
+            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                return Some((
+                    budget_props.heap_budget[i],
+                    budget_props.heap_usage[i],
+                ));
+            }
+        }
+
+        None
     }
 
     // ---- internals ----

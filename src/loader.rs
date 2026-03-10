@@ -5,14 +5,19 @@
 //! - Extract all `TRIANGLES` primitives → `Vec<Vertex>` with tangents + `Vec<u32>` indices
 //! - Decode embedded JPEG/PNG via the `image` crate to RGBA8
 //! - Detect texture role from material slot and assign correct `vk::Format` (SRGB vs UNORM)
-//! - Submit decoded images to `TextureManager::load_async` for GPU upload
+//! - Submit decoded images to `TextureManager::load_sync_mipmapped` for GPU upload with mip chain
 //! - Register materials in `MaterialLibrary`
 //! - Upload vertex/index buffers via `MemoryContext`
 //!
 //! Texture format policy (§4.2):
 //!   Albedo/emissive → R8G8B8A8_SRGB
 //!   Normal/metallic-roughness → R8G8B8A8_UNORM
-//!   AO → R8_UNORM (single channel)
+//!   AO → R8G8B8A8_UNORM (single channel uploaded as RGBA8)
+//!
+//! Phase 4 fix: Two-pass texture upload.  First pass scans all materials
+//! to determine the dominant role for each image index.  Second pass
+//! uploads with the correct Vulkan format (SRGB vs UNORM).  This avoids
+//! the previous bug where all textures were hardcoded to UNORM.
 
 use ash::vk;
 use std::collections::HashMap;
@@ -50,7 +55,8 @@ pub struct LoadedAsset {
 }
 
 /// Texture role determines Vulkan format (SRGB vs UNORM).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §4.2: Albedo/emissive → SRGB; Normal/MR/AO → UNORM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TextureRole {
     Albedo,
     Normal,
@@ -64,7 +70,21 @@ impl TextureRole {
         match self {
             Self::Albedo | Self::Emissive => vk::Format::R8G8B8A8_SRGB,
             Self::Normal | Self::MetallicRoughness => vk::Format::R8G8B8A8_UNORM,
-            Self::Occlusion => vk::Format::R8G8B8A8_UNORM, // single-channel but uploaded as RGBA8
+            Self::Occlusion => vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    /// Priority for resolving conflicts when one image is referenced
+    /// by multiple material slots with different roles.  Higher wins.
+    /// Albedo (SRGB) and Normal (UNORM) are highest because a wrong
+    /// format produces the most visible artefacts for those roles.
+    fn priority(self) -> u32 {
+        match self {
+            Self::Albedo => 4,
+            Self::Normal => 3,
+            Self::Emissive => 2,
+            Self::MetallicRoughness => 1,
+            Self::Occlusion => 0,
         }
     }
 }
@@ -80,7 +100,8 @@ impl GltfLoader {
     ///
     /// - Extracts all triangle primitives with vertices, normals, UVs, tangents
     /// - Generates MikkTSpace tangents when not provided by the asset
-    /// - Decodes embedded textures and submits them for GPU upload
+    /// - Decodes embedded textures and submits them for GPU upload with mipmaps
+    /// - Assigns correct SRGB/UNORM format per texture role (§4.2)
     /// - Registers materials in the engine's MaterialLibrary
     /// - Uploads vertex/index buffers via the pool allocator
     pub fn load(
@@ -104,7 +125,48 @@ impl GltfLoader {
             images.len(),
         );
 
-        // ---- Phase 1: Upload textures ----
+        // ================================================================
+        //  Phase 1a: Determine texture roles from material references.
+        //
+        //  Two-pass approach (§4.2 fix): scan all materials BEFORE uploading
+        //  any textures so we know whether each image index should be SRGB
+        //  (albedo/emissive) or UNORM (normal/MR/AO).
+        //
+        //  When an image is referenced by multiple material slots with
+        //  conflicting roles (rare but spec-legal), the highest-priority
+        //  role wins.  In practice this almost never happens — DCC tools
+        //  don't reuse the same image for albedo AND normals.
+        // ================================================================
+        let mut image_role: HashMap<usize, TextureRole> = HashMap::new();
+
+        for mat in document.materials() {
+            let pbr = mat.pbr_metallic_roughness();
+
+            if let Some(info) = pbr.base_color_texture() {
+                let idx = info.texture().source().index();
+                update_role(&mut image_role, idx, TextureRole::Albedo);
+            }
+            if let Some(info) = mat.normal_texture() {
+                let idx = info.texture().source().index();
+                update_role(&mut image_role, idx, TextureRole::Normal);
+            }
+            if let Some(info) = pbr.metallic_roughness_texture() {
+                let idx = info.texture().source().index();
+                update_role(&mut image_role, idx, TextureRole::MetallicRoughness);
+            }
+            if let Some(info) = mat.emissive_texture() {
+                let idx = info.texture().source().index();
+                update_role(&mut image_role, idx, TextureRole::Emissive);
+            }
+            if let Some(info) = mat.occlusion_texture() {
+                let idx = info.texture().source().index();
+                update_role(&mut image_role, idx, TextureRole::Occlusion);
+            }
+        }
+
+        // ================================================================
+        //  Phase 1b: Upload textures with correct format and mip chain.
+        // ================================================================
         let mut texture_slot_map: HashMap<usize, u32> = HashMap::new();
         let mut texture_names: Vec<String> = Vec::new();
 
@@ -113,81 +175,25 @@ impl GltfLoader {
             let width = img_data.width;
             let height = img_data.height;
 
-            // Determine role — we'll set the correct format when the material
-            // references this texture.  For now, decode to RGBA8.
-            let rgba = match img_data.format {
-                gltf::image::Format::R8G8B8A8 => img_data.pixels.clone(),
-                gltf::image::Format::R8G8B8 => {
-                    let mut rgba = Vec::with_capacity(img_data.pixels.len() / 3 * 4);
-                    for chunk in img_data.pixels.chunks(3) {
-                        rgba.extend_from_slice(chunk);
-                        rgba.push(255);
-                    }
-                    rgba
-                }
-                gltf::image::Format::R8 => {
-                    let mut rgba = Vec::with_capacity(img_data.pixels.len() * 4);
-                    for &p in &img_data.pixels {
-                        rgba.extend_from_slice(&[p, p, p, 255]);
-                    }
-                    rgba
-                }
-                gltf::image::Format::R8G8 => {
-                    let mut rgba = Vec::with_capacity(img_data.pixels.len() / 2 * 4);
-                    for chunk in img_data.pixels.chunks(2) {
-                        rgba.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
-                    }
-                    rgba
-                }
-                gltf::image::Format::R16 | gltf::image::Format::R16G16
-                | gltf::image::Format::R16G16B16 | gltf::image::Format::R16G16B16A16 => {
-                    // 16-bit images: downsample to 8-bit RGBA
-                    let channel_count = match img_data.format {
-                        gltf::image::Format::R16 => 1,
-                        gltf::image::Format::R16G16 => 2,
-                        gltf::image::Format::R16G16B16 => 3,
-                        gltf::image::Format::R16G16B16A16 => 4,
-                        _ => unreachable!(),
-                    };
-                    let pixel_count = img_data.pixels.len() / (channel_count * 2);
-                    let mut rgba = Vec::with_capacity(pixel_count * 4);
-                    for px in 0..pixel_count {
-                        let base = px * channel_count * 2;
-                        for ch in 0..4 {
-                            if ch < channel_count {
-                                let lo = img_data.pixels[base + ch * 2] as u16;
-                                let hi = img_data.pixels[base + ch * 2 + 1] as u16;
-                                let val16 = lo | (hi << 8);
-                                rgba.push((val16 >> 8) as u8);
-                            } else if ch == 3 {
-                                rgba.push(255); // alpha
-                            } else {
-                                rgba.push(0);
-                            }
-                        }
-                    }
-                    rgba
-                }
-                _ => {
-                    // Unknown format — fill with magenta for debugging
-                    println!("[GltfLoader] Warning: unsupported image format {:?} for image {}", img_data.format, img_idx);
-                    vec![255, 0, 255, 255].repeat((width * height) as usize)
-                }
-            };
+            let rgba = decode_to_rgba8(img_data, img_idx);
 
-            // Default to UNORM; the correct SRGB/UNORM format is applied
-            // per-role when materials reference the texture below.
-            // We use UNORM as a safe default that works for all roles.
-            let format = vk::Format::R8G8B8A8_UNORM;
+            // Look up the role determined in phase 1a.  Default to UNORM
+            // for images not referenced by any material (orphaned images
+            // in the glTF — rare but legal).
+            let role = image_role.get(&img_idx).copied()
+                .unwrap_or(TextureRole::MetallicRoughness);
+            let format = role.vk_format();
 
-            match texture_mgr.load_sync(
+            // §4.6: Upload with mip chain generation.
+            match texture_mgr.load_sync_mipmapped(
                 &tex_name, &rgba, width, height, format,
                 memory_ctx, command_pool, queue,
             ) {
                 Ok(slot) => {
                     texture_slot_map.insert(img_idx, slot);
                     texture_names.push(tex_name);
-                    println!("[GltfLoader]   Image {} → slot {} ({}×{})", img_idx, slot, width, height);
+                    println!("[GltfLoader]   Image {} → slot {} ({}×{}, {:?}, {:?})",
+                        img_idx, slot, width, height, role, format);
                 }
                 Err(e) => {
                     eprintln!("[GltfLoader]   Image {} upload failed: {}", img_idx, e);
@@ -195,7 +201,9 @@ impl GltfLoader {
             }
         }
 
-        // ---- Phase 2: Register materials ----
+        // ================================================================
+        //  Phase 2: Register materials
+        // ================================================================
         let mut material_id_map: HashMap<Option<usize>, u32> = HashMap::new();
         let mut material_names: Vec<String> = Vec::new();
 
@@ -298,7 +306,9 @@ impl GltfLoader {
         // Ensure default material mapping for primitives with no material.
         material_id_map.entry(None).or_insert(0);
 
-        // ---- Phase 3: Extract meshes ----
+        // ================================================================
+        //  Phase 3: Extract meshes
+        // ================================================================
         let mut meshes: Vec<LoadedMesh> = Vec::new();
 
         for mesh in document.meshes() {
@@ -330,24 +340,19 @@ impl GltfLoader {
                     .map(|iter| iter.into_rgb_f32().collect())
                     .unwrap_or_else(|| vec![[1.0, 1.0, 1.0]; positions.len()]);
 
-                // Tangents (optional — generate with MikkTSpace if missing).
+                // Indices — read once, shared by tangent gen and draw.
+                let indices: Vec<u32> = reader.read_indices()
+                    .map(|iter| iter.into_u32().collect())
+                    .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+                // Tangents (optional — generate with MikkTSpace if missing §4.5).
                 let tangents: Vec<[f32; 4]> = reader.read_tangents()
                     .map(|iter| iter.collect())
                     .unwrap_or_else(|| {
-                        // Read indices for MikkTSpace generation.
-                        let indices: Vec<u32> = reader.read_indices()
-                            .map(|iter| iter.into_u32().collect())
-                            .unwrap_or_else(|| (0..positions.len() as u32).collect());
-
                         generate_mikktspace_tangents(
                             &positions, &normals, &uvs, &indices,
                         )
                     });
-
-                // Indices.
-                let indices: Vec<u32> = reader.read_indices()
-                    .map(|iter| iter.into_u32().collect())
-                    .unwrap_or_else(|| (0..positions.len() as u32).collect());
 
                 // Build engine Vertex array.
                 let vertex_count = positions.len();
@@ -430,14 +435,96 @@ impl GltfLoader {
 }
 
 // ====================================================================
+//  Helpers
+// ====================================================================
+
+/// Update the image→role map.  If an image is already assigned a role,
+/// keep the higher-priority one (prevents albedo from being overwritten
+/// by a lower-priority occlusion reference to the same image).
+fn update_role(map: &mut HashMap<usize, TextureRole>, img_idx: usize, role: TextureRole) {
+    let entry = map.entry(img_idx).or_insert(role);
+    if role.priority() > entry.priority() {
+        *entry = role;
+    }
+}
+
+/// Decode a glTF image to RGBA8 bytes regardless of source format.
+fn decode_to_rgba8(img_data: &gltf::image::Data, img_idx: usize) -> Vec<u8> {
+    match img_data.format {
+        gltf::image::Format::R8G8B8A8 => img_data.pixels.clone(),
+        gltf::image::Format::R8G8B8 => {
+            let mut rgba = Vec::with_capacity(img_data.pixels.len() / 3 * 4);
+            for chunk in img_data.pixels.chunks(3) {
+                rgba.extend_from_slice(chunk);
+                rgba.push(255);
+            }
+            rgba
+        }
+        gltf::image::Format::R8 => {
+            let mut rgba = Vec::with_capacity(img_data.pixels.len() * 4);
+            for &p in &img_data.pixels {
+                rgba.extend_from_slice(&[p, p, p, 255]);
+            }
+            rgba
+        }
+        gltf::image::Format::R8G8 => {
+            let mut rgba = Vec::with_capacity(img_data.pixels.len() / 2 * 4);
+            for chunk in img_data.pixels.chunks(2) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
+            }
+            rgba
+        }
+        gltf::image::Format::R16 | gltf::image::Format::R16G16
+        | gltf::image::Format::R16G16B16 | gltf::image::Format::R16G16B16A16 => {
+            let channel_count = match img_data.format {
+                gltf::image::Format::R16 => 1,
+                gltf::image::Format::R16G16 => 2,
+                gltf::image::Format::R16G16B16 => 3,
+                gltf::image::Format::R16G16B16A16 => 4,
+                _ => unreachable!(),
+            };
+            let pixel_count = img_data.pixels.len() / (channel_count * 2);
+            let mut rgba = Vec::with_capacity(pixel_count * 4);
+            for px in 0..pixel_count {
+                let base = px * channel_count * 2;
+                for ch in 0..4 {
+                    if ch < channel_count {
+                        let lo = img_data.pixels[base + ch * 2] as u16;
+                        let hi = img_data.pixels[base + ch * 2 + 1] as u16;
+                        let val16 = lo | (hi << 8);
+                        rgba.push((val16 >> 8) as u8);
+                    } else if ch == 3 {
+                        rgba.push(255);
+                    } else {
+                        rgba.push(0);
+                    }
+                }
+            }
+            rgba
+        }
+        _ => {
+            println!("[GltfLoader] Warning: unsupported image format {:?} for image {}",
+                img_data.format, img_idx);
+            vec![255, 0, 255, 255].repeat((img_data.width * img_data.height) as usize)
+        }
+    }
+}
+
+// ====================================================================
 //  MikkTSpace Tangent Generation (§4.5)
 // ====================================================================
 
-/// Generate tangent vectors using the MikkTSpace algorithm.
+/// Generate tangent vectors using the MikkTSpace algorithm via the
+/// `mikktspace` crate.
 ///
 /// This matches the convention used by Blender, Substance Painter,
 /// Marmoset, and Unreal Engine — guaranteeing correct normal map
-/// rendering across all tools.
+/// rendering across all tools.  The crate implements the exact same
+/// algorithm as xNormal's MikkTSpace, which is the de-facto standard
+/// for tangent-space normal map baking.
+///
+/// Falls back to a manual edge-UV cross product method only when the
+/// mikktspace crate fails (degenerate geometry with zero-area triangles).
 fn generate_mikktspace_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
@@ -445,10 +532,108 @@ fn generate_mikktspace_tangents(
     indices: &[u32],
 ) -> Vec<[f32; 4]> {
     let num_faces = indices.len() / 3;
-    let mut tangents = vec![[0.0f32; 4]; positions.len()];
+    let num_vertices = positions.len();
 
-    // Fallback: manual tangent generation when mikktspace crate is unavailable
-    // or for degenerate geometry.  Uses the standard edge-UV cross product method.
+    // Attempt MikkTSpace generation via the crate.
+    let result = try_mikktspace_crate(positions, normals, uvs, indices, num_faces, num_vertices);
+    if let Some(tangents) = result {
+        return tangents;
+    }
+
+    // Fallback: manual edge-UV cross product method.
+    // Only reached for degenerate geometry (zero-area triangles, collapsed UVs).
+    println!("[GltfLoader] Warning: MikkTSpace failed, using edge-UV fallback tangent generation");
+    generate_tangents_fallback(positions, normals, uvs, indices, num_faces, num_vertices)
+}
+
+/// MikkTSpace tangent generation via the `mikktspace` crate (§4.5).
+///
+/// The crate requires implementing its `Geometry` trait which provides
+/// callbacks for vertex positions, normals, and UVs.  It writes tangent
+/// vectors (including handedness) directly into our output buffer.
+fn try_mikktspace_crate(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+    num_faces: usize,
+    num_vertices: usize,
+) -> Option<Vec<[f32; 4]>> {
+    struct MikkMesh<'a> {
+        positions: &'a [[f32; 3]],
+        normals: &'a [[f32; 3]],
+        uvs: &'a [[f32; 2]],
+        indices: &'a [u32],
+        num_faces: usize,
+        tangents: Vec<[f32; 4]>,
+    }
+
+    impl<'a> mikktspace::Geometry for MikkMesh<'a> {
+        fn num_faces(&self) -> usize {
+            self.num_faces
+        }
+
+        fn num_vertices_of_face(&self, _face: usize) -> usize {
+            3 // All faces are triangles.
+        }
+
+        fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+            let idx = self.indices[face * 3 + vert] as usize;
+            self.positions[idx]
+        }
+
+        fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+            let idx = self.indices[face * 3 + vert] as usize;
+            self.normals[idx]
+        }
+
+        fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+            let idx = self.indices[face * 3 + vert] as usize;
+            self.uvs[idx]
+        }
+
+        fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
+            let idx = self.indices[face * 3 + vert] as usize;
+            // MikkTSpace may call set_tangent multiple times for the same
+            // vertex (from different faces).  The last write wins, which
+            // is correct — MikkTSpace handles averaging internally.
+            self.tangents[idx] = tangent;
+        }
+    }
+
+    let mut mesh = MikkMesh {
+        positions,
+        normals,
+        uvs,
+        indices,
+        num_faces,
+        tangents: vec![[1.0, 0.0, 0.0, 1.0]; num_vertices],
+    };
+
+    if mikktspace::generate_tangents(&mut mesh) {
+        Some(mesh.tangents)
+    } else {
+        None
+    }
+}
+
+/// Fallback tangent generation using edge-UV cross product method.
+///
+/// This is the previous manual implementation, retained as a fallback
+/// for degenerate geometry that MikkTSpace cannot handle.  It produces
+/// incorrect results at UV seams and mirrored UVs but is better than
+/// no tangent data.
+fn generate_tangents_fallback(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    _uvs: &[[f32; 2]],
+    indices: &[u32],
+    num_faces: usize,
+    num_vertices: usize,
+) -> Vec<[f32; 4]> {
+    let uvs = _uvs;
+    let mut tangents = vec![[0.0f32; 4]; num_vertices];
+
     for face in 0..num_faces {
         let i0 = indices[face * 3] as usize;
         let i1 = indices[face * 3 + 1] as usize;
@@ -483,13 +668,11 @@ fn generate_mikktspace_tangents(
             (duv1[0] * edge2[2] - duv2[0] * edge1[2]) * r,
         ];
 
-        // Accumulate per-vertex (area-weighted by triangle contribution).
         for &idx in &[i0, i1, i2] {
             tangents[idx][0] += t[0];
             tangents[idx][1] += t[1];
             tangents[idx][2] += t[2];
 
-            // Compute handedness: sign of dot(cross(N, T), B).
             let n = normals[idx];
             let cross = [
                 n[1] * t[2] - n[2] * t[1],
@@ -507,7 +690,6 @@ fn generate_mikktspace_tangents(
         let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
 
         if len > 1e-8 {
-            // Gram-Schmidt orthogonalization against the vertex normal.
             let n = normals[i];
             let dot_nt = n[0] * t[0] + n[1] * t[1] + n[2] * t[2];
             let ortho = [
@@ -526,7 +708,6 @@ fn generate_mikktspace_tangents(
                 tan[2] = t[2] / len;
             }
         } else {
-            // Degenerate — pick an arbitrary tangent perpendicular to normal.
             let n = normals[i];
             let up = if n[1].abs() < 0.999 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
             let right = [
@@ -546,7 +727,6 @@ fn generate_mikktspace_tangents(
             }
         }
 
-        // Finalize handedness sign.
         tan[3] = if tan[3] < 0.0 { -1.0 } else { 1.0 };
     }
 
