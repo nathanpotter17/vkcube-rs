@@ -1337,6 +1337,38 @@ impl FrameLightingBuffers {
         }
     }
 
+    /// Zero-allocation light SSBO upload.  Writes the 16-byte header
+    /// and the `GpuLight` array directly into the HOST_COHERENT mapped
+    /// pointer — no intermediate `Vec<u8>` needed.
+    ///
+    /// Replaces `upload_lights(&self.light_manager.ssbo_bytes())` on the
+    /// hot path.
+    pub fn upload_lights_direct(
+        &self,
+        frame: usize,
+        header: &LightSsboHeader,
+        lights: &[GpuLight],
+    ) {
+        let dst = self.light_ssbo_ptrs[frame].as_ptr();
+        let max = self.light_ssbo_size as usize;
+        let header_bytes = std::mem::size_of::<LightSsboHeader>();
+        let body_bytes = (lights.len() * std::mem::size_of::<GpuLight>()).min(max - header_bytes);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                header as *const LightSsboHeader as *const u8,
+                dst,
+                header_bytes,
+            );
+            if body_bytes > 0 {
+                std::ptr::copy_nonoverlapping(
+                    lights.as_ptr() as *const u8,
+                    dst.add(header_bytes),
+                    body_bytes,
+                );
+            }
+        }
+    }
+
     pub fn destroy(&self, allocator: &mut GpuAllocator) {
         for &h in &self.light_ssbo_handles {
             allocator.free_buffer(h);

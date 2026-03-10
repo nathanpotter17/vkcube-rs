@@ -478,8 +478,8 @@ impl World {
                 self.shadow_draws.push(cmd);
             }
         }
-        self.transparent_draws.sort_unstable_by(|a,b| b.distance_sq.partial_cmp(&a.distance_sq).unwrap());
-        self.opaque_draws.sort_unstable_by(|a,b| a.distance_sq.partial_cmp(&b.distance_sq).unwrap());
+        self.transparent_draws.sort_unstable_by(|a,b| b.distance_sq.total_cmp(&a.distance_sq));
+        self.opaque_draws.sort_unstable_by(|a,b| a.distance_sq.total_cmp(&b.distance_sq));
     }
 
     pub fn update_sector_grid(&mut self, camera_xz: [f32;2], r: f32) {
@@ -552,7 +552,7 @@ impl World {
         let mut v: Vec<_> = self.sectors.iter()
             .filter(|(_,s)| s.state == SectorState::Unloaded)
             .map(|(&c,s)| (c,s.priority)).collect();
-        v.sort_unstable_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+        v.sort_unstable_by(|a,b| b.1.total_cmp(&a.1));
         v.into_iter().map(|(c,_)| c).collect()
     }
 

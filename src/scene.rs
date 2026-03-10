@@ -376,6 +376,28 @@ pub fn multiply_matrices(a: [[f32;4];4], b: [[f32;4];4]) -> [[f32;4];4] {
     r
 }
 
+/// Extract frustum planes from a pre-computed view-projection matrix.
+///
+/// Use this when the VP product is already available to avoid
+/// recomputing `view * proj` (saves one 4×4 matrix multiply +
+/// two matrix getter calls compared to `Camera::extract_frustum_planes`).
+pub fn extract_frustum_planes_from_vp(vp: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let row = |r: usize| [vp[0][r], vp[1][r], vp[2][r], vp[3][r]];
+    let r0 = row(0); let r1 = row(1); let r2 = row(2); let r3 = row(3);
+    let add = |a: [f32;4], b: [f32;4]| [a[0]+b[0],a[1]+b[1],a[2]+b[2],a[3]+b[3]];
+    let sub = |a: [f32;4], b: [f32;4]| [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]];
+    let norm = |mut p: [f32;4]| {
+        let len = (p[0]*p[0]+p[1]*p[1]+p[2]*p[2]).sqrt();
+        if len > 0.0 { p[0]/=len; p[1]/=len; p[2]/=len; p[3]/=len; }
+        p
+    };
+    [
+        norm(add(r3, r0)), norm(sub(r3, r0)),
+        norm(add(r3, r1)), norm(sub(r3, r1)),
+        norm(add(r3, r2)), norm(sub(r3, r2)),
+    ]
+}
+
 /// Compute the inverse of a perspective projection matrix.
 /// Exploits the sparse structure of standard projection matrices
 /// for an exact, branch-free inverse.

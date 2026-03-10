@@ -765,20 +765,19 @@ impl Renderer {
     /// `wait_for_fences` so we know the current frame-slot's previous
     /// submission has completed.  With MAX_FRAMES_IN_FLIGHT=2 and both
     /// slots having cycled, all commands referencing these buffers are done.
+    ///
+    /// Uses swap-remove for single-pass drain — no intermediate Vec.
     fn drain_deferred_frees(&mut self) {
         let cutoff = self.global_frame.saturating_sub(MAX_FRAMES_IN_FLIGHT as u64);
-        // Collect handles to free (avoids borrow conflict with retain).
-        let mut to_free: Vec<BufferHandle> = Vec::new();
-        self.deferred_frees.retain(|entry| {
-            if entry.frame <= cutoff {
-                to_free.push(entry.handle);
-                false
+        let mut i = 0;
+        while i < self.deferred_frees.len() {
+            if self.deferred_frees[i].frame <= cutoff {
+                let entry = self.deferred_frees.swap_remove(i);
+                self.memory_ctx.allocator.free_buffer(entry.handle);
+                // don't increment — swap_remove moved the last element into slot i
             } else {
-                true
+                i += 1;
             }
-        });
-        for handle in to_free {
-            self.memory_ctx.allocator.free_buffer(handle);
         }
     }
 
@@ -812,10 +811,14 @@ impl Renderer {
             self.update_dynamic_lights(dt);
             self.memory_ctx.ring.begin_frame(self.current_frame);
 
-            let frustum = self.scene.camera.extract_frustum_planes();
             let view_mat = self.scene.camera.get_view_matrix();
             let proj_mat = self.scene.camera.get_projection_matrix();
             let camera_pos = self.scene.camera.position;
+
+            // Compute VP product once — frustum planes derived from this,
+            // avoiding the redundant multiply inside extract_frustum_planes().
+            let camera_vp = crate::scene::multiply_matrices(view_mat, proj_mat);
+            let frustum = crate::scene::extract_frustum_planes_from_vp(&camera_vp);
 
             let xz = crate::world::frustum_aabb_xz(camera_pos, self.scene.camera.far);
             self.world.cull_and_select_lod(camera_pos, &frustum, &xz);
@@ -823,7 +826,11 @@ impl Renderer {
             self.shadow_assignments = self.shadow_budget.assign(&self.light_manager, camera_pos);
             let active_light_count = self.light_manager.cull_and_sort(camera_pos, &frustum, &self.shadow_assignments);
 
-            self.lighting_buffers.upload_lights(self.current_frame, &self.light_manager.ssbo_bytes());
+            self.lighting_buffers.upload_lights_direct(
+                self.current_frame,
+                &self.light_manager.ssbo_header(),
+                self.light_manager.gpu_lights(),
+            );
 
             // Compute sun shadow light-space VP matrix.
             let (sun_view, sun_proj) = compute_sun_shadow_matrices(self.sun_direction, camera_pos);
@@ -935,7 +942,7 @@ impl Renderer {
             let sv = vk::Viewport { x:0.0,y:0.0, width:SHADOW_MAP_SIZE as f32, height:SHADOW_MAP_SIZE as f32, min_depth:0.0, max_depth:1.0 };
             let ss = vk::Rect2D { offset:vk::Offset2D{x:0,y:0}, extent:vk::Extent2D{width:SHADOW_MAP_SIZE,height:SHADOW_MAP_SIZE} };
 
-            for (slot, light_idx) in self.shadow_budget.assigned_slots().collect::<Vec<_>>() {
+            for (slot, light_idx) in self.shadow_budget.assigned_slots() {
                 let Some(light) = self.light_manager.get(light_idx) else { continue };
                 if light.light_type == LightType::Directional { continue; }
                 let push = ShadowPushConstants { light_pos: light.position, light_radius: light.radius };

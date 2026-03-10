@@ -481,7 +481,7 @@ impl LightManager {
 
             let da = dist_sq(camera_pos, la.position);
             let db = dist_sq(camera_pos, lb.position);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            da.total_cmp(&db)
         });
 
         // 3. Budget cap.
@@ -498,7 +498,27 @@ impl LightManager {
         self.active_count
     }
 
+    /// Zero-allocation SSBO header for direct upload.
+    /// Pair with [`gpu_lights()`] to write header + body into mapped
+    /// GPU memory without an intermediate `Vec<u8>` allocation.
+    #[inline]
+    pub fn ssbo_header(&self) -> LightSsboHeader {
+        LightSsboHeader { light_count: self.active_count, _pad: [0; 3] }
+    }
+
+    /// Immutable slice of the per-frame GPU light array (post-cull).
+    /// Use with [`ssbo_header()`] for zero-alloc SSBO upload.
+    #[inline]
+    pub fn gpu_lights(&self) -> &[GpuLight] {
+        &self.gpu_lights
+    }
+
     /// Raw bytes for the light SSBO upload (header + GpuLight array).
+    ///
+    /// Allocating variant retained for diagnostics / tooling.  The hot
+    /// path should use [`ssbo_header()`] + [`gpu_lights()`] via
+    /// `FrameLightingBuffers::upload_lights_direct()` instead.
+    #[allow(dead_code)]
     pub fn ssbo_bytes(&self) -> Vec<u8> {
         let header = LightSsboHeader {
             light_count: self.active_count,
@@ -607,9 +627,7 @@ impl ShadowBudgetManager {
         }
 
         // Sort descending by score.
-        candidates.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         // Clear previous assignments.
         let prev_light_to_slot = std::mem::take(&mut self.light_to_slot);
