@@ -21,6 +21,8 @@ shaders=(
     "shadow.vert:shadow.vert.spv"
     "shadow.frag:shadow.frag.spv"
     "cluster_assign.comp:cluster_assign.comp.spv"
+    "probe_capture.frag:probe_capture.frag.spv"
+    "sh_project.comp:sh_project.comp.spv"
 )
 
 set_avx2() {

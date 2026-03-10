@@ -1,0 +1,167 @@
+// Phase 3: SH Projection Compute Shader
+// Compile: glslangValidator -V sh_project.comp -o compiled/sh_project.comp.spv
+//
+// Reads an HDR cubemap captured from a probe's viewpoint and projects
+// the radiance into L2 (9 coefficient) spherical harmonics per RGB channel.
+// Applies cosine-lobe convolution so the result is irradiance SH ready
+// for direct use in the PBR fragment shader.
+//
+// Dispatch: (1, 1, 1) — single workgroup handles entire cubemap.
+// Workgroup: 64 threads, each processing ~96 texels (6144 total at 32×32×6).
+// Uses shared memory tree reduction for the 9 SH coefficient accumulators.
+
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ---- Input: captured probe cubemap ----
+layout(set = 0, binding = 0) uniform samplerCube capturedCubemap;
+
+// ---- Output: probe SSBO (same layout as pbr.frag binding 6) ----
+// Header: uint probe_count + 3 padding, then GpuSHProbe[] array.
+// Each GpuSHProbe: vec4[9] — coeffs[i].rgb = SH basis i (R,G,B).
+layout(set = 0, binding = 1, std430) buffer ProbeSSBO {
+    uint probe_count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    vec4 probes[]; // indexed as [probe_index * 9 + coeff_index]
+} probeBuf;
+
+// ---- Push constants ----
+layout(push_constant) uniform PushConstants {
+    uint probe_index; // which probe to write
+    uint face_size;   // cubemap face resolution (e.g., 32)
+} pc;
+
+// ---- SH basis constants ----
+const float SH_Y00  = 0.282095;
+const float SH_Y1N1 = 0.488603;
+const float SH_Y10  = 0.488603;
+const float SH_Y11  = 0.488603;
+const float SH_Y2N2 = 1.092548;
+const float SH_Y2N1 = 1.092548;
+const float SH_Y20  = 0.315392;
+const float SH_Y21  = 1.092548;
+const float SH_Y22  = 0.546274;
+
+// Cosine-lobe convolution factors (Ramamoorthi & Hanrahan 2001).
+const float PI = 3.14159265358979;
+const float A_L0 = PI;             // band 0
+const float A_L1 = 2.0 * PI / 3.0; // band 1
+const float A_L2 = PI / 4.0;       // band 2
+
+const float COSINE_WEIGHT[9] = float[9](
+    A_L0,
+    A_L1, A_L1, A_L1,
+    A_L2, A_L2, A_L2, A_L2, A_L2
+);
+
+// ---- Shared memory for parallel reduction ----
+// 64 threads × 9 coefficients × 3 channels = stored as 64 × 9 vec4s
+// (rgb + unused w). Total: 64 × 9 × 16 bytes = 9216 bytes.
+shared vec4 sh_partial[64 * 9];
+
+// ====================================================================
+//  Cube face direction mapping
+// ====================================================================
+
+vec3 cubeFaceDir(uint face, float u, float v) {
+    // Standard OpenGL cubemap convention:
+    //   +X: ( 1, -v, -u)    -X: (-1, -v,  u)
+    //   +Y: ( u,  1,  v)    -Y: ( u, -1, -v)
+    //   +Z: ( u, -v,  1)    -Z: (-u, -v, -1)
+    switch (face) {
+        case 0u: return vec3( 1.0,   -v,   -u);
+        case 1u: return vec3(-1.0,   -v,    u);
+        case 2u: return vec3(   u,  1.0,    v);
+        case 3u: return vec3(   u, -1.0,   -v);
+        case 4u: return vec3(   u,   -v,  1.0);
+        case 5u: return vec3(  -u,   -v, -1.0);
+        default: return vec3(0.0, 0.0, 1.0);
+    }
+}
+
+// ====================================================================
+//  Main
+// ====================================================================
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint face_pixels = pc.face_size * pc.face_size;
+    uint total_texels = face_pixels * 6u;
+
+    // ---- Phase 1: Each thread accumulates its assigned texels privately ----
+    vec4 local_sh[9];
+    for (int i = 0; i < 9; i++) local_sh[i] = vec4(0.0);
+
+    for (uint texel = tid; texel < total_texels; texel += 64u) {
+        uint face = texel / face_pixels;
+        uint local_idx = texel - face * face_pixels;
+        uint x = local_idx % pc.face_size;
+        uint y = local_idx / pc.face_size;
+
+        // Map texel to [-1, 1] on cube face.
+        float u = (float(x) + 0.5) / float(pc.face_size) * 2.0 - 1.0;
+        float v = (float(y) + 0.5) / float(pc.face_size) * 2.0 - 1.0;
+
+        // Direction + normalization.
+        vec3 dir = normalize(cubeFaceDir(face, u, v));
+
+        // Solid angle weight for cubemap texel.
+        // dΩ = 4 / (√(1 + u² + v²))³ / N² where N = face_size.
+        float tmp = 1.0 + u * u + v * v;
+        float solid_angle = 4.0 / (sqrt(tmp) * tmp * float(face_pixels));
+
+        // Sample the captured HDR cubemap.
+        vec3 radiance = texture(capturedCubemap, dir).rgb;
+
+        // Evaluate SH basis functions.
+        float basis[9];
+        basis[0] = SH_Y00;
+        basis[1] = SH_Y1N1 * dir.y;
+        basis[2] = SH_Y10  * dir.z;
+        basis[3] = SH_Y11  * dir.x;
+        basis[4] = SH_Y2N2 * dir.x * dir.y;
+        basis[5] = SH_Y2N1 * dir.y * dir.z;
+        basis[6] = SH_Y20  * (3.0 * dir.z * dir.z - 1.0);
+        basis[7] = SH_Y21  * dir.x * dir.z;
+        basis[8] = SH_Y22  * (dir.x * dir.x - dir.y * dir.y);
+
+        // Accumulate weighted contribution.
+        for (int i = 0; i < 9; i++) {
+            float w = basis[i] * solid_angle;
+            local_sh[i] += vec4(radiance * w, 0.0);
+        }
+    }
+
+    // ---- Phase 2: Write partial sums to shared memory ----
+    for (int i = 0; i < 9; i++) {
+        sh_partial[tid * 9u + uint(i)] = local_sh[i];
+    }
+    barrier();
+
+    // ---- Phase 3: Tree reduction (log2(64) = 6 steps) ----
+    for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+        if (tid < stride) {
+            for (int i = 0; i < 9; i++) {
+                sh_partial[tid * 9u + uint(i)] +=
+                    sh_partial[(tid + stride) * 9u + uint(i)];
+            }
+        }
+        barrier();
+    }
+
+    // ---- Phase 4: Thread 0 applies cosine convolution and writes to SSBO ----
+    if (tid < 9u) {
+        vec4 coeff = sh_partial[tid]; // reduced sum is in thread 0's slots
+        // Apply cosine-lobe convolution → converts radiance SH to irradiance SH.
+        coeff.rgb *= COSINE_WEIGHT[tid];
+        // Clamp negative irradiance (can occur from SH ringing).
+        // Note: per-coefficient clamping isn't perfect, but prevents
+        // large negative values from corrupting the interpolation.
+        // Write to probe SSBO at the correct offset.
+        uint dst = pc.probe_index * 9u + tid;
+        probeBuf.probes[dst] = coeff;
+    }
+}

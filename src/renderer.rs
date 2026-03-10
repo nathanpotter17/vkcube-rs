@@ -2,10 +2,15 @@ use ash::{vk, Device};
 use std::collections::HashMap;
 
 use crate::device::DeviceContext;
+use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
+                 SHProjectPushConstants, MAX_PROBE_BAKES_PER_FRAME,
+                 PROBE_CAPTURE_NEAR, PROBE_CAPTURE_FAR, PROBE_CAPTURE_SIZE};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightManager, LightType,
-    ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, CLUSTER_X, CLUSTER_Y,
-    CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE, TOTAL_CLUSTERS,
+    ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, SunShadow,
+    compute_sun_shadow_matrices,
+    CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE,
+    SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY,
 };
 use crate::material::{MaterialData, MaterialLibrary, MaterialSsbo};
 use crate::memory::{BufferHandle, MemoryContext, MAX_FRAMES_IN_FLIGHT};
@@ -28,6 +33,8 @@ struct GlobalUbo {
     view: [[f32; 4]; 4],
     proj: [[f32; 4]; 4],
     camera_pos: [f32; 4],
+    sun_light_vp: [[f32; 4]; 4],  // sun shadow light-space view-projection
+    sun_direction: [f32; 4],       // xyz = normalized direction, w = shadow_enabled (1.0/0.0)
 }
 
 // ====================================================================
@@ -82,6 +89,13 @@ pub struct Renderer {
     shadow_atlas: ShadowAtlas,
     lighting_buffers: FrameLightingBuffers,
     shadow_assignments: HashMap<usize, u32>,
+    sun_shadow: SunShadow,
+    sun_direction: [f32; 3],
+
+    // Phase 3: Global Illumination
+    probe_grid: ProbeGrid,
+    gi_resources: GIResources,
+    probe_bake_target: ProbeBakeTarget,
 
     descriptor_layouts: DescriptorLayouts,
     render_passes: RenderPasses,
@@ -141,12 +155,17 @@ impl Renderer {
         material_library.clear_dirty();
 
         let texture_manager = TextureManager::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
-        let light_manager = LightManager::new();
+        let mut light_manager = LightManager::new();
         let shadow_budget = ShadowBudgetManager::new();
         let descriptor_layouts = DescriptorLayouts::new(&device, texture_manager.descriptor_set_layout)?;
         let render_passes = RenderPasses::new(&device, device_ctx.surface_format.format)?;
         let shadow_atlas = ShadowAtlas::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
+        let sun_shadow = SunShadow::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
         let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
+
+        // Phase 3: Global Illumination resources.
+        let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [32.0, 32.0])?;
+        let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
 
         let vert_spv = include_bytes!("../shaders/compiled/basic.vert.spv");
         let frag_spv = include_bytes!("../shaders/compiled/basic.frag.spv");
@@ -155,9 +174,19 @@ impl Renderer {
         let shadow_vert_spv: &[u8] = include_bytes!("../shaders/compiled/shadow.vert.spv");
         let shadow_frag_spv: &[u8] = include_bytes!("../shaders/compiled/shadow.frag.spv");
         let cluster_comp_spv: &[u8] = include_bytes!("../shaders/compiled/cluster_assign.comp.spv");
+        let probe_capture_frag_spv: &[u8] = include_bytes!("../shaders/compiled/probe_capture.frag.spv");
+        let sh_project_comp_spv: &[u8] = include_bytes!("../shaders/compiled/sh_project.comp.spv");
+
+        let probe_bake_target = ProbeBakeTarget::new(
+            &device, &memory_ctx.allocator, render_passes.probe_capture,
+            probe_grid.ssbo_buffer(), probe_grid.ssbo_size(),
+            sh_project_comp_spv,
+            device_ctx.command_pool, device_ctx.queue,
+        )?;
 
         let pipelines = Pipelines::new(&device, &descriptor_layouts, &render_passes,
-            vert_spv, frag_spv, depth_vert_spv, depth_frag_spv, shadow_vert_spv, shadow_frag_spv, cluster_comp_spv)?;
+            vert_spv, frag_spv, depth_vert_spv, depth_frag_spv, shadow_vert_spv, shadow_frag_spv,
+            cluster_comp_spv, probe_capture_frag_spv)?;
         let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
             device_ctx.depth_image_view, device_ctx.swapchain_extent)?;
 
@@ -165,11 +194,20 @@ impl Renderer {
         let cluster_params_size = std::mem::size_of::<ClusterParamsUbo>() as u64;
         let per_draw_ubo_size = std::mem::size_of::<UniformBufferObject>() as u64;
         let material_ssbo_size = (material_library.count() * std::mem::size_of::<MaterialData>()) as u64;
+        let probe_grid_params_size = std::mem::size_of::<GpuProbeGridParams>() as u64;
 
         let frame_descriptors = FrameDescriptors::new(&device, &descriptor_layouts, memory_ctx.ring.buffer,
             global_ubo_size, cluster_params_size, per_draw_ubo_size,
             material_ssbo.buffer, material_ssbo_size.max(128),
-            &lighting_buffers, shadow_atlas.sampling_view, shadow_atlas.shadow_sampler)?;
+            &lighting_buffers, shadow_atlas.sampling_view, shadow_atlas.shadow_sampler,
+            sun_shadow.sampling_view, sun_shadow.sampler,
+            // Phase 3: GI descriptor params
+            probe_grid.ssbo_buffer(), probe_grid.ssbo_size(),
+            probe_grid_params_size,
+            gi_resources.brdf_lut_view, gi_resources.brdf_lut_sampler,
+            gi_resources.irradiance_view, gi_resources.irradiance_sampler,
+            gi_resources.prefiltered_view, gi_resources.prefiltered_sampler,
+        )?;
 
         let command_buffers = Self::allocate_command_buffers(&device, device_ctx.command_pool)?;
 
@@ -183,8 +221,13 @@ impl Renderer {
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?);
         }}
 
-        let cam_pos = scene.camera.position;
-        println!("[Renderer] Phase 2 initialized. {} materials. Streaming radius: {}m", material_library.count(), STREAMING_RADIUS);
+        // Register a global directional sun light.
+        let sun_dir = crate::scene::normalize([0.4, -0.7, 0.3]);
+        let sun_light = Light::directional(sun_dir, SUN_COLOR, SUN_INTENSITY);
+        light_manager.register((i32::MAX, i32::MAX), vec![sun_light]);
+
+        println!("[Renderer] Phase 3 initialized. {} materials, {} SH probes, sun shadow {}×{}. Streaming: {}m",
+            material_library.count(), probe_grid.probe_count(), SUN_SHADOW_SIZE, SUN_SHADOW_SIZE, STREAMING_RADIUS);
 
         Ok(Self {
             device, memory_ctx, scene, world,
@@ -192,6 +235,9 @@ impl Renderer {
             material_library, material_ssbo, texture_manager,
             light_manager, shadow_budget, shadow_atlas, lighting_buffers,
             shadow_assignments: HashMap::new(),
+            sun_shadow,
+            sun_direction: sun_dir,
+            probe_grid, gi_resources, probe_bake_target,
             descriptor_layouts, render_passes, pipelines, framebuffers,
             frame_descriptors, command_buffers,
             image_available, render_finished, in_flight_fences,
@@ -350,6 +396,8 @@ impl Renderer {
                 );
             }
             self.register_sector_lights(upload.sector);
+            // Phase 3: Bake SH probes affected by this sector's lights.
+            self.probe_grid.bake_sector_probes(upload.sector, &self.light_manager);
         }
     }
 
@@ -393,6 +441,8 @@ impl Renderer {
 
             let ids = self.world.evict_sector(coord);
             self.light_manager.unregister(coord);
+            // Phase 3: Invalidate probes affected by evicted sector.
+            self.probe_grid.invalidate_sector(coord);
 
             if !ids.is_empty() {
                 println!("[Renderer] Evicted sector ({},{}) — {} objects", coord.0, coord.1, ids.len());
@@ -410,6 +460,8 @@ impl Renderer {
         self.update_streaming();
         self.poll_uploads();
         self.texture_manager.poll_pending(&self.memory_ctx);
+        // Phase 3: Upload dirty SH probe data to GPU SSBO.
+        self.probe_grid.upload_if_dirty();
 
         if self.material_library.is_dirty() {
             self.material_ssbo.upload(&self.material_library);
@@ -434,9 +486,15 @@ impl Renderer {
 
             self.lighting_buffers.upload_lights(self.current_frame, &self.light_manager.ssbo_bytes());
 
+            // Compute sun shadow light-space VP matrix.
+            let (sun_view, sun_proj) = compute_sun_shadow_matrices(self.sun_direction, camera_pos);
+            let sun_vp = crate::scene::multiply_matrices(sun_view, sun_proj);
+
             let global_ubo = GlobalUbo {
                 view: view_mat, proj: proj_mat,
                 camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
+                sun_light_vp: sun_vp,
+                sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
             };
             let g_off = self.memory_ctx.ring.push_data(&global_ubo).expect("Ring: GlobalUbo").offset as u32;
 
@@ -445,7 +503,11 @@ impl Renderer {
                 device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height, active_light_count);
             let c_off = self.memory_ctx.ring.push_data(&cluster_params).expect("Ring: ClusterParams").offset as u32;
 
-            let dyn_off = [g_off, c_off];
+            // Phase 3: Push ProbeGridParams dynamic UBO.
+            let probe_params = self.probe_grid.gpu_params();
+            let p_off = self.memory_ctx.ring.push_data(&probe_params).expect("Ring: ProbeGridParams").offset as u32;
+
+            let dyn_off = [g_off, c_off, p_off];
 
             let (image_index, _) = device_ctx.swapchain_loader.acquire_next_image(
                 device_ctx.swapchain, u64::MAX, self.image_available[self.current_frame], vk::Fence::null())?;
@@ -464,7 +526,7 @@ impl Renderer {
             // ---- Stats ----
             if self.global_frame % 60 == 0 {
                 println!(
-                    "[Frame {:>5}] sectors: {}/{} (stream:{} fail:{})  objects: {}  draws: {} opq + {} shd  lights: {}/{}  shadows: {}  tex: {}/{}",
+                    "[Frame {:>5}] sectors: {}/{} (stream:{} fail:{})  objects: {}  draws: {} opq + {} shd  lights: {}/{}  shadows: {}  tex: {}/{}  probes: {} (bake_q: {})",
                     self.global_frame,
                     self.world.ready_sector_count(), self.world.sectors.len(),
                     self.world.streaming_sector_count(),
@@ -474,12 +536,51 @@ impl Renderer {
                     active_light_count, self.light_manager.total_count(),
                     self.shadow_budget.active_shadow_count(),
                     self.texture_manager.active_count(), self.texture_manager.pending_count(),
+                    self.probe_grid.probe_count(),
+                    self.probe_grid.pending_bake_count(),
                 );
             }
 
             // ============================================================
             //  PASS 0: Shadow Pass
             // ============================================================
+
+            // ---- Sun directional shadow (single 2D depth pass) ----
+            {
+                let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
+                    width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
+                    min_depth: 0.0, max_depth: 1.0 };
+                let sun_ss = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width: SUN_SHADOW_SIZE, height: SUN_SHADOW_SIZE },
+                };
+                let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } }];
+                let rp = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.render_passes.shadow)
+                    .framebuffer(self.sun_shadow.framebuffer)
+                    .render_area(sun_ss)
+                    .clear_values(&clear);
+                self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sun_shadow);
+                self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
+                self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
+
+                // Bind set 3 per-draw UBO (only need per-object).
+                for draw in &self.world.shadow_draws {
+                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
+                    self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
+                    let ubo = UniformBufferObject::new(draw.transform, sun_view, sun_proj, 0);
+                    let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: sun shadow UBO");
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.layout, 3,
+                        &[self.frame_descriptors.per_draw_sets[self.current_frame]],
+                        &[rs.offset as u32]);
+                    self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
+                }
+                self.device.cmd_end_render_pass(cmd);
+            }
+
+            // ---- Point light cube map shadows ----
             let sv = vk::Viewport { x:0.0,y:0.0, width:SHADOW_MAP_SIZE as f32, height:SHADOW_MAP_SIZE as f32, min_depth:0.0, max_depth:1.0 };
             let ss = vk::Rect2D { offset:vk::Offset2D{x:0,y:0}, extent:vk::Extent2D{width:SHADOW_MAP_SIZE,height:SHADOW_MAP_SIZE} };
 
@@ -521,6 +622,114 @@ impl Renderer {
                         self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
                     }
                     self.device.cmd_end_render_pass(cmd);
+                }
+            }
+
+            // ============================================================
+            //  PASS 0.5: GPU Probe Cubemap Capture + SH Projection (Phase 3)
+            // ============================================================
+            {
+                let pv = vk::Viewport { x: 0.0, y: 0.0,
+                    width: PROBE_CAPTURE_SIZE as f32, height: PROBE_CAPTURE_SIZE as f32,
+                    min_depth: 0.0, max_depth: 1.0 };
+                let ps = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width: PROBE_CAPTURE_SIZE, height: PROBE_CAPTURE_SIZE },
+                };
+
+                let mut probes_baked = 0u32;
+                while probes_baked < MAX_PROBE_BAKES_PER_FRAME as u32 {
+                    let Some((probe_idx, probe_pos)) = self.probe_grid.next_bake_probe() else { break };
+
+                    let face_matrices = ProbeGrid::probe_capture_matrices(probe_pos);
+
+                    // Render 6 cubemap faces.
+                    for face in 0..6u32 {
+                        let (face_view, face_proj) = face_matrices[face as usize];
+                        let clear = [
+                            vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } },
+                            vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
+                        ];
+                        let rp = vk::RenderPassBeginInfo::default()
+                            .render_pass(self.render_passes.probe_capture)
+                            .framebuffer(self.probe_bake_target.framebuffers[face as usize])
+                            .render_area(ps)
+                            .clear_values(&clear);
+
+                        self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+                        self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.probe_capture);
+                        self.device.cmd_set_viewport(cmd, 0, &[pv]);
+                        self.device.cmd_set_scissor(cmd, 0, &[ps]);
+
+                        // Bind descriptor sets (same as lighting pass — set 0 has lights, set 1 textures, set 2 shadows).
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 0,
+                            &[self.frame_descriptors.per_frame_sets[self.current_frame]], &dyn_off);
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 1, &[self.texture_manager.descriptor_set], &[]);
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 2,
+                            &[self.frame_descriptors.shadow_map_sets[self.current_frame]], &[]);
+
+                        // Draw all opaque objects with probe view/proj.
+                        for draw in &self.world.opaque_draws {
+                            self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
+                            self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
+                            let ubo = UniformBufferObject::new(draw.transform, face_view, face_proj, draw.material_id);
+                            let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: probe capture UBO");
+                            self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                                self.pipelines.layout, 3,
+                                &[self.frame_descriptors.per_draw_sets[self.current_frame]], &[rs.offset as u32]);
+                            self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
+                        }
+                        self.device.cmd_end_render_pass(cmd);
+                    }
+
+                    // Transition cubemap: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .image(self.probe_bake_target.color_image)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0, level_count: 1,
+                            base_array_layer: 0, layer_count: 6,
+                        });
+                    self.device.cmd_pipeline_barrier(cmd,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(), &[], &[],
+                        std::slice::from_ref(&barrier));
+
+                    // Dispatch SH projection compute shader.
+                    let push = SHProjectPushConstants {
+                        probe_index: probe_idx,
+                        face_size: PROBE_CAPTURE_SIZE,
+                    };
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.probe_bake_target.sh_compute_pipeline);
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE,
+                        self.probe_bake_target.sh_compute_pipeline_layout, 0,
+                        &[self.probe_bake_target.sh_compute_set], &[]);
+                    self.device.cmd_push_constants(cmd, self.probe_bake_target.sh_compute_pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE, 0,
+                        std::slice::from_raw_parts(&push as *const _ as *const u8, std::mem::size_of_val(&push)));
+                    self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+                    // Barrier: SH compute SSBO write → fragment shader read.
+                    let ssbo_barrier = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    self.device.cmd_pipeline_barrier(cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&ssbo_barrier), &[], &[]);
+
+                    probes_baked += 1;
                 }
             }
 
@@ -673,6 +882,10 @@ impl Drop for Renderer {
         self.render_passes.destroy(&self.device);
         self.descriptor_layouts.destroy(&self.device);
         self.shadow_atlas.destroy(&self.device);
+        self.sun_shadow.destroy(&self.device);
+        self.gi_resources.destroy(&self.device);
+        self.probe_bake_target.destroy(&self.device);
+        // probe_grid SSBO freed via allocator on MemoryContext drop
         self.lighting_buffers.destroy(&mut self.memory_ctx.allocator);
     }}
 }

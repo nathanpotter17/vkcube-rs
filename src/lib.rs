@@ -4,6 +4,7 @@ pub mod memory;
 pub mod material;
 pub mod texture;
 pub mod light;
+pub mod gi;
 pub mod pipeline;
 pub mod world;
 pub mod renderer;

@@ -1661,6 +1661,19 @@ impl MemoryContext {
         self.create_buffer_with_data(bytes, usage, command_pool, queue)
     }
 
+    // ----------------------------------------------------------------
+    //  Staging buffer accessors (for bulk uploads in gi.rs, etc.)
+    // ----------------------------------------------------------------
+
+    /// Raw staging buffer handle (for vkCmdCopyBufferToImage).
+    pub fn staging_buffer(&self) -> vk::Buffer { self.staging_buffer }
+
+    /// Staging buffer capacity in bytes.
+    pub fn staging_size(&self) -> u64 { self.staging_size }
+
+    /// Raw mapped pointer into the staging buffer.
+    pub fn staging_ptr(&self) -> *mut u8 { self.staging_mapped.as_ptr() }
+
     /// Create a device-local VkImage and upload pixel data synchronously.
     /// Returns the image in `SHADER_READ_ONLY_OPTIMAL` layout.
     pub fn create_image_with_data(

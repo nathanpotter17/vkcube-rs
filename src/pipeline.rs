@@ -1,18 +1,23 @@
-//! Pipeline Management (Phase 1 + Phase 2)
+//! Pipeline Management (Phase 1 + Phase 2 + Phase 3)
 //!
 //! Pass structure (Phase 2):
 //!   1. Shadow pass     (per shadow-casting light × 6 cube faces)
 //!   2. Depth pre-pass  (depth-only, enables early-Z)
 //!   3. Cluster compute (light → cluster assignment)
-//!   4. Lighting pass   (PBR + clustered shading + shadows)
+//!   4. Lighting pass   (PBR + clustered shading + shadows + GI)
 //!
 //! Descriptor Set 0 (per-frame globals):
-//!   binding 0: GlobalUbo            (UNIFORM_BUFFER_DYNAMIC)
-//!   binding 1: Light SSBO           (STORAGE_BUFFER)
-//!   binding 2: Cluster SSBO         (STORAGE_BUFFER)
-//!   binding 3: Light Index SSBO     (STORAGE_BUFFER)
-//!   binding 4: ClusterParamsUbo     (UNIFORM_BUFFER_DYNAMIC)
-//!   binding 5: Material SSBO        (STORAGE_BUFFER)
+//!   binding 0:  GlobalUbo            (UNIFORM_BUFFER_DYNAMIC)
+//!   binding 1:  Light SSBO           (STORAGE_BUFFER)
+//!   binding 2:  Cluster SSBO         (STORAGE_BUFFER)
+//!   binding 3:  Light Index SSBO     (STORAGE_BUFFER)
+//!   binding 4:  ClusterParamsUbo     (UNIFORM_BUFFER_DYNAMIC)
+//!   binding 5:  Material SSBO        (STORAGE_BUFFER)
+//!   binding 6:  SH Probe SSBO        (STORAGE_BUFFER)            [Phase 3]
+//!   binding 7:  ProbeGridParams UBO  (UNIFORM_BUFFER_DYNAMIC)    [Phase 3]
+//!   binding 8:  BRDF LUT             (COMBINED_IMAGE_SAMPLER)    [Phase 3]
+//!   binding 9:  Irradiance Cube Map  (COMBINED_IMAGE_SAMPLER)    [Phase 3]
+//!   binding 10: Pre-filtered Env Map (COMBINED_IMAGE_SAMPLER)    [Phase 3]
 //!
 //! Descriptor Set 1: Bindless textures (from TextureManager)
 //! Descriptor Set 2: Shadow maps (cube map array sampler)
@@ -75,6 +80,11 @@ impl DescriptorLayouts {
         // Binding 3: Light Index SSBO        (storage buffer)
         // Binding 4: ClusterParamsUbo        (dynamic UBO)
         // Binding 5: Material SSBO           (storage buffer)
+        // Binding 6: SH Probe SSBO           (storage buffer)           [Phase 3]
+        // Binding 7: ProbeGridParams UBO     (dynamic UBO)              [Phase 3]
+        // Binding 8: BRDF LUT               (combined image sampler)    [Phase 3]
+        // Binding 9: Irradiance cube map    (combined image sampler)    [Phase 3]
+        // Binding 10: Pre-filtered env map  (combined image sampler)    [Phase 3]
         let set0_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -121,6 +131,36 @@ impl DescriptorLayouts {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 3: SH Probe SSBO
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 3: ProbeGridParams dynamic UBO
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 3: BRDF LUT
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 3: Irradiance cube map
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(9)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 3: Pre-filtered env map
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(10)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
 
         let per_frame = unsafe {
@@ -134,16 +174,24 @@ impl DescriptorLayouts {
         // ---- Set 2: Shadow maps ----
         //
         // Binding 0: samplerCubeArray for point light shadow cube maps.
-        let set2_binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        // Binding 1: sampler2D for directional (sun) shadow map.
+        let set2_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
 
         let shadow_maps = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(std::slice::from_ref(&set2_binding)),
+                    .bindings(&set2_bindings),
                 None,
             )?
         };
@@ -201,6 +249,8 @@ pub struct RenderPasses {
     pub lighting: vk::RenderPass,
     /// Shadow pass: depth-only into a single cube map face layer.
     pub shadow: vk::RenderPass,
+    /// Probe capture pass: HDR color + depth into a cubemap face (Phase 3).
+    pub probe_capture: vk::RenderPass,
 }
 
 impl RenderPasses {
@@ -211,11 +261,13 @@ impl RenderPasses {
         let depth_prepass = Self::create_depth_prepass(device)?;
         let lighting = Self::create_lighting_pass(device, color_format)?;
         let shadow = Self::create_shadow_pass(device)?;
+        let probe_capture = Self::create_probe_capture_pass(device)?;
 
         Ok(Self {
             depth_prepass,
             lighting,
             shadow,
+            probe_capture,
         })
     }
 
@@ -376,7 +428,73 @@ impl RenderPasses {
             device.destroy_render_pass(self.depth_prepass, None);
             device.destroy_render_pass(self.lighting, None);
             device.destroy_render_pass(self.shadow, None);
+            device.destroy_render_pass(self.probe_capture, None);
         }
+    }
+
+    /// Probe capture render pass: HDR color + depth per cubemap face.
+    ///
+    /// Color: R16G16B16A16_SFLOAT, CLEAR+STORE, UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
+    /// Depth: D32_SFLOAT, CLEAR+DONT_CARE, UNDEFINED → DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+    /// After all 6 faces, a manual barrier transitions color to SHADER_READ_ONLY.
+    fn create_probe_capture_pass(
+        device: &Device,
+    ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
+        let attachments = [
+            // Color (HDR).
+            vk::AttachmentDescription::default()
+                .format(vk::Format::R16G16B16A16_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            // Depth (transient, reused per face).
+            vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        ];
+
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .depth_stencil_attachment(&depth_ref);
+
+        let dependency = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+
+        let info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(std::slice::from_ref(&dependency));
+
+        unsafe { Ok(device.create_render_pass(&info, None)?) }
     }
 }
 
@@ -389,6 +507,10 @@ pub struct Pipelines {
     pub lighting: vk::Pipeline,
     pub shadow: vk::Pipeline,
     pub cluster_compute: vk::Pipeline,
+    /// Phase 3: Probe cubemap capture pipeline (full PBR, all-lights, HDR output).
+    pub probe_capture: vk::Pipeline,
+    /// Sun directional shadow pipeline (depth-only with hardware z, ortho projection).
+    pub sun_shadow: vk::Pipeline,
     /// Graphics pipeline layout (all four sets + push constants).
     pub layout: vk::PipelineLayout,
     /// Compute pipeline layout (set 0 only).
@@ -408,6 +530,7 @@ impl Pipelines {
         shadow_vert_spv: &[u8],
         shadow_frag_spv: &[u8],
         cluster_comp_spv: &[u8],
+        probe_capture_frag_spv: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cache = unsafe {
             device.create_pipeline_cache(
@@ -467,11 +590,29 @@ impl Pipelines {
             device, cache, compute_layout, cluster_comp_spv,
         )?;
 
+        // ---- Probe capture pipeline (Phase 3) ----
+        // Reuses the PBR vertex shader + same pipeline layout.
+        // Different fragment shader (all-lights, no GI, raw HDR).
+        let probe_capture = Self::create_probe_capture_pipeline(
+            device, cache, layout, passes.probe_capture,
+            vert_spv, probe_capture_frag_spv,
+        )?;
+
+        // ---- Sun shadow pipeline (depth-only with hardware z, ortho) ----
+        // Uses the shadow render pass (SHADER_READ_ONLY ↔ SHADER_READ_ONLY)
+        // but with depth shaders (no gl_FragDepth override → standard ortho depth).
+        let sun_shadow = Self::create_depth_pipeline(
+            device, cache, layout, passes.shadow,
+            depth_vert_spv, depth_frag_spv,
+        )?;
+
         Ok(Self {
             depth_prepass,
             lighting,
             shadow,
             cluster_compute,
+            probe_capture,
+            sun_shadow,
             layout,
             compute_layout,
             cache,
@@ -738,9 +879,90 @@ impl Pipelines {
             device.destroy_pipeline(self.lighting, None);
             device.destroy_pipeline(self.shadow, None);
             device.destroy_pipeline(self.cluster_compute, None);
+            device.destroy_pipeline(self.probe_capture, None);
+            device.destroy_pipeline(self.sun_shadow, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_pipeline_layout(self.compute_layout, None);
             device.destroy_pipeline_cache(self.cache, None);
+        }
+    }
+
+    /// Phase 3: Probe cubemap capture pipeline.
+    /// Same vertex layout as PBR, but uses the probe_capture fragment shader
+    /// and renders into the probe capture render pass (HDR color + depth).
+    fn create_probe_capture_pipeline(
+        device: &Device,
+        cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+        render_pass: vk::RenderPass,
+        vert_spv: &[u8],
+        frag_spv: &[u8],
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        unsafe {
+            let vert_module = create_shader_module(device, vert_spv)?;
+            let frag_module = create_shader_module(device, frag_spv)?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vert_module)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(frag_module)
+                    .name(c"main"),
+            ];
+
+            let binding = Vertex::binding_description();
+            let attributes = Vertex::attribute_descriptions();
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(std::slice::from_ref(&binding))
+                .vertex_attribute_descriptions(&attributes);
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .line_width(1.0)
+                .cull_mode(vk::CullModeFlags::BACK)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+            let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS);
+            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false);
+            let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dynamic_states);
+
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterizer)
+                .multisample_state(&multisampling)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blending)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .render_pass(render_pass)
+                .subpass(0);
+
+            let pipelines = device
+                .create_graphics_pipelines(cache, &[pipeline_info], None)
+                .map_err(|(_, e)| e)?;
+            device.destroy_shader_module(vert_module, None);
+            device.destroy_shader_module(frag_module, None);
+            Ok(pipelines[0])
         }
     }
 }
@@ -947,21 +1169,36 @@ impl FrameDescriptors {
         lighting: &FrameLightingBuffers,
         shadow_view: vk::ImageView,
         shadow_sampler: vk::Sampler,
+        // Sun shadow (set 2, binding 1)
+        sun_shadow_view: vk::ImageView,
+        sun_shadow_sampler: vk::Sampler,
+        // Phase 3: GI resources
+        probe_ssbo: vk::Buffer,
+        probe_ssbo_size: u64,
+        probe_grid_params_range: u64,
+        brdf_lut_view: vk::ImageView,
+        brdf_lut_sampler: vk::Sampler,
+        irradiance_view: vk::ImageView,
+        irradiance_sampler: vk::Sampler,
+        prefiltered_view: vk::ImageView,
+        prefiltered_sampler: vk::Sampler,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let n = MAX_FRAMES_IN_FLIGHT as u32;
 
         let pool_sizes = [
-            // Set 0: 2× UNIFORM_BUFFER_DYNAMIC + 4× STORAGE_BUFFER per frame
+            // Set 0: 3× UNIFORM_BUFFER_DYNAMIC (global + cluster + probe grid)
+            //       + 5× STORAGE_BUFFER (light, cluster, index, material, probe)
+            //       + 3× COMBINED_IMAGE_SAMPLER (brdf, irradiance, prefiltered) per frame
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(n * 2),
+                .descriptor_count(n * 3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(n * 4),
-            // Set 2: 1× COMBINED_IMAGE_SAMPLER per frame
+                .descriptor_count(n * 5),
+            // Set 0 GI samplers (3) + Set 2 shadow samplers (2: cube + sun)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(n),
+                .descriptor_count(n * 5),
             // Set 3: 1× UNIFORM_BUFFER_DYNAMIC per frame
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
@@ -1040,6 +1277,32 @@ impl FrameDescriptors {
                 .offset(0)
                 .range(material_ssbo_size);
 
+            // Phase 3: GI descriptor infos.
+            let probe_ssbo_info = vk::DescriptorBufferInfo::default()
+                .buffer(probe_ssbo)
+                .offset(0)
+                .range(probe_ssbo_size);
+
+            let probe_grid_params_info = vk::DescriptorBufferInfo::default()
+                .buffer(ring_buffer)
+                .offset(0)
+                .range(probe_grid_params_range);
+
+            let brdf_lut_info = vk::DescriptorImageInfo::default()
+                .sampler(brdf_lut_sampler)
+                .image_view(brdf_lut_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+            let irradiance_info = vk::DescriptorImageInfo::default()
+                .sampler(irradiance_sampler)
+                .image_view(irradiance_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+            let prefiltered_info = vk::DescriptorImageInfo::default()
+                .sampler(prefiltered_sampler)
+                .image_view(prefiltered_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
             let set0_writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(per_frame_sets[i])
@@ -1071,6 +1334,32 @@ impl FrameDescriptors {
                     .dst_binding(5)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(std::slice::from_ref(&material_info)),
+                // Phase 3: GI writes
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(6)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&probe_ssbo_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                    .buffer_info(std::slice::from_ref(&probe_grid_params_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(8)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&brdf_lut_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(9)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&irradiance_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(10)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&prefiltered_info)),
             ];
             unsafe { device.update_descriptor_sets(&set0_writes, &[]) };
 
@@ -1079,13 +1368,24 @@ impl FrameDescriptors {
                 .sampler(shadow_sampler)
                 .image_view(shadow_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let sun_shadow_info = vk::DescriptorImageInfo::default()
+                .sampler(sun_shadow_sampler)
+                .image_view(sun_shadow_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-            let shadow_write = vk::WriteDescriptorSet::default()
-                .dst_set(shadow_map_sets[i])
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&shadow_info));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&shadow_write), &[]) };
+            let shadow_writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(shadow_map_sets[i])
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&shadow_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(shadow_map_sets[i])
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&sun_shadow_info)),
+            ];
+            unsafe { device.update_descriptor_sets(&shadow_writes, &[]) };
 
             // ---- Set 3: Per-draw dynamic UBO ----
             let per_draw_info = vk::DescriptorBufferInfo::default()

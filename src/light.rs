@@ -55,6 +55,21 @@ pub const LIGHT_INDEX_CAPACITY: u32 = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER as
 /// Hysteresis bonus score for lights retaining shadow slots across frames.
 const SHADOW_HYSTERESIS_BONUS: f32 = 2.0;
 
+pub const SUN_COLOR: [f32; 3] = [1.0, 0.95, 0.85]; 
+pub const SUN_INTENSITY: f32 = 0.1;
+/// Resolution of the sun shadow map (single 2D texture).
+pub const SUN_SHADOW_SIZE: u32 = 2048;
+
+/// Half-width of the sun shadow orthographic projection (meters).
+/// Covers 300m × 300m — matches the streaming radius.
+pub const SUN_SHADOW_EXTENT: f32 = 300.0;
+
+/// Far plane for the sun shadow orthographic projection.
+pub const SUN_SHADOW_FAR: f32 = 600.0;
+
+/// Near plane.
+pub const SUN_SHADOW_NEAR: f32 = 1.0;
+
 // ====================================================================
 //  Light Types
 // ====================================================================
@@ -910,6 +925,195 @@ impl ShadowAtlas {
             device.free_memory(self.memory, None);
         }
     }
+}
+
+// ====================================================================
+//  SunShadow — 2D depth map for directional light
+// ====================================================================
+
+/// Manages a single 2D depth texture for directional (sun) shadows.
+///
+/// The sun shadow uses the same depth-only render pass as the point
+/// light cube maps, but writes standard hardware depth (no linear distance).
+/// Uses an orthographic projection centered on the camera, covering
+/// `SUN_SHADOW_EXTENT` meters in each direction.
+pub struct SunShadow {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub depth_view: vk::ImageView,
+    /// View for shader sampling (TYPE_2D).
+    pub sampling_view: vk::ImageView,
+    pub framebuffer: vk::Framebuffer,
+    pub sampler: vk::Sampler,
+}
+
+impl SunShadow {
+    /// Create the sun shadow map resources.
+    ///
+    /// Reuses the provided shadow render pass (depth-only,
+    /// SHADER_READ_ONLY → SHADER_READ_ONLY).
+    pub fn new(
+        device: &Device,
+        allocator: &mut GpuAllocator,
+        shadow_render_pass: vk::RenderPass,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let size = SUN_SHADOW_SIZE;
+
+        // ---- Create 2D depth image ----
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .extent(vk::Extent3D { width: size, height: size, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = unsafe { device.create_image(&image_info, None)? };
+        let mem_req = unsafe { device.get_image_memory_requirements(image) };
+
+        let mem_type = allocator.find_memory_type(
+            mem_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { device.allocate_memory(&alloc_info, None)? };
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        // ---- Initial layout transition: UNDEFINED → SHADER_READ_ONLY_OPTIMAL ----
+        unsafe {
+            let cmd_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd = device.allocate_command_buffers(&cmd_info)?[0];
+            device.begin_command_buffer(cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(), &[], &[],
+                std::slice::from_ref(&barrier));
+
+            device.end_command_buffer(cmd)?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            device.queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+            device.queue_wait_idle(queue)?;
+            device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
+        }
+
+        // ---- Depth view (framebuffer attachment) ----
+        let depth_view = unsafe { device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                }), None)? };
+
+        // ---- Sampling view (same as depth_view for 2D) ----
+        let sampling_view = depth_view;
+
+        // ---- Framebuffer ----
+        let fb = unsafe { device.create_framebuffer(
+            &vk::FramebufferCreateInfo::default()
+                .render_pass(shadow_render_pass)
+                .attachments(std::slice::from_ref(&depth_view))
+                .width(size)
+                .height(size)
+                .layers(1), None)? };
+
+        // ---- Shadow sampler (linear, clamp-to-border white) ----
+        let sampler = unsafe { device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                .compare_enable(false)
+                .min_lod(0.0)
+                .max_lod(1.0)
+                .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE), None)? };
+
+        let mb = (mem_req.size + 1024 * 1024 - 1) / (1024 * 1024);
+        println!("[SunShadow] {}×{} D32_SFLOAT, ~{} MB", size, size, mb);
+
+        Ok(Self {
+            image, memory, depth_view, sampling_view, framebuffer: fb, sampler,
+        })
+    }
+
+    pub fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_framebuffer(self.framebuffer, None);
+            // depth_view == sampling_view, destroy once.
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Compute the sun's orthographic view + projection matrices for shadow rendering.
+///
+/// The orthographic frustum is centered on `camera_pos` projected along the
+/// sun direction, covering `SUN_SHADOW_EXTENT` meters in each direction.
+pub fn compute_sun_shadow_matrices(
+    sun_direction: [f32; 3],
+    camera_pos: [f32; 3],
+) -> ([[f32; 4]; 4], [[f32; 4]; 4]) {
+    // Light "eye" = camera center offset far along opposite of sun direction.
+    let eye = [
+        camera_pos[0] - sun_direction[0] * SUN_SHADOW_FAR * 0.5,
+        camera_pos[1] - sun_direction[1] * SUN_SHADOW_FAR * 0.5,
+        camera_pos[2] - sun_direction[2] * SUN_SHADOW_FAR * 0.5,
+    ];
+    let target = camera_pos;
+    let up = if sun_direction[1].abs() > 0.99 { [0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0] };
+
+    let view = look_at(eye, target, up);
+
+    // Orthographic projection (Vulkan convention: Y-flip, Z=[0,1]).
+    let half = SUN_SHADOW_EXTENT;
+    let near = SUN_SHADOW_NEAR;
+    let far = SUN_SHADOW_FAR;
+
+    let proj = [
+        [1.0 / half, 0.0, 0.0, 0.0],
+        [0.0, -1.0 / half, 0.0, 0.0],       // Y-flip for Vulkan
+        [0.0, 0.0, 1.0 / (far - near), 0.0],
+        [0.0, 0.0, -near / (far - near), 1.0],
+    ];
+
+    (view, proj)
 }
 
 // ====================================================================
