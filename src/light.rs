@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - `Light` / `GpuLight`: CPU and GPU light representations.
-//! - `LightManager`: register/unregister by chunk, frustum cull, SSBO upload.
+//! - `LightManager`: register/unregister by sector, frustum cull, SSBO upload.
 //! - `ShadowBudgetManager`: scoring, slot assignment with hysteresis.
 //! - `ShadowAtlas`: cube map array for point light shadows, per-face
 //!   framebuffers, view matrix generation.
@@ -21,7 +21,7 @@ use ash::{vk, Device};
 use std::collections::HashMap;
 
 use crate::memory::{GpuAllocator, ImageHandle, MemoryLocation};
-use crate::scene::ChunkCoord;
+use crate::world::SectorCoord;
 
 // ====================================================================
 //  Constants
@@ -68,7 +68,7 @@ pub enum LightType {
     Directional = 2,
 }
 
-/// CPU-side light definition.  Registered per-chunk, culled per-frame.
+/// CPU-side light definition.  Registered per-sector, culled per-frame.
 #[derive(Debug, Clone)]
 pub struct Light {
     pub light_type: LightType,
@@ -86,8 +86,8 @@ pub struct Light {
     pub cos_inner_angle: f32,
     /// Can this light cast shadows?
     pub shadow_capable: bool,
-    /// Chunk that registered this light (for bulk unregister).
-    pub(crate) source_chunk: ChunkCoord,
+    /// Sector that registered this light (for bulk unregister).
+    pub(crate) source_sector: SectorCoord,
 }
 
 impl Light {
@@ -109,7 +109,7 @@ impl Light {
             cos_outer_angle: -1.0,
             cos_inner_angle: -1.0,
             shadow_capable: true,
-            source_chunk: (0, 0),
+            source_sector: (0, 0),
         }
     }
 
@@ -140,7 +140,7 @@ impl Light {
             cos_outer_angle: -1.0,
             cos_inner_angle: -1.0,
             shadow_capable: false,
-            source_chunk: (0, 0),
+            source_sector: (0, 0),
         }
     }
 
@@ -175,7 +175,7 @@ impl Light {
             cos_outer_angle: outer_angle_deg.to_radians().cos(),
             cos_inner_angle: inner_angle_deg.to_radians().cos(),
             shadow_capable: true,
-            source_chunk: (0, 0),
+            source_sector: (0, 0),
         }
     }
 }
@@ -336,14 +336,14 @@ pub struct ShadowPushConstants {
 
 /// CPU-side light management.
 ///
-/// Lights are registered per-chunk.  Each frame, the manager frustum-culls,
+/// Lights are registered per-sector.  Each frame, the manager frustum-culls,
 /// sorts by distance, caps at `MAX_LIGHTS`, and produces a `Vec<GpuLight>`
 /// for SSBO upload.
 pub struct LightManager {
     /// All registered lights.
     lights: Vec<Light>,
-    /// Chunk → index range in `lights`.
-    chunk_ranges: HashMap<ChunkCoord, Vec<usize>>,
+    /// Sector → index range in `lights`.
+    sector_ranges: HashMap<SectorCoord, Vec<usize>>,
     /// Per-frame output after cull (indices into `lights`).
     active_indices: Vec<usize>,
     /// Per-frame GPU data ready for upload.
@@ -356,33 +356,33 @@ impl LightManager {
     pub fn new() -> Self {
         Self {
             lights: Vec::with_capacity(1024),
-            chunk_ranges: HashMap::new(),
+            sector_ranges: HashMap::new(),
             active_indices: Vec::with_capacity(MAX_LIGHTS),
             gpu_lights: Vec::with_capacity(MAX_LIGHTS),
             active_count: 0,
         }
     }
 
-    /// Register lights from a chunk.  Returns indices into the global
+    /// Register lights from a sector.  Returns indices into the global
     /// light array (for optional external tracking).
-    pub fn register(&mut self, coord: ChunkCoord, lights: Vec<Light>) -> Vec<usize> {
+    pub fn register(&mut self, coord: SectorCoord, lights: Vec<Light>) -> Vec<usize> {
         let mut indices = Vec::with_capacity(lights.len());
         for mut light in lights {
-            light.source_chunk = coord;
+            light.source_sector = coord;
             let idx = self.lights.len();
             self.lights.push(light);
             indices.push(idx);
         }
-        self.chunk_ranges.insert(coord, indices.clone());
+        self.sector_ranges.insert(coord, indices.clone());
         indices
     }
 
-    /// Bulk-remove all lights registered by a chunk.
+    /// Bulk-remove all lights registered by a sector.
     ///
-    /// Uses swap-remove for O(1) per light.  Updates chunk_ranges to
+    /// Uses swap-remove for O(1) per light.  Updates sector_ranges to
     /// reflect swapped indices.
-    pub fn unregister(&mut self, coord: ChunkCoord) {
-        let Some(indices) = self.chunk_ranges.remove(&coord) else {
+    pub fn unregister(&mut self, coord: SectorCoord) {
+        let Some(indices) = self.sector_ranges.remove(&coord) else {
             return;
         };
 
@@ -398,10 +398,10 @@ impl LightManager {
             // swap_remove: moves last element into `idx`.
             self.lights.swap_remove(idx);
 
-            // If we moved a light, update its chunk's index mapping.
+            // If we moved a light, update its sector's index mapping.
             if idx < self.lights.len() {
-                let moved_chunk = self.lights[idx].source_chunk;
-                if let Some(mapping) = self.chunk_ranges.get_mut(&moved_chunk) {
+                let moved_sector = self.lights[idx].source_sector;
+                if let Some(mapping) = self.sector_ranges.get_mut(&moved_sector) {
                     // The moved light was at position `self.lights.len()` (before remove),
                     // now it's at `idx`.
                     if let Some(pos) = mapping.iter().position(|&i| i == self.lights.len()) {

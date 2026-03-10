@@ -1,12 +1,6 @@
 use ash::vk;
-use std::collections::HashMap;
-use crate::memory::{BufferHandle, TransferTicket};
 
 // ===== Vertex =====
-//
-// Phase 1 vertex format: position + normal + UV + color.
-// Matches the PBR pipeline's vertex input layout.
-// Total: 12 + 12 + 8 + 12 = 44 bytes per vertex.
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -19,33 +13,17 @@ pub struct Vertex {
 
 impl Vertex {
     pub fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-        Self {
-            position,
-            normal: [0.0, 1.0, 0.0],
-            uv: [0.0, 0.0],
-            color,
-        }
+        Self { position, normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color }
     }
 
     pub fn with_normal(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Self {
-        Self {
-            position,
-            normal,
-            uv: [0.0, 0.0],
-            color,
-        }
+        Self { position, normal, uv: [0.0, 0.0], color }
     }
 
-    pub fn full(
-        position: [f32; 3],
-        normal: [f32; 3],
-        uv: [f32; 2],
-        color: [f32; 3],
-    ) -> Self {
+    pub fn full(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], color: [f32; 3]) -> Self {
         Self { position, normal, uv, color }
     }
 
-    /// Vulkan vertex input binding description for binding 0.
     pub fn binding_description() -> vk::VertexInputBindingDescription {
         vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -53,41 +31,21 @@ impl Vertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    /// Vulkan vertex input attribute descriptions.
-    ///   location 0: position (vec3, offset 0)
-    ///   location 1: normal   (vec3, offset 12)
-    ///   location 2: uv       (vec2, offset 24)
-    ///   location 3: color    (vec3, offset 32)
     pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
         [
             vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
+                .binding(0).location(0).format(vk::Format::R32G32B32_SFLOAT).offset(0),
             vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(1)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(12),
+                .binding(0).location(1).format(vk::Format::R32G32B32_SFLOAT).offset(12),
             vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(2)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(24),
+                .binding(0).location(2).format(vk::Format::R32G32_SFLOAT).offset(24),
             vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(3)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(32),
+                .binding(0).location(3).format(vk::Format::R32G32B32_SFLOAT).offset(32),
         ]
     }
 }
 
 // ===== UBO =====
-//
-// Phase 1 per-draw UBO: model/view/proj matrices + material index.
-// Bound via dynamic offset from the ring buffer (descriptor set 3).
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -95,33 +53,20 @@ pub struct UniformBufferObject {
     pub model: [[f32; 4]; 4],
     pub view: [[f32; 4]; 4],
     pub proj: [[f32; 4]; 4],
-    /// Index into the material SSBO (set 0, binding 5).
     pub material_id: u32,
-    /// Padding to align to 16 bytes (3 floats = 12 bytes).
     pub _pad: [u32; 3],
 }
 
 impl UniformBufferObject {
     pub fn new(
-        model: [[f32; 4]; 4],
-        view: [[f32; 4]; 4],
-        proj: [[f32; 4]; 4],
-        material_id: u32,
+        model: [[f32; 4]; 4], view: [[f32; 4]; 4],
+        proj: [[f32; 4]; 4], material_id: u32,
     ) -> Self {
-        Self {
-            model,
-            view,
-            proj,
-            material_id,
-            _pad: [0; 3],
-        }
+        Self { model, view, proj, material_id, _pad: [0; 3] }
     }
 }
 
 // ===== Camera =====
-//
-// Phase 2: elevated orbit camera.  Orbits at a fixed height and radius
-// around the world origin, looking down at ground level.
 
 pub struct Camera {
     pub position: [f32; 3],
@@ -133,14 +78,10 @@ pub struct Camera {
     pub far: f32,
 }
 
-/// Orbit radius (world units) — close to single chunk center.
-const ORBIT_RADIUS: f32 = 25.0;        // was 55.0
-/// Camera height above ground — steep enough to see ground shadows.
-const ORBIT_HEIGHT: f32 = 18.0;        // was 28.0
-/// Look-at target Y.
-const TARGET_Y: f32 = 1.0;             // was 2.0
-/// Rotation speed (radians per second) — slow cinematic orbit.
-const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.08;  // was 0.15 — slower for observation
+const ORBIT_RADIUS: f32 = 25.0;
+const ORBIT_HEIGHT: f32 = 18.0;
+const TARGET_Y: f32 = 1.0;
+const ORBIT_SPEED_RAD_PER_SEC: f32 = 0.08;
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
@@ -148,10 +89,7 @@ impl Camera {
             position: [ORBIT_RADIUS, ORBIT_HEIGHT, 0.0],
             target: [0.0, TARGET_Y, 0.0],
             up: [0.0, 1.0, 0.0],
-            fov: 60.0,
-            aspect,
-            near: 0.1,
-            far: 800.0,
+            fov: 60.0, aspect, near: 0.1, far: 800.0,
         }
     }
 
@@ -159,34 +97,22 @@ impl Camera {
         let f = normalize(sub3(self.target, self.position));
         let s = normalize(cross3(f, self.up));
         let u = cross3(s, f);
-
         [
             [s[0], u[0], -f[0], 0.0],
             [s[1], u[1], -f[1], 0.0],
             [s[2], u[2], -f[2], 0.0],
-            [
-                -dot3(s, self.position),
-                -dot3(u, self.position),
-                dot3(f, self.position),
-                1.0,
-            ],
+            [-dot3(s, self.position), -dot3(u, self.position), dot3(f, self.position), 1.0],
         ]
     }
 
     pub fn get_projection_matrix(&self) -> [[f32; 4]; 4] {
         let fov_rad = self.fov.to_radians();
         let f = 1.0 / (fov_rad / 2.0).tan();
-
         [
             [f / self.aspect, 0.0, 0.0, 0.0],
             [0.0, -f, 0.0, 0.0],
             [0.0, 0.0, self.far / (self.near - self.far), -1.0],
-            [
-                0.0,
-                0.0,
-                (self.near * self.far) / (self.near - self.far),
-                0.0,
-            ],
+            [0.0, 0.0, (self.near * self.far) / (self.near - self.far), 0.0],
         ]
     }
 
@@ -206,294 +132,67 @@ impl Camera {
         self.position[2] = self.target[2] + radius * phi.cos() * theta.sin();
     }
 
-    /// Gribb-Hartmann frustum plane extraction.
     pub fn extract_frustum_planes(&self) -> [[f32; 4]; 6] {
-        let vp = multiply_matrices(
-            self.get_view_matrix(),
-            self.get_projection_matrix(),
-        );
-
+        let vp = multiply_matrices(self.get_view_matrix(), self.get_projection_matrix());
         let row = |r: usize| [vp[0][r], vp[1][r], vp[2][r], vp[3][r]];
-        let r0 = row(0);
-        let r1 = row(1);
-        let r2 = row(2);
-        let r3 = row(3);
-
-        let add = |a: [f32; 4], b: [f32; 4]| [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]];
-        let sub = |a: [f32; 4], b: [f32; 4]| [a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]];
-        let norm = |mut p: [f32; 4]| {
-            let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
-            if len > 0.0 { p[0] /= len; p[1] /= len; p[2] /= len; p[3] /= len; }
+        let r0 = row(0); let r1 = row(1); let r2 = row(2); let r3 = row(3);
+        let add = |a: [f32;4], b: [f32;4]| [a[0]+b[0],a[1]+b[1],a[2]+b[2],a[3]+b[3]];
+        let sub = |a: [f32;4], b: [f32;4]| [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]];
+        let norm = |mut p: [f32;4]| {
+            let len = (p[0]*p[0]+p[1]*p[1]+p[2]*p[2]).sqrt();
+            if len > 0.0 { p[0]/=len; p[1]/=len; p[2]/=len; p[3]/=len; }
             p
         };
-
         [
-            norm(add(r3, r0)),
-            norm(sub(r3, r0)),
-            norm(add(r3, r1)),
-            norm(sub(r3, r1)),
-            norm(add(r3, r2)),
-            norm(sub(r3, r2)),
+            norm(add(r3, r0)), norm(sub(r3, r0)),
+            norm(add(r3, r1)), norm(sub(r3, r1)),
+            norm(add(r3, r2)), norm(sub(r3, r2)),
         ]
-    }
-}
-
-// ===== Chunk coordinate =====
-
-pub type ChunkCoord = (i32, i32);
-pub const CHUNK_SIZE: f32 = 64.0;
-pub const WORLD_GRID_RADIUS: i32 = 0;
-pub const MAX_STREAM_STARTS_PER_FRAME: usize = 4;
-
-// ===== Load State =====
-
-#[derive(Debug)]
-pub enum ChunkLoadState {
-    Unloaded,
-    Streaming {
-        vertex_ticket: TransferTicket,
-        index_ticket: TransferTicket,
-    },
-    Ready,
-}
-
-// ===== Chunk =====
-
-pub struct Chunk {
-    pub coord: ChunkCoord,
-    pub load_state: ChunkLoadState,
-
-    pub vertex_handle: Option<BufferHandle>,
-    pub index_handle: Option<BufferHandle>,
-
-    pub vertex_vk_buffer: Option<vk::Buffer>,
-    pub index_vk_buffer: Option<vk::Buffer>,
-
-    pub meshes: Vec<Mesh>,
-
-    pub aabb_min: [f32; 3],
-    pub aabb_max: [f32; 3],
-
-    pub total_vertex_count: u32,
-    pub total_index_count: u32,
-}
-
-impl Chunk {
-    pub fn new(coord: ChunkCoord, meshes: Vec<Mesh>) -> Self {
-        let mut total_vertex_count = 0u32;
-        let mut total_index_count = 0u32;
-        let mut aabb_min = [f32::MAX; 3];
-        let mut aabb_max = [f32::MIN; 3];
-
-        for mesh in &meshes {
-            total_vertex_count += mesh.vertices.len() as u32;
-            total_index_count += mesh.indices.len() as u32;
-            for v in &mesh.vertices {
-                let wp = transform_point(mesh.transform, v.position);
-                for i in 0..3 {
-                    aabb_min[i] = aabb_min[i].min(wp[i]);
-                    aabb_max[i] = aabb_max[i].max(wp[i]);
-                }
-            }
-        }
-
-        if meshes.is_empty() {
-            let cx = coord.0 as f32 * CHUNK_SIZE;
-            let cz = coord.1 as f32 * CHUNK_SIZE;
-            aabb_min = [cx, -1.0, cz];
-            aabb_max = [cx + CHUNK_SIZE, 1.0, cz + CHUNK_SIZE];
-        }
-
-        Self {
-            coord,
-            load_state: ChunkLoadState::Unloaded,
-            vertex_handle: None,
-            index_handle: None,
-            vertex_vk_buffer: None,
-            index_vk_buffer: None,
-            meshes,
-            aabb_min,
-            aabb_max,
-            total_vertex_count,
-            total_index_count,
-        }
-    }
-
-    pub fn is_visible(&self, frustum_planes: &[[f32; 4]; 6]) -> bool {
-        for plane in frustum_planes {
-            let px = if plane[0] >= 0.0 { self.aabb_max[0] } else { self.aabb_min[0] };
-            let py = if plane[1] >= 0.0 { self.aabb_max[1] } else { self.aabb_min[1] };
-            let pz = if plane[2] >= 0.0 { self.aabb_max[2] } else { self.aabb_min[2] };
-            if plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0.0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub fn is_ready(&self) -> bool {
-        matches!(self.load_state, ChunkLoadState::Ready)
-    }
-
-    pub fn is_unloaded(&self) -> bool {
-        matches!(self.load_state, ChunkLoadState::Unloaded)
-    }
-}
-
-// ===== Mesh =====
-
-pub struct Mesh {
-    pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
-    pub transform: [[f32; 4]; 4],
-    /// Index into the global MaterialLibrary.  0 = default PBR material.
-    pub material_id: u32,
-}
-
-impl Mesh {
-    pub fn create_cube() -> Self {
-        let face_normals: [[f32; 3]; 6] = [
-            [ 0.0,  0.0,  1.0],
-            [ 0.0,  0.0, -1.0],
-            [ 0.0,  1.0,  0.0],
-            [ 0.0, -1.0,  0.0],
-            [ 1.0,  0.0,  0.0],
-            [-1.0,  0.0,  0.0],
-        ];
-
-        let face_colors: [[f32; 3]; 6] = [
-            [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
-            [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0],
-        ];
-
-        let positions: [[f32; 3]; 8] = [
-            [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5],
-            [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
-            [ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5],
-            [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5],
-        ];
-
-        let face_data: [([usize; 4], [[f32; 2]; 4]); 6] = [
-            ([0,1,2,3], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-            ([4,5,6,7], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-            ([3,2,7,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-            ([5,4,1,0], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-            ([1,4,7,2], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-            ([5,0,3,6], [[0.0,1.0],[1.0,1.0],[1.0,0.0],[0.0,0.0]]),
-        ];
-
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-
-        for (face_idx, (pos_indices, uvs)) in face_data.iter().enumerate() {
-            let base = vertices.len() as u32;
-            let normal = face_normals[face_idx];
-            let color = face_colors[face_idx];
-
-            for (vi, &pos_idx) in pos_indices.iter().enumerate() {
-                vertices.push(Vertex::full(positions[pos_idx], normal, uvs[vi], color));
-            }
-            indices.extend([base, base+1, base+2, base+2, base+3, base]);
-        }
-
-        Self {
-            vertices,
-            indices,
-            transform: identity_matrix(),
-            material_id: 0,
-        }
     }
 }
 
 // ===== Scene =====
 
 pub struct Scene {
-    pub chunks: HashMap<ChunkCoord, Chunk>,
     pub camera: Camera,
     pub rotation: f32,
     pub frame_number: u64,
+    prev_camera_pos: [f32; 3],
 }
 
 impl Scene {
     pub fn new(aspect: f32) -> Self {
-        let mut chunks = HashMap::new();
-
-        for cx in -WORLD_GRID_RADIUS..=WORLD_GRID_RADIUS {
-            for cz in -WORLD_GRID_RADIUS..=WORLD_GRID_RADIUS {
-                let meshes = crate::worldgen::generate_chunk_meshes(cx, cz);
-                let chunk = Chunk::new((cx, cz), meshes);
-                chunks.insert((cx, cz), chunk);
-            }
-        }
-
-        println!(
-            "[Scene] Generated {} chunks ({}x{} grid), all Unloaded",
-            chunks.len(),
-            WORLD_GRID_RADIUS * 2 + 1,
-            WORLD_GRID_RADIUS * 2 + 1,
-        );
-
-        Self {
-            chunks,
-            camera: Camera::new(aspect),
-            rotation: 0.0,
-            frame_number: 0,
-        }
+        let camera = Camera::new(aspect);
+        let pos = camera.position;
+        Self { camera, rotation: 0.0, frame_number: 0, prev_camera_pos: pos }
     }
 
-    /// Phase 2: elevated orbit around world origin.
     pub fn update(&mut self, delta_time: f32) {
+        self.prev_camera_pos = self.camera.position;
         self.rotation += delta_time * ORBIT_SPEED_RAD_PER_SEC;
         self.frame_number += 1;
-
         let cos_r = self.rotation.cos();
         let sin_r = self.rotation.sin();
-
-        let center_x = 32.0; // chunk (0,0) center
+        let center_x = 32.0;
         let center_z = 32.0;
-
         self.camera.position = [
-            center_x + ORBIT_RADIUS * cos_r,
-            ORBIT_HEIGHT,
+            center_x + ORBIT_RADIUS * cos_r, ORBIT_HEIGHT,
             center_z + ORBIT_RADIUS * sin_r,
         ];
         self.camera.target = [center_x, TARGET_Y, center_z];
     }
 
-    /// Unloaded chunks sorted nearest-to-camera first.
-    pub fn unloaded_chunks_by_distance(&self) -> Vec<ChunkCoord> {
-        let cam_chunk = self.camera_chunk();
-        let mut coords: Vec<ChunkCoord> = self
-            .chunks
-            .iter()
-            .filter(|(_, c)| c.is_unloaded())
-            .map(|(&coord, _)| coord)
-            .collect();
-        coords.sort_by_key(|&(x, z)| {
-            let dx = (x - cam_chunk.0).abs();
-            let dz = (z - cam_chunk.1).abs();
-            dx * dx + dz * dz
-        });
-        coords
-    }
-
-    pub fn camera_chunk(&self) -> ChunkCoord {
-        (
-            (self.camera.position[0] / CHUNK_SIZE).floor() as i32,
-            (self.camera.position[2] / CHUNK_SIZE).floor() as i32,
-        )
-    }
-
-    pub fn visible_ready_chunks(&self, frustum: &[[f32; 4]; 6]) -> Vec<&Chunk> {
-        self.chunks.values().filter(|c| c.is_ready() && c.is_visible(frustum)).collect()
+    pub fn camera_velocity_xz(&self) -> [f32; 2] {
+        [
+            self.camera.position[0] - self.prev_camera_pos[0],
+            self.camera.position[2] - self.prev_camera_pos[2],
+        ]
     }
 
     pub fn get_ubo(&self, material_id: u32) -> UniformBufferObject {
         UniformBufferObject::new(
-            identity_matrix(),
-            self.camera.get_view_matrix(),
-            self.camera.get_projection_matrix(),
-            material_id,
+            identity_matrix(), self.camera.get_view_matrix(),
+            self.camera.get_projection_matrix(), material_id,
         )
     }
 }
@@ -501,35 +200,27 @@ impl Scene {
 // ===== Math helpers =====
 
 fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt();
+    let len = (v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt();
     if len > 0.0 { [v[0]/len, v[1]/len, v[2]/len] } else { v }
 }
 
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn cross3(a: [f32;3], b: [f32;3]) -> [f32;3] {
     [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
 }
 
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-}
+fn dot3(a: [f32;3], b: [f32;3]) -> f32 { a[0]*b[0]+a[1]*b[1]+a[2]*b[2] }
 
-fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
-}
+fn sub3(a: [f32;3], b: [f32;3]) -> [f32;3] { [a[0]-b[0], a[1]-b[1], a[2]-b[2]] }
 
-fn length3(v: [f32; 3]) -> f32 {
-    (v[0]*v[0] + v[1]*v[1] + v[2]*v[2]).sqrt()
-}
+fn length3(v: [f32; 3]) -> f32 { (v[0]*v[0]+v[1]*v[1]+v[2]*v[2]).sqrt() }
 
-pub fn identity_matrix() -> [[f32; 4]; 4] {
+pub fn identity_matrix() -> [[f32;4];4] {
     [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]]
 }
 
 pub fn create_rotation_matrix(angle: f32, axis: [f32; 3]) -> [[f32; 4]; 4] {
     let axis = normalize(axis);
-    let s = angle.sin();
-    let c = angle.cos();
-    let oc = 1.0 - c;
+    let s = angle.sin(); let c = angle.cos(); let oc = 1.0 - c;
     [
         [oc*axis[0]*axis[0]+c, oc*axis[0]*axis[1]-axis[2]*s, oc*axis[2]*axis[0]+axis[1]*s, 0.0],
         [oc*axis[0]*axis[1]+axis[2]*s, oc*axis[1]*axis[1]+c, oc*axis[1]*axis[2]-axis[0]*s, 0.0],
@@ -543,16 +234,8 @@ fn create_translation_matrix(t: [f32; 3]) -> [[f32; 4]; 4] {
     [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[t[0],t[1],t[2],1.0]]
 }
 
-pub fn multiply_matrices(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    let mut r = [[0.0; 4]; 4];
-    for i in 0..4 { for j in 0..4 { for k in 0..4 { r[i][j] += a[i][k] * b[k][j]; } } }
+pub fn multiply_matrices(a: [[f32;4];4], b: [[f32;4];4]) -> [[f32;4];4] {
+    let mut r = [[0.0;4];4];
+    for i in 0..4 { for j in 0..4 { for k in 0..4 { r[i][j] += a[i][k]*b[k][j]; } } }
     r
-}
-
-fn transform_point(m: [[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
-    [
-        m[0][0]*p[0] + m[1][0]*p[1] + m[2][0]*p[2] + m[3][0],
-        m[0][1]*p[0] + m[1][1]*p[1] + m[2][1]*p[2] + m[3][1],
-        m[0][2]*p[0] + m[1][2]*p[1] + m[2][2]*p[2] + m[3][2],
-    ]
 }
