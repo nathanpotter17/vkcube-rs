@@ -1,0 +1,117 @@
+// Phase 6 §6.1: Separable bilateral blur for HBAO
+// Compile: glslangValidator -V hbao_blur.comp -o compiled/hbao_blur.comp.spv
+//
+// Depth-aware Gaussian blur that smooths AO noise without bleeding
+// across geometric discontinuities.  Dispatched twice: once
+// horizontal (direction = 1,0), once vertical (direction = 0,1).
+//
+// Kernel radius = 4 pixels, sigma_spatial = 2.0.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---- Descriptor set ----
+
+layout(binding = 0, set = 0, r8) uniform readonly  image2D inputAO;
+layout(binding = 1, set = 0, r8) uniform writeonly image2D outputAO;
+layout(binding = 2, set = 0)     uniform sampler2D depthTexture;
+
+// ---- Push constants ----
+
+layout(push_constant) uniform BlurParams {
+    vec2  direction;    // (1,0) horizontal or (0,1) vertical
+    float sharpness;    // depth-weight sharpness (higher = sharper edges)
+    float _pad;
+    vec4  resolution;   // xy: screen size, zw: 1/screen size
+} blur;
+
+// ---- Constants ----
+
+const int   KERNEL_RADIUS = 4;
+const float SIGMA_SPATIAL = 2.0;
+
+// Pre-computed Gaussian weights for sigma=2, offsets 0..4.
+// w(i) = exp(-0.5 * i*i / sigma^2)
+const float WEIGHTS[5] = float[5](
+    1.0,            // offset 0
+    0.8824969,      // offset 1
+    0.6065307,      // offset 2
+    0.3246525,      // offset 3
+    0.1353353       // offset 4
+);
+
+// ---- Entry point ----
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = ivec2(blur.resolution.xy);
+
+    if (coord.x >= size.x || coord.y >= size.y)
+        return;
+
+    vec2 uv = (vec2(coord) + 0.5) * blur.resolution.zw;
+
+    float centerAO    = imageLoad(inputAO, coord).r;
+    float centerDepth = texture(depthTexture, uv).r;
+
+    // Background pixels pass through unblurred.
+    if (centerDepth >= 0.9999) {
+        imageStore(outputAO, coord, vec4(1.0));
+        return;
+    }
+
+    float totalWeight = WEIGHTS[0];
+    float totalAO     = centerAO * WEIGHTS[0];
+
+    ivec2 step = ivec2(blur.direction);
+
+    for (int i = 1; i <= KERNEL_RADIUS; ++i) {
+        float spatialWeight = WEIGHTS[i];
+
+        // Positive direction.
+        {
+            ivec2 sampleCoord = coord + step * i;
+            if (sampleCoord.x >= 0 && sampleCoord.x < size.x &&
+                sampleCoord.y >= 0 && sampleCoord.y < size.y)
+            {
+                vec2  sUV    = (vec2(sampleCoord) + 0.5) * blur.resolution.zw;
+                float sAO    = imageLoad(inputAO, sampleCoord).r;
+                float sDepth = texture(depthTexture, sUV).r;
+
+                // Depth-aware weight: reduce contribution when depth
+                // differs significantly (geometric edge).
+                float depthDiff    = abs(centerDepth - sDepth);
+                float depthWeight  = exp(-depthDiff * depthDiff
+                                         * blur.sharpness * blur.sharpness);
+                float w = spatialWeight * depthWeight;
+
+                totalAO     += sAO * w;
+                totalWeight += w;
+            }
+        }
+
+        // Negative direction.
+        {
+            ivec2 sampleCoord = coord - step * i;
+            if (sampleCoord.x >= 0 && sampleCoord.x < size.x &&
+                sampleCoord.y >= 0 && sampleCoord.y < size.y)
+            {
+                vec2  sUV    = (vec2(sampleCoord) + 0.5) * blur.resolution.zw;
+                float sAO    = imageLoad(inputAO, sampleCoord).r;
+                float sDepth = texture(depthTexture, sUV).r;
+
+                float depthDiff    = abs(centerDepth - sDepth);
+                float depthWeight  = exp(-depthDiff * depthDiff
+                                         * blur.sharpness * blur.sharpness);
+                float w = spatialWeight * depthWeight;
+
+                totalAO     += sAO * w;
+                totalWeight += w;
+            }
+        }
+    }
+
+    float result = totalAO / max(totalWeight, 0.0001);
+    imageStore(outputAO, coord, vec4(result));
+}

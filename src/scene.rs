@@ -375,3 +375,32 @@ pub fn multiply_matrices(a: [[f32;4];4], b: [[f32;4];4]) -> [[f32;4];4] {
     for i in 0..4 { for j in 0..4 { for k in 0..4 { r[i][j] += a[i][k]*b[k][j]; } } }
     r
 }
+
+/// Compute the inverse of a perspective projection matrix.
+/// Exploits the sparse structure of standard projection matrices
+/// for an exact, branch-free inverse.
+pub fn invert_projection(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    // Standard perspective matrix layout (row-major as stored):
+    //   [a  0  0  0]    a = m[0][0]
+    //   [0  b  0  0]    b = m[1][1]
+    //   [0  0  c  d]    c = m[2][2], d = m[2][3]
+    //   [0  0  e  0]    e = m[3][2]
+    //
+    // Inverse:
+    //   [1/a  0   0     0   ]
+    //   [ 0  1/b  0     0   ]
+    //   [ 0   0   0    1/e  ]
+    //   [ 0   0  1/d  -c/(d*e)]
+    let a = m[0][0];
+    let b = m[1][1];
+    let c = m[2][2];
+    let d = m[2][3];
+    let e = m[3][2];
+    let mut inv = [[0.0f32; 4]; 4];
+    inv[0][0] = 1.0 / a;
+    inv[1][1] = 1.0 / b;
+    inv[2][3] = 1.0 / e;
+    inv[3][2] = 1.0 / d;
+    inv[3][3] = -c / (d * e);
+    inv
+}

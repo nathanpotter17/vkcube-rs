@@ -85,6 +85,7 @@ impl DescriptorLayouts {
         // Binding 8: BRDF LUT               (combined image sampler)    [Phase 3]
         // Binding 9: Irradiance cube map    (combined image sampler)    [Phase 3]
         // Binding 10: Pre-filtered env map  (combined image sampler)    [Phase 3]
+        // Binding 11: Screen-space AO texture (HBAO output) [Phase 6]
         let set0_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -158,6 +159,12 @@ impl DescriptorLayouts {
             // Phase 3: Pre-filtered env map
             vk::DescriptorSetLayoutBinding::default()
                 .binding(10)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Phase 6: Screen-space AO texture (HBAO output)
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(11)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -1182,6 +1189,8 @@ impl FrameDescriptors {
         irradiance_sampler: vk::Sampler,
         prefiltered_view: vk::ImageView,
         prefiltered_sampler: vk::Sampler,
+        ao_screen_view: vk::ImageView,
+        ao_screen_sampler: vk::Sampler,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let n = MAX_FRAMES_IN_FLIGHT as u32;
 
@@ -1195,10 +1204,10 @@ impl FrameDescriptors {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(n * 5),
-            // Set 0 GI samplers (3) + Set 2 shadow samplers (2: cube + sun)
+            // Set 0 GI samplers (3) + Set 2 shadow samplers + 1 AO (2: cube + sun)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(n * 5),
+                .descriptor_count(n * 6),
             // Set 3: 1× UNIFORM_BUFFER_DYNAMIC per frame
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
@@ -1302,6 +1311,11 @@ impl FrameDescriptors {
                 .sampler(prefiltered_sampler)
                 .image_view(prefiltered_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            
+            let ao_screen_info = vk::DescriptorImageInfo::default()
+                .sampler(ao_screen_sampler)
+                .image_view(ao_screen_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
             let set0_writes = [
                 vk::WriteDescriptorSet::default()
@@ -1360,6 +1374,11 @@ impl FrameDescriptors {
                     .dst_binding(10)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(std::slice::from_ref(&prefiltered_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(11)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&ao_screen_info)),
             ];
             unsafe { device.update_descriptor_sets(&set0_writes, &[]) };
 

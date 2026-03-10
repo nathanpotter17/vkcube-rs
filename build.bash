@@ -23,6 +23,8 @@ shaders=(
     "cluster_assign.comp:cluster_assign.comp.spv"
     "probe_capture.frag:probe_capture.frag.spv"
     "sh_project.comp:sh_project.comp.spv"
+    "hbao.comp:hbao.comp.spv"
+    "hbao_blur.comp:hbao_blur.comp.spv"
 )
 
 set_avx2() {

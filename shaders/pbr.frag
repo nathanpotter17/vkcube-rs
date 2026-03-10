@@ -134,6 +134,8 @@ layout(set = 0, binding = 8)  uniform sampler2D   brdfLUT;
 layout(set = 0, binding = 9)  uniform samplerCube irradianceMap;
 layout(set = 0, binding = 10) uniform samplerCube prefilteredEnvMap;
 
+layout(set = 0, binding = 11) uniform sampler2D aoScreen;
+
 // ---- Descriptor Set 1: Bindless textures ----
 
 layout(set = 1, binding = 0) uniform sampler2D textures[];
@@ -511,7 +513,10 @@ void main() {
     vec3 indirectSpecular = sampleSpecularIBL(R, roughness, F_env, brdf);
 
     // ---- Compose ----
-    vec3 ambient = (diffuseGI + indirectSpecular) * ao;
+    // Screen-space AO modulates the ambient term.
+    vec2 screenUV = gl_FragCoord.xy / vec2(cluster.screen_size);
+    float ao_screen = texture(aoScreen, screenUV).r;
+    vec3 ambient = (diffuseGI + indirectSpecular) * ao * ao_screen;
 
     // ---- Phase 4: Emissive texture multiplication ----
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;

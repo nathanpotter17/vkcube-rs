@@ -28,6 +28,7 @@ use crate::world::{
     demo_transform, make_cube, make_pyramid, make_column,
 };
 use crate::loader::GltfLoader;
+use crate::postprocess::HbaoPass;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -196,6 +197,7 @@ pub struct Renderer {
     /// visibility and explicit cleanup.  These live outside the sector
     /// batching path (each mesh owns its own VB/IB).
     gltf_buffer_handles: Vec<BufferHandle>,
+    hbao_pass: HbaoPass,
 }
 
 impl Renderer {
@@ -357,6 +359,8 @@ impl Renderer {
         let cluster_comp_spv: &[u8] = include_bytes!("../shaders/compiled/cluster_assign.comp.spv");
         let probe_capture_frag_spv: &[u8] = include_bytes!("../shaders/compiled/probe_capture.frag.spv");
         let sh_project_comp_spv: &[u8] = include_bytes!("../shaders/compiled/sh_project.comp.spv");
+        let hbao_comp_spv: &[u8] = include_bytes!("../shaders/compiled/hbao.comp.spv");
+        let hbao_blur_comp_spv: &[u8] = include_bytes!("../shaders/compiled/hbao_blur.comp.spv");
 
         let probe_bake_target = ProbeBakeTarget::new(
             &device, &memory_ctx.allocator, render_passes.probe_capture,
@@ -370,6 +374,19 @@ impl Renderer {
             cluster_comp_spv, probe_capture_frag_spv)?;
         let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
             device_ctx.depth_image_view, device_ctx.swapchain_extent)?;
+
+        // HBAO pass.
+        let inv_proj = crate::scene::invert_projection(scene.camera.get_projection_matrix());
+        let mut hbao_pass = HbaoPass::new(
+            &device,
+            &mut memory_ctx.allocator,
+            device_ctx.depth_image_view,
+            device_ctx.swapchain_extent,
+            scene.camera.get_projection_matrix(),
+            inv_proj,
+            hbao_comp_spv,
+            hbao_blur_comp_spv,
+        )?;
 
         let global_ubo_size = std::mem::size_of::<GlobalUbo>() as u64;
         let cluster_params_size = std::mem::size_of::<ClusterParamsUbo>() as u64;
@@ -388,6 +405,7 @@ impl Renderer {
             gi_resources.brdf_lut_view, gi_resources.brdf_lut_sampler,
             gi_resources.irradiance_view, gi_resources.irradiance_sampler,
             gi_resources.prefiltered_view, gi_resources.prefiltered_sampler,
+            hbao_pass.ao_sampled_view, hbao_pass.ao_sampler,
         )?;
 
         let command_buffers = Self::allocate_command_buffers(&device, device_ctx.command_pool)?;
@@ -459,7 +477,7 @@ impl Renderer {
             spawned_geometry_count: 0,
             next_dynamic_sector: 0,
             deferred_frees: Vec::new(),
-            gltf_buffer_handles,
+            gltf_buffer_handles, hbao_pass,
         })
     }
 
@@ -1094,6 +1112,17 @@ impl Renderer {
             self.device.cmd_end_render_pass(cmd);
 
             // ============================================================
+            //  PASS 1.5: HBAO (Phase 6)
+            // ============================================================
+            //
+            // Transition depth to read-only for compute sampling,
+            // dispatch HBAO + bilateral blur, then transition depth
+            // back to attachment for the lighting pass.
+            HbaoPass::barrier_depth_to_read(&self.device, cmd, device_ctx.depth_image);
+            self.hbao_pass.dispatch(&self.device, cmd);
+            HbaoPass::barrier_depth_to_attachment(&self.device, cmd, device_ctx.depth_image);
+
+            // ============================================================
             //  PASS 2: Cluster Assignment Compute
             // ============================================================
             self.device.cmd_fill_buffer(cmd, self.lighting_buffers.index_ssbo_buffers[self.current_frame], 0, 16, 0);
@@ -1326,6 +1355,15 @@ impl Renderer {
         self.framebuffers = PassFramebuffers::new(&self.device, &self.render_passes,
             &device_ctx.swapchain_image_views, device_ctx.depth_image_view, device_ctx.swapchain_extent)?;
         self.scene.camera.update_aspect(device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height);
+        let inv_proj = crate::scene::invert_projection(self.scene.camera.get_projection_matrix());
+        self.hbao_pass.resize(
+            &self.device,
+            &mut self.memory_ctx.allocator,
+            device_ctx.depth_image_view,
+            device_ctx.swapchain_extent,
+            self.scene.camera.get_projection_matrix(),
+            inv_proj,
+        )?;
         Ok(())
     }
 
@@ -1365,6 +1403,7 @@ impl Drop for Renderer {
         self.shadow_atlas.destroy(&self.device);
         self.sun_shadow.destroy(&self.device);
         self.gi_resources.destroy(&self.device);
+        self.hbao_pass.destroy(&self.device, &mut self.memory_ctx.allocator);
         self.probe_bake_target.destroy(&self.device);
         // probe_grid SSBO freed via allocator on MemoryContext drop
         self.lighting_buffers.destroy(&mut self.memory_ctx.allocator);
