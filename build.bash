@@ -29,6 +29,9 @@ shaders=(
     "skybox.frag:skybox.frag.spv"
     "overlay.vert:overlay.vert.spv"
     "overlay.frag:overlay.frag.spv"
+    "cull.comp:cull.comp.spv"
+    "sun_shadow.frag:sun_shadow.frag.spv"
+    "sun_shadow.vert:sun_shadow.vert.spv"
 )
 
 set_avx2() {

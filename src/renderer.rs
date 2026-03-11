@@ -1,3 +1,14 @@
+//! Phase 8A: GPU-Driven Rendering
+//!
+//! This module replaces CPU frustum culling (~8000 per-frame ring buffer pushes)
+//! with GPU compute-based culling and indirect draw commands.
+//!
+//! Key changes from pre-8A:
+//! - PerDrawUbo removed (set 3 now binds object SSBO)
+//! - DrawCommand CPU lists removed (cull shader writes VkDrawIndexedIndirectCommand)
+//! - record_draw_list() removed (replaced by cmd_draw_indexed_indirect per buffer group)
+//! - GpuCullResources manages object SSBO, indirect buffers, cull compute pipeline
+
 use ash::{vk, Device};
 use std::collections::HashMap;
 use std::path::Path;
@@ -5,12 +16,14 @@ use crate::device::DeviceContext;
 use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
                  SHProjectPushConstants, MAX_PROBE_BAKES_PER_FRAME,
                  PROBE_CAPTURE_NEAR, PROBE_CAPTURE_FAR, PROBE_CAPTURE_SIZE};
+use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants, BufferGroup,
+                       MAX_BUFFER_GROUPS, INDIRECT_COMMAND_STRIDE};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightManager, LightType,
     ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, SunShadow,
     compute_sun_shadow_matrices,
     CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE,
-    SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY,
+    SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY, SUN_DIR,
 };
 use crate::material::{MaterialData, MaterialLibrary, MaterialSsbo};
 use crate::memory::{BufferHandle, GpuAllocator, MemoryContext, MAX_FRAMES_IN_FLIGHT};
@@ -18,10 +31,12 @@ use crate::pipeline::{
     DescriptorLayouts, FrameDescriptors, FrameLightingBuffers, PassFramebuffers,
     Pipelines, RenderPasses,
 };
-use crate::scene::{InputAction, InputState, Scene, PerDrawUbo, Vertex};
+// Phase 8A: PerDrawUbo removed — SSBO replaces per-draw UBO
+// Phase 8A: DrawCommand removed — GPU cull writes indirect commands
+use crate::scene::{InputAction, InputState, Scene, Vertex};
 use crate::texture::TextureManager;
 use crate::world::{
-    Aabb, DrawCommand, LodChain, MeshRange, ObjectDescriptor, RenderFlags,
+    Aabb, LodChain, MeshRange, ObjectDescriptor, RenderFlags,
     RenderObjectId, Sector, SectorCoord, SectorState, World,
     EVICTION_RADIUS, GROUND_TILE_SIZE, MAX_SECTOR_STARTS_PER_FRAME,
     SECTOR_SIZE, STREAMING_RADIUS, generate_sector_objects,
@@ -38,42 +53,28 @@ struct GlobalUbo {
     view: [[f32; 4]; 4],
     proj: [[f32; 4]; 4],
     camera_pos: [f32; 4],
-    sun_light_vp: [[f32; 4]; 4],  // sun shadow light-space view-projection
-    sun_direction: [f32; 4],       // xyz = normalized direction, w = shadow_enabled (1.0/0.0)
+    sun_light_vp: [[f32; 4]; 4],
+    sun_direction: [f32; 4],
 }
 
 // ====================================================================
 //  Dynamic spawn limits and PRNG
 // ====================================================================
 
-/// Max user-spawned point lights (L key).
 const MAX_SPAWNED_LIGHTS: usize = 32;
-/// Max user-spawned geometry objects (G key).
 const MAX_SPAWNED_GEOMETRY: usize = 50;
-/// Spawn radius around camera (XZ plane).
 const SPAWN_RADIUS: f32 = 40.0;
-/// Spawn height range for lights.
 const SPAWN_LIGHT_HEIGHT_MIN: f32 = 3.0;
 const SPAWN_LIGHT_HEIGHT_MAX: f32 = 15.0;
 
-/// Sentinel sector base for dynamic spawns (high i32 range to avoid collision).
 const DYNAMIC_SECTOR_BASE: i32 = i32::MAX - 5000;
-
-/// Sentinel sector base for glTF asset loads.  Must be >= DYNAMIC_SECTOR_BASE
-/// so existing eviction filters (`c.0 < DYNAMIC_SECTOR_BASE`) protect these sectors.
 const GLTF_SECTOR_BASE: i32 = i32::MAX - 4000;
 
-/// Deferred buffer deletion entry.  Buffers freed during eviction may
-/// still be referenced by in-flight command buffers.  We delay the
-/// actual `free_buffer` call until `MAX_FRAMES_IN_FLIGHT` frames have
-/// elapsed, guaranteeing all referencing submissions have completed
-/// their fence wait.
 struct DeferredFree {
     handle: BufferHandle,
     frame: u64,
 }
 
-/// Minimal xorshift64 PRNG — no crate dependency.
 struct SimpleRng { s: u64 }
 
 impl SimpleRng {
@@ -84,15 +85,12 @@ impl SimpleRng {
         self.s ^= self.s << 17;
         self.s
     }
-    /// Uniform f32 in [0, 1).
     fn f32(&mut self) -> f32 {
         (self.next_u64() & 0xFF_FFFF) as f32 / 16_777_216.0
     }
-    /// Uniform f32 in [lo, hi).
     fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + self.f32() * (hi - lo)
     }
-    /// Pick a random element from a slice.
     fn pick<T: Copy>(&mut self, items: &[T]) -> T {
         items[(self.next_u64() as usize) % items.len()]
     }
@@ -102,7 +100,6 @@ impl SimpleRng {
 //  Per-sector pending upload
 // ====================================================================
 
-/// Per-object metadata stored while the sector's batch upload is in-flight.
 struct PendingObject {
     first_index: u32,
     index_count: u32,
@@ -113,8 +110,6 @@ struct PendingObject {
     bounds: Aabb,
 }
 
-/// One in-flight upload per sector — a single vertex buffer + index buffer
-/// containing ALL objects concatenated.
 struct PendingSectorUpload {
     sector: SectorCoord,
     vertex_handle: BufferHandle,
@@ -125,7 +120,6 @@ struct PendingSectorUpload {
     index_ticket: crate::memory::TransferTicket,
     vertex_size: u64,
     index_size: u64,
-    /// Per-object metadata for creating RenderObjects on completion.
     objects: Vec<PendingObject>,
 }
 
@@ -153,15 +147,16 @@ pub struct Renderer {
     sun_shadow: SunShadow,
     sun_direction: [f32; 3],
 
-    /// Global indices into LightManager for lights that orbit each frame.
     dynamic_light_indices: Vec<usize>,
-    /// Accumulated time for dynamic light animation (independent of camera).
     dynamic_light_time: f32,
 
     // Phase 3: Global Illumination
     probe_grid: ProbeGrid,
     gi_resources: GIResources,
     probe_bake_target: ProbeBakeTarget,
+
+    // Phase 8A: GPU-driven culling resources
+    gpu_cull: GpuCullResources,
 
     descriptor_layouts: DescriptorLayouts,
     render_passes: RenderPasses,
@@ -178,29 +173,15 @@ pub struct Renderer {
     current_frame: usize,
     global_frame: u64,
 
-    // ---- Dynamic spawn state ----
     rng: SimpleRng,
-    /// Number of user-spawned point lights so far.
     spawned_light_count: usize,
-    /// Sentinel sector coord for spawned light tracking.
     spawned_light_sector: SectorCoord,
-    /// Number of user-spawned geometry objects so far.
     spawned_geometry_count: usize,
-    /// Incrementing sector-coord offset for each geometry spawn batch.
     next_dynamic_sector: i32,
 
-    // ---- Deferred buffer deletion queue ----
-    /// Buffers queued for delayed free.  Drained after fence wait each
-    /// frame once `global_frame - entry.frame >= MAX_FRAMES_IN_FLIGHT`.
     deferred_frees: Vec<DeferredFree>,
-
-    // ---- glTF asset buffer tracking ----
-    /// Buffer handles from glTF asset loads.  Tracked for VRAM budget
-    /// visibility and explicit cleanup.  These live outside the sector
-    /// batching path (each mesh owns its own VB/IB).
     gltf_buffer_handles: Vec<BufferHandle>,
 
-    // ---- G-buffer view-space normal (for HBAO) ----
     normal_image: vk::Image,
     normal_memory: vk::DeviceMemory,
     normal_view: vk::ImageView,
@@ -223,7 +204,6 @@ impl Renderer {
         let mut world = World::new();
 
         // ---- Materials ----
-
         let mut material_library = MaterialLibrary::new();
         material_library.add("ground", MaterialData {
             base_color:[0.35,0.28,0.18,1.0], roughness:0.92, metallic:0.0, ..Default::default() });
@@ -255,8 +235,24 @@ impl Renderer {
         let mut texture_manager = TextureManager::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
 
         // ================================================================
-        //  Phase 4: glTF asset loading — test model at world center
+        //  glTF asset loading
         // ================================================================
+        // Phase 8A: Store mesh info for later registration with gpu_cull
+        #[allow(dead_code)]
+        struct GltfMeshInfo {
+            vertex_buffer: vk::Buffer,
+            index_buffer: vk::Buffer,
+            object_id: RenderObjectId,
+            model: [[f32; 4]; 4],
+            aabb_min: [f32; 3],
+            aabb_max: [f32; 3],
+            first_index: u32,
+            index_count: u32,
+            vertex_offset: i32,
+            material_id: u32,
+            flags: RenderFlags,
+        }
+        let mut gltf_meshes: Vec<GltfMeshInfo> = Vec::new();
         let mut gltf_buffer_handles: Vec<BufferHandle> = Vec::new();
         {
             let gltf_path = std::path::Path::new("assets/models/ubg/utility_box_02_1k.gltf");
@@ -270,7 +266,6 @@ impl Renderer {
                     device_ctx.queue,
                 ) {
                     Ok(asset) => {
-                        // Sentinel sector for glTF assets — never evicted.
                         let gltf_sector: SectorCoord = (GLTF_SECTOR_BASE, 0);
                         world.sectors.entry(gltf_sector)
                             .or_insert_with(|| Sector::new(gltf_sector));
@@ -278,13 +273,9 @@ impl Renderer {
                             sec.state = SectorState::Ready;
                         }
 
-                        // Place the model at the exact center of the scene.
-                        // identity_matrix() → position (0, 0, 0), scale 1, no rotation.
                         let model_transform = crate::scene::identity_matrix();
 
                         for mesh in &asset.meshes {
-                            // Each LoadedMesh has its own VB/IB (not sector-batched).
-                            // MeshRange starts at offset 0 within each buffer.
                             let mesh_range = MeshRange {
                                 vertex_buffer: mesh.vertex_alloc.buffer,
                                 index_buffer: mesh.index_alloc.buffer,
@@ -293,8 +284,6 @@ impl Renderer {
                                 vertex_offset: 0,
                             };
 
-                            // Compute world-space AABB from the mesh's local AABB
-                            // transformed by the model matrix.
                             let bounds = Aabb::new(
                                 [
                                     mesh.aabb_min[0] + model_transform[3][0],
@@ -310,7 +299,7 @@ impl Renderer {
 
                             let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
 
-                            world.add_object(
+                            let obj_id = world.add_object(
                                 gltf_sector,
                                 bounds,
                                 LodChain::single(mesh_range),
@@ -319,15 +308,39 @@ impl Renderer {
                                 flags,
                             );
 
-                            // Track buffer handles for VRAM budget visibility.
+                            // Phase 8A: Store info for gpu_cull registration
+                            gltf_meshes.push(GltfMeshInfo {
+                                vertex_buffer: mesh.vertex_alloc.buffer,
+                                index_buffer: mesh.index_alloc.buffer,
+                                object_id: obj_id,
+                                model: model_transform,
+                                aabb_min: bounds.min,
+                                aabb_max: bounds.max,
+                                first_index: 0,
+                                index_count: mesh.index_count,
+                                vertex_offset: 0,
+                                material_id: mesh.material_id,
+                                flags,
+                            });
+
                             memory_ctx.budget.track(mesh.vertex_alloc.handle, mesh.vertex_alloc.size, 0);
                             memory_ctx.budget.track(mesh.index_alloc.handle, mesh.index_alloc.size, 0);
                             gltf_buffer_handles.push(mesh.vertex_alloc.handle);
                             gltf_buffer_handles.push(mesh.index_alloc.handle);
                         }
 
+                        // Phase 8A: Store VB/IB in sector for buffer group tracking
+                        if let Some(mesh) = asset.meshes.first() {
+                            if let Some(sec) = world.sectors.get_mut(&gltf_sector) {
+                                sec.vertex_handle = Some(mesh.vertex_alloc.handle);
+                                sec.index_handle = Some(mesh.index_alloc.handle);
+                                sec.vertex_buffer = Some(mesh.vertex_alloc.buffer);
+                                sec.index_buffer = Some(mesh.index_alloc.buffer);
+                            }
+                        }
+
                         println!(
-                            "[Renderer] glTF '{}' loaded: {} meshes, {} materials, {} textures → placed at world center",
+                            "[Renderer] glTF '{}' loaded: {} meshes, {} materials, {} textures",
                             gltf_path.display(),
                             asset.meshes.len(),
                             asset.material_names.len(),
@@ -338,12 +351,9 @@ impl Renderer {
                         eprintln!("[Renderer] glTF load failed for '{}': {}", gltf_path.display(), e);
                     }
                 }
-            } else {
-                println!("[Renderer] glTF test asset '{}' not found — skipping", gltf_path.display());
             }
         }
 
-        // Re-upload material SSBO if glTF loading added new materials.
         if material_library.is_dirty() {
             material_ssbo.upload(&material_library);
             material_library.clear_dirty();
@@ -357,11 +367,36 @@ impl Renderer {
         let sun_shadow = SunShadow::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
         let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
 
-        // Phase 3: Global Illumination resources.
         let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
         let hdr_path: Option<&Path> = Some(Path::new("assets/park1k.hdr"));
         let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue, hdr_path)?;
-        
+
+        // Phase 8A: Initialize GPU culling resources
+        let mut gpu_cull = GpuCullResources::new(&device, &mut memory_ctx.allocator)?;
+
+        // Phase 8A: Register glTF meshes with gpu_cull (loaded before gpu_cull was created)
+        for mesh_info in &gltf_meshes {
+            let buffer_group = gpu_cull.register_buffer_group(
+                mesh_info.vertex_buffer,
+                mesh_info.index_buffer,
+            );
+
+            let gpu_data = GpuObjectData::new(
+                mesh_info.model,
+                mesh_info.aabb_min,
+                mesh_info.aabb_max,
+                mesh_info.first_index,
+                mesh_info.index_count,
+                mesh_info.vertex_offset,
+                mesh_info.material_id,
+                buffer_group,
+                mesh_info.flags,
+            );
+
+            gpu_cull.queue_dirty(mesh_info.object_id.0, gpu_data);
+            gpu_cull.total_alive = gpu_cull.total_alive.max(mesh_info.object_id.0 + 1);
+        }
+
         let vert_spv = include_bytes!("../shaders/compiled/basic.vert.spv");
         let frag_spv = include_bytes!("../shaders/compiled/basic.frag.spv");
         let depth_vert_spv: &[u8] = include_bytes!("../shaders/compiled/depth.vert.spv");
@@ -377,6 +412,8 @@ impl Renderer {
         let skybox_frag_spv: &[u8] = include_bytes!("../shaders/compiled/skybox.frag.spv");
         let overlay_vert_spv: &[u8] = include_bytes!("../shaders/compiled/overlay.vert.spv");
         let overlay_frag_spv: &[u8] = include_bytes!("../shaders/compiled/overlay.frag.spv");
+        let sun_shadow_vert_spv: &[u8] = include_bytes!("../shaders/compiled/sun_shadow.vert.spv");
+        let sun_shadow_frag_spv: &[u8] = include_bytes!("../shaders/compiled/sun_shadow.frag.spv");
 
         let probe_bake_target = ProbeBakeTarget::new(
             &device, &memory_ctx.allocator, render_passes.probe_capture,
@@ -387,9 +424,9 @@ impl Renderer {
 
         let pipelines = Pipelines::new(&device, &descriptor_layouts, &render_passes,
             vert_spv, frag_spv, depth_vert_spv, depth_frag_spv, shadow_vert_spv, shadow_frag_spv,
-            cluster_comp_spv, probe_capture_frag_spv, skybox_vert_spv, skybox_frag_spv)?;
+            cluster_comp_spv, probe_capture_frag_spv, skybox_vert_spv, skybox_frag_spv,
+            sun_shadow_vert_spv, sun_shadow_frag_spv)?;
 
-        // G-buffer view-space normal — written by depth pre-pass, read by HBAO.
         let (normal_image, normal_memory, normal_view) = Self::create_normal_image(
             &device, &memory_ctx.allocator,
             device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height,
@@ -398,7 +435,6 @@ impl Renderer {
         let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
             device_ctx.depth_image_view, normal_view, device_ctx.swapchain_extent)?;
 
-        // HBAO pass — receives both depth and normal views for compute sampling.
         let inv_proj = crate::scene::invert_projection(scene.camera.get_projection_matrix());
         let mut hbao_pass = HbaoPass::new(
             &device,
@@ -430,16 +466,16 @@ impl Renderer {
 
         let global_ubo_size = std::mem::size_of::<GlobalUbo>() as u64;
         let cluster_params_size = std::mem::size_of::<ClusterParamsUbo>() as u64;
-        let per_draw_ubo_size = std::mem::size_of::<PerDrawUbo>() as u64;
+        // Phase 8A: per_draw_ubo_size removed — SSBO replaces per-draw UBO
         let material_ssbo_size = (material_library.count() * std::mem::size_of::<MaterialData>()) as u64;
         let probe_grid_params_size = std::mem::size_of::<GpuProbeGridParams>() as u64;
 
+        // Phase 8A: per_draw_ubo_range parameter removed from FrameDescriptors::new()
         let frame_descriptors = FrameDescriptors::new(&device, &descriptor_layouts, memory_ctx.ring.buffer,
-            global_ubo_size, cluster_params_size, per_draw_ubo_size,
+            global_ubo_size, cluster_params_size,
             material_ssbo.buffer, material_ssbo_size.max(128),
             &lighting_buffers, shadow_atlas.sampling_view, shadow_atlas.shadow_sampler,
             sun_shadow.sampling_view, sun_shadow.sampler,
-            // Phase 3: GI descriptor params
             probe_grid.ssbo_buffer(), probe_grid.ssbo_size(),
             probe_grid_params_size,
             gi_resources.brdf_lut_view, gi_resources.brdf_lut_sampler,
@@ -460,14 +496,10 @@ impl Renderer {
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?);
         }}
 
-        // Register a global directional sun light.
-        let sun_dir = crate::scene::normalize([0.4, -0.7, 0.3]);
+        let sun_dir = crate::scene::normalize(SUN_DIR);
         let sun_light = Light::directional(sun_dir, SUN_COLOR, SUN_INTENSITY);
         light_manager.register((i32::MAX, i32::MAX), vec![sun_light]);
 
-        // ---- Demo: Dynamic orbiting lights ----
-        // Registered under a sentinel sector, tracked for per-frame position updates.
-        // Speeds (0.37, -0.53, 0.71 rad/s) are all distinct primes for visual variety.
         let dynamic_sector: (i32, i32) = (i32::MAX - 2, i32::MAX - 2);
         let dynamic_light_indices;
         {
@@ -480,20 +512,16 @@ impl Renderer {
             dynamic_light_indices = light_manager.register(dynamic_sector, vec![dl1, dl2, dl3]);
         }
 
-        // Sentinel sector for user-spawned lights.
         let spawned_light_sector: SectorCoord = (i32::MAX - 3, i32::MAX - 3);
 
-        // Seed RNG from system time (coarse but sufficient for spawn scatter).
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(42);
 
         println!(
-            "[Renderer] Scene initialized: ground + {} animated lights. {} materials, {} SH probes.  \
-             Keybinds: L=light (max {}), G=geometry (max {})",
-            dynamic_light_indices.len(), material_library.count(),
-            probe_grid.probe_count(), MAX_SPAWNED_LIGHTS, MAX_SPAWNED_GEOMETRY,
+            "[Renderer] Phase 8A GPU-driven culling initialized. {} materials, {} probes.",
+            material_library.count(), probe_grid.probe_count(),
         );
 
         Ok(Self {
@@ -507,6 +535,7 @@ impl Renderer {
             dynamic_light_indices,
             dynamic_light_time: 0.0,
             probe_grid, gi_resources, probe_bake_target,
+            gpu_cull,
             descriptor_layouts, render_passes, pipelines, framebuffers,
             frame_descriptors, command_buffers,
             image_available, render_finished, in_flight_fences,
@@ -565,12 +594,9 @@ impl Renderer {
         }
     }
 
-    /// Concatenate all object vertices/indices into ONE vertex buffer +
-    /// ONE index buffer, upload via async transfer, track per-object offsets.
     fn upload_sector_batch(
         &mut self, sector: SectorCoord, descriptors: Vec<crate::world::ObjectDescriptor>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Concatenate all vertices and indices.
         let mut all_verts: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
         let mut objects: Vec<PendingObject> = Vec::new();
@@ -590,12 +616,10 @@ impl Renderer {
             });
         }
 
-        // Upload ONE vertex buffer.
         let (valloc, vticket) = self.memory_ctx.upload_async_typed(
             &all_verts, vk::BufferUsageFlags::VERTEX_BUFFER,
         )?;
 
-        // Upload ONE index buffer.
         let (ialloc, iticket) = match self.memory_ctx.upload_async_typed(
             &all_indices, vk::BufferUsageFlags::INDEX_BUFFER,
         ) {
@@ -613,6 +637,8 @@ impl Renderer {
             sec.state = SectorState::Streaming;
             sec.vertex_handle = Some(valloc.handle);
             sec.index_handle = Some(ialloc.handle);
+            sec.vertex_buffer = Some(valloc.buffer);
+            sec.index_buffer = Some(ialloc.buffer);
         }
 
         self.pending_sectors.push(PendingSectorUpload {
@@ -627,10 +653,11 @@ impl Renderer {
         Ok(())
     }
 
+    /// Phase 8A: poll_uploads now registers buffer groups with gpu_cull
+    /// and queues GpuObjectData for SSBO upload.
     fn poll_uploads(&mut self) {
         let mut completed: Vec<PendingSectorUpload> = Vec::new();
 
-        // Extract ref to transfer queue — disjoint from pending_sectors.
         let transfer = &self.memory_ctx.transfer;
 
         self.pending_sectors.retain_mut(|upload| {
@@ -654,6 +681,9 @@ impl Renderer {
             let vb = upload.vertex_buffer;
             let ib = upload.index_buffer;
 
+            // Phase 8A: Register buffer group with GPU cull system
+            let buffer_group = self.gpu_cull.register_buffer_group(vb, ib);
+
             for pobj in &upload.objects {
                 let mesh_range = MeshRange {
                     vertex_buffer: vb, index_buffer: ib,
@@ -661,11 +691,27 @@ impl Renderer {
                     index_count: pobj.index_count,
                     vertex_offset: pobj.vertex_offset,
                 };
-                self.world.add_object(
+
+                let obj_id = self.world.add_object(
                     upload.sector, pobj.bounds,
                     LodChain::single(mesh_range),
                     pobj.transform, pobj.material_id, pobj.flags,
                 );
+
+                // Phase 8A: Queue GpuObjectData for SSBO upload
+                let gpu_data = GpuObjectData::new(
+                    pobj.transform,
+                    pobj.bounds.min,
+                    pobj.bounds.max,
+                    pobj.first_index,
+                    pobj.index_count,
+                    pobj.vertex_offset,
+                    pobj.material_id,
+                    buffer_group,
+                    pobj.flags,
+                );
+                self.gpu_cull.queue_dirty(obj_id.0, gpu_data);
+                self.gpu_cull.total_alive = self.gpu_cull.total_alive.max(obj_id.0 + 1);
             }
 
             if let Some(sec) = self.world.sectors.get_mut(&upload.sector) {
@@ -677,24 +723,18 @@ impl Renderer {
                 );
             }
             self.register_sector_lights(upload.sector);
-            // Phase 3: Bake SH probes affected by this sector's lights.
             self.probe_grid.bake_sector_probes(upload.sector, &self.light_manager);
         }
     }
 
     fn register_sector_lights(&mut self, sector: SectorCoord) {
-        // Sentinel sectors (global lights, dynamic spawns) already have lights
-        // registered separately.  Skip them.
         if sector.0 >= DYNAMIC_SECTOR_BASE || sector.0 >= i32::MAX - 10 {
             return;
         }
-        // Demo scene sectors near origin only contain ground tiles — no per-tile lights.
-        // In production, all non-sentinel sectors get procedural lights.
         let is_demo_origin = sector.0.abs() <= 1 && sector.1.abs() <= 1;
         if is_demo_origin {
             return;
         }
-        // Fallback: original per-tile light placement for non-demo sectors.
         let tiles = (SECTOR_SIZE / GROUND_TILE_SIZE) as i32;
         let bx = sector.0 * tiles;
         let bz = sector.1 * tiles;
@@ -709,15 +749,6 @@ impl Renderer {
         self.light_manager.register(sector, lights);
     }
 
-    /// Per-frame position update for orbiting demo lights.
-    ///
-    /// Three lights orbit the origin at different radii, heights, and angular
-    /// velocities — all deliberately different from the camera rotation speed
-    /// (0.12 rad/s) so the dynamic lighting effect is clearly visible.
-    ///
-    /// Light 0: radius 25 m, height 6 m, speed  0.37 rad/s  (warm)
-    /// Light 1: radius 35 m, height 8 m, speed −0.53 rad/s  (cool, reverse)
-    /// Light 2: radius 18 m, height 4 m, speed  0.71 rad/s  (magenta)
     fn update_dynamic_lights(&mut self, dt: f32) {
         self.dynamic_light_time += dt;
         let t = self.dynamic_light_time;
@@ -744,21 +775,22 @@ impl Renderer {
         }
     }
 
+    /// Phase 8A: evict_distant_sectors now deactivates buffer groups
+    /// and queues dead GpuObjectData for evicted objects.
     fn evict_distant_sectors(&mut self, camera_xz: [f32; 2]) {
         let r2 = EVICTION_RADIUS * EVICTION_RADIUS;
         let to_evict: Vec<SectorCoord> = self.world.sectors.iter()
             .filter(|(_, s)| s.state == SectorState::Ready)
-            // Never evict sentinel sectors (global lights, dynamic spawns).
             .filter(|&(&c, _)| c.0 < DYNAMIC_SECTOR_BASE && c.0 < i32::MAX - 10)
-            // Use actual content AABB distance — eliminates need for DEMO_SECTORS hack.
             .filter(|(_, s)| s.distance_sq_to_point_xz(camera_xz) > r2)
             .map(|(&c,_)| c).collect();
 
         for coord in to_evict {
-            // Defer buffer deletion — these buffers may still be bound in
-            // command buffers from the previous MAX_FRAMES_IN_FLIGHT frames.
-            // Immediate free causes VUID-vkDestroyBuffer-buffer-00922.
+            // Phase 8A: Deactivate buffer group using stored vk::Buffer
             if let Some(sec) = self.world.sectors.get(&coord) {
+                if let Some(vb) = sec.vertex_buffer {
+                    self.gpu_cull.deactivate_buffer_group(vb);
+                }
                 if let Some(vh) = sec.vertex_handle {
                     self.memory_ctx.budget.untrack(vh);
                     self.deferred_frees.push(DeferredFree { handle: vh, frame: self.global_frame });
@@ -769,14 +801,14 @@ impl Renderer {
                 }
             }
 
+            // Phase 8A: Zero out GpuObjectData for all objects in this sector
             let ids = self.world.evict_sector(coord);
-            self.light_manager.unregister(coord);
-            // Phase 3: Invalidate probes affected by evicted sector.
-            self.probe_grid.invalidate_sector(coord);
+            for &id in &ids {
+                self.gpu_cull.queue_dirty(id.0, GpuObjectData::dead());
+            }
 
-            // Remove from HashMap entirely so `prioritized_unloaded_sectors`
-            // won't find it and re-stream it.  `update_sector_grid` will
-            // re-insert when the camera is within STREAMING_RADIUS.
+            self.light_manager.unregister(coord);
+            self.probe_grid.invalidate_sector(coord);
             self.world.sectors.remove(&coord);
 
             if !ids.is_empty() {
@@ -785,12 +817,6 @@ impl Renderer {
         }
     }
 
-    /// Drain the deferred buffer deletion queue.  Called after
-    /// `wait_for_fences` so we know the current frame-slot's previous
-    /// submission has completed.  With MAX_FRAMES_IN_FLIGHT=2 and both
-    /// slots having cycled, all commands referencing these buffers are done.
-    ///
-    /// Uses swap-remove for single-pass drain — no intermediate Vec.
     fn drain_deferred_frees(&mut self) {
         let cutoff = self.global_frame.saturating_sub(MAX_FRAMES_IN_FLIGHT as u64);
         let mut i = 0;
@@ -798,7 +824,6 @@ impl Renderer {
             if self.deferred_frees[i].frame <= cutoff {
                 let entry = self.deferred_frees.swap_remove(i);
                 self.memory_ctx.allocator.free_buffer(entry.handle);
-                // don't increment — swap_remove moved the last element into slot i
             } else {
                 i += 1;
             }
@@ -806,19 +831,16 @@ impl Renderer {
     }
 
     // ================================================================
-    //  Frame rendering
+    //  Frame rendering — Phase 8A GPU-driven culling
     // ================================================================
 
     pub fn render(&mut self, device_ctx: &DeviceContext, input: &InputState, dt: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.global_frame += 1;
-
-        // ---- Process keybind actions ----
         self.process_actions(input);
 
         self.update_streaming();
         self.poll_uploads();
         self.texture_manager.poll_pending(&self.memory_ctx);
-        // Phase 3: Upload dirty SH probe data to GPU SSBO.
         self.probe_grid.upload_if_dirty();
 
         if self.material_library.is_dirty() {
@@ -827,13 +849,25 @@ impl Renderer {
         }
 
         unsafe {
+            // ════════════════════════════════════════════════════════════
+            // STEP 1: Fence wait (MUST precede flush_dirty — §3.3)
+            // ════════════════════════════════════════════════════════════
             self.device.wait_for_fences(&[self.in_flight_fences[self.current_frame]], true, u64::MAX)?;
-            // Safe to free buffers now — both frame slots have cycled
-            // since these buffers were last referenced.
+
+            #[cfg(debug_assertions)]
+            self.gpu_cull.assert_fence_waited();
+
+            // STEP 2: Resource cleanup (safe now — GPU done with this slot)
             self.drain_deferred_frees();
+
             self.scene.update(dt, input);
             self.update_dynamic_lights(dt);
-            // Phase 7: Read GPU timestamp results from previous frame in this slot.
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 3: Flush dirty objects to SSBO (AFTER fence wait — §3.3)
+            // ════════════════════════════════════════════════════════════
+            self.gpu_cull.flush_dirty(&mut self.memory_ctx);
+
             self.profiler.read_results(&self.device, self.current_frame);
             self.memory_ctx.ring.begin_frame(self.current_frame);
 
@@ -841,13 +875,10 @@ impl Renderer {
             let proj_mat = self.scene.camera.get_projection_matrix();
             let camera_pos = self.scene.camera.position;
 
-            // Compute VP product once — frustum planes derived from this,
-            // avoiding the redundant multiply inside extract_frustum_planes().
             let camera_vp = crate::scene::multiply_matrices(view_mat, proj_mat);
             let frustum = crate::scene::extract_frustum_planes_from_vp(&camera_vp);
 
-            let xz = crate::world::frustum_aabb_xz(camera_pos, self.scene.camera.far);
-            self.world.cull_and_select_lod(camera_pos, &frustum, &xz);
+            // Phase 8A: CPU cull_and_select_lod removed — GPU does this now
 
             self.shadow_assignments = self.shadow_budget.assign(&self.light_manager, camera_pos);
             let active_light_count = self.light_manager.cull_and_sort(camera_pos, &frustum, &self.shadow_assignments);
@@ -858,7 +889,6 @@ impl Renderer {
                 self.light_manager.gpu_lights(),
             );
 
-            // Compute sun shadow light-space VP matrix.
             let (sun_view, sun_proj) = compute_sun_shadow_matrices(self.sun_direction, camera_pos);
             let sun_vp = crate::scene::multiply_matrices(sun_view, sun_proj);
 
@@ -875,7 +905,6 @@ impl Renderer {
                 device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height, active_light_count);
             let c_off = self.memory_ctx.ring.push_data(&cluster_params).expect("Ring: ClusterParams").offset as u32;
 
-            // Phase 3: Push ProbeGridParams dynamic UBO.
             let probe_params = self.probe_grid.gpu_params();
             let p_off = self.memory_ctx.ring.push_data(&probe_params).expect("Ring: ProbeGridParams").offset as u32;
 
@@ -889,7 +918,6 @@ impl Renderer {
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             self.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
 
-            // Phase 7: Reset timestamp queries for this frame slot.
             self.profiler.reset_queries(&self.device, cmd, self.current_frame);
 
             let viewport = vk::Viewport { x:0.0, y:0.0,
@@ -898,24 +926,100 @@ impl Renderer {
                 min_depth: 0.0, max_depth: 1.0 };
             let scissor = vk::Rect2D { offset: vk::Offset2D{x:0,y:0}, extent: device_ctx.swapchain_extent };
 
+            let f = self.current_frame;
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 4: Zero count buffers (vkCmdFillBuffer)
+            // ════════════════════════════════════════════════════════════
+            let count_size = (MAX_BUFFER_GROUPS as u64) * 4;
+            self.device.cmd_fill_buffer(cmd, self.gpu_cull.opaque_counts[f], 0, count_size, 0);
+            self.device.cmd_fill_buffer(cmd, self.gpu_cull.shadow_counts[f], 0, count_size, 0);
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 5: Pre-cull barrier (§3.4)
+            // ════════════════════════════════════════════════════════════
+            let transfer_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+
+            let ssbo_barrier = if self.gpu_cull.needs_host_barrier {
+                vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            } else {
+                vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            };
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[transfer_barrier, ssbo_barrier],
+                &[],
+                &[],
+            );
+            self.gpu_cull.needs_host_barrier = false;
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 6: GPU Cull Dispatch
+            // ════════════════════════════════════════════════════════════
+            self.gpu_cull.update_group_base_offsets(&mut self.memory_ctx);
+
+            let cull_push = CullPushConstants::new(&frustum, camera_pos, self.gpu_cull.total_alive);
+
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.gpu_cull.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, self.gpu_cull.pipeline_layout, 0,
+                &[self.gpu_cull.descriptor_sets[f]], &[],
+            );
+            self.device.cmd_push_constants(
+                cmd, self.gpu_cull.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0,
+                std::slice::from_raw_parts(&cull_push as *const _ as *const u8, std::mem::size_of_val(&cull_push)),
+            );
+
+            let workgroups = (self.gpu_cull.total_alive + 255) / 256;
+            self.device.cmd_dispatch(cmd, workgroups, 1, 1);
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 7: Post-cull barrier
+            // ════════════════════════════════════════════════════════════
+            let post_cull_barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ);
+
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::VERTEX_SHADER,
+                vk::DependencyFlags::empty(),
+                &[post_cull_barrier],
+                &[],
+                &[],
+            );
+
             // ---- Stats ----
+            let total_alive = self.gpu_cull.total_alive;
+            let active_groups = self.gpu_cull.buffer_groups.iter().filter(|g| g.active).count();
             if self.global_frame % 60 == 0 {
                 println!(
-                    "[Frame {:>5}] cam:[{:.1},{:.1},{:.1}] spd:{:.0}  objects: {}  draws: {} opq + {} shd  lights: {}/{}  shadows: {}  spawned: {} lights, {} geom  probes: {} (bake_q: {})",
+                    "[Frame {:>5}] cam:[{:.1},{:.1},{:.1}] spd:{:.0}  objects: {}  groups: {}  lights: {}/{}  shadows: {}",
                     self.global_frame,
                     camera_pos[0], camera_pos[1], camera_pos[2],
                     self.scene.camera.move_speed,
-                    self.world.total_objects(),
-                    self.world.opaque_draws.len(), self.world.shadow_draws.len(),
+                    total_alive,
+                    active_groups,
                     active_light_count, self.light_manager.total_count(),
                     self.shadow_budget.active_shadow_count(),
-                    self.spawned_light_count, self.spawned_geometry_count,
-                    self.probe_grid.probe_count(),
-                    self.probe_grid.pending_bake_count(),
                 );
             }
 
-            // Phase 7: Collect overlay stats.
+            // Phase 7: Collect overlay stats
             if self.overlay.visible {
                 self.overlay.collect_profiler_stats(&self.profiler);
                 self.overlay.stats.sectors_ready = self.world.ready_sector_count();
@@ -930,19 +1034,19 @@ impl Renderer {
                 self.overlay.stats.lights_total = self.light_manager.total_count();
                 self.overlay.stats.lights_active = active_light_count;
                 self.overlay.stats.lights_shadow = self.shadow_budget.active_shadow_count();
-                self.overlay.stats.draw_calls_opaque = self.world.opaque_draws.len();
-                self.overlay.stats.draw_calls_shadow = self.world.shadow_draws.len();
+                self.overlay.stats.draw_calls_opaque = active_groups; // Now counts buffer groups
+                self.overlay.stats.draw_calls_shadow = active_groups;
                 self.overlay.stats.staging_fill_pct = self.memory_ctx.transfer.staging_fill_ratio() * 100.0;
                 self.overlay.stats.ring_fill_pct = self.memory_ctx.ring.frame_fill_ratio() * 100.0;
                 self.overlay.stats.frame_dt_ms = dt * 1000.0;
             }
 
             // ============================================================
-            //  PASS 0: Shadow Pass
+            //  PASS 0: Shadow Pass — Phase 8A indirect draws
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
-            // ---- Sun directional shadow (single 2D depth pass) ----
+            // ---- Sun directional shadow ----
             {
                 let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
                     width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
@@ -962,7 +1066,6 @@ impl Renderer {
                 self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
                 self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
 
-                // Shadow shaders read view/proj from set 0 binding 0.
                 let sun_global = GlobalUbo {
                     view: sun_view, proj: sun_proj,
                     camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
@@ -973,19 +1076,32 @@ impl Renderer {
                 let sun_dyn_off = [sun_g_off, c_off, p_off];
                 self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                     self.pipelines.layout, 0,
-                    &[self.frame_descriptors.per_frame_sets[self.current_frame]], &sun_dyn_off);
+                    &[self.frame_descriptors.per_frame_sets[f]], &sun_dyn_off);
 
-                // Bind set 3 per-draw with model + material_id only.
-                for draw in &self.world.shadow_draws {
-                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
-                    self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                    let ubo = PerDrawUbo::new(draw.transform, 0);
-                    let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: sun shadow UBO");
-                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.layout, 3,
-                        &[self.frame_descriptors.per_draw_sets[self.current_frame]],
-                        &[rs.offset as u32]);
-                    self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
+                // Phase 8A: Bind object SSBO (set 3) once for all draws
+                self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout, 3,
+                    &[self.gpu_cull.object_ssbo_set], &[]);
+
+                // Phase 8A: Indirect draw per buffer group
+                for group in self.gpu_cull.active_groups() {
+                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
+                    self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+
+                    let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
+                    let count_offset = (group.group_index as u64) * 4; // 4 bytes per u32 count
+                    let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
+                    
+                    // Use count-based indirect draw to only issue actual draws
+                    self.device.cmd_draw_indexed_indirect_count(
+                        cmd,
+                        self.gpu_cull.shadow_cmds[f],
+                        cmd_offset,
+                        self.gpu_cull.shadow_counts[f],
+                        count_offset,
+                        max_draws,
+                        INDIRECT_COMMAND_STRIDE,
+                    );
                 }
                 self.device.cmd_end_render_pass(cmd);
             }
@@ -998,12 +1114,11 @@ impl Renderer {
                 let Some(light) = self.light_manager.get(light_idx) else { continue };
                 if light.light_type == LightType::Directional { continue; }
                 let push = ShadowPushConstants { light_pos: light.position, light_radius: light.radius };
-                let lp = light.position; let lr2 = light.radius * light.radius;
+                let lp = light.position;
 
                 for face in 0..6u32 {
                     let (fv, fp) = cube_face_matrices(lp, light.radius, face);
 
-                    // Phase 4: Push per-face GlobalUbo with face view/proj.
                     let face_global = GlobalUbo {
                         view: fv, proj: fp,
                         camera_pos: [lp[0], lp[1], lp[2], self.global_frame as f32],
@@ -1026,26 +1141,34 @@ impl Renderer {
                         vk::ShaderStageFlags::VERTEX|vk::ShaderStageFlags::FRAGMENT, 0,
                         std::slice::from_raw_parts(&push as *const _ as *const u8, std::mem::size_of_val(&push)));
 
-                    // Bind set 0 with face-specific dynamic offsets.
                     self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.layout, 0,
-                        &[self.frame_descriptors.per_frame_sets[self.current_frame]], &face_dyn_off);
+                        &[self.frame_descriptors.per_frame_sets[f]], &face_dyn_off);
 
-                    for draw in &self.world.shadow_draws {
-                        let oi = draw.object_id.0 as usize;
-                        if oi >= self.world.objects.len() { continue; }
-                        let obj = &self.world.objects[oi];
-                        if !obj.alive || obj.bounds.distance_sq_to_point(lp) > lr2 { continue; }
+                    // Phase 8A: Bind object SSBO (set 3)
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.layout, 3,
+                        &[self.gpu_cull.object_ssbo_set], &[]);
 
-                        self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
-                        self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                        let ubo = PerDrawUbo::new(draw.transform, 0);
-                        let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: shadow UBO");
-                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                            self.pipelines.layout, 3,
-                            &[self.frame_descriptors.per_draw_sets[self.current_frame]],
-                            &[rs.offset as u32]);
-                        self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
+                    // Phase 8A: Indirect draw per buffer group
+                    // Note: Point light shadows could use a separate cull pass with light frustum,
+                    // but for Phase 8A we draw all shadow casters (GPU cull already filtered them)
+                    for group in self.gpu_cull.active_groups() {
+                        self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
+                        self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+
+                        let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
+                        let count_offset = (group.group_index as u64) * 4;
+                        let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
+                        self.device.cmd_draw_indexed_indirect_count(
+                            cmd,
+                            self.gpu_cull.shadow_cmds[f],
+                            cmd_offset,
+                            self.gpu_cull.shadow_counts[f],
+                            count_offset,
+                            max_draws,
+                            INDIRECT_COMMAND_STRIDE,
+                        );
                     }
                     self.device.cmd_end_render_pass(cmd);
                 }
@@ -1054,7 +1177,7 @@ impl Renderer {
             self.profiler.end_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
             // ============================================================
-            //  PASS 0.5: GPU Probe Cubemap Capture + SH Projection (Phase 3)
+            //  PASS 0.5: GPU Probe Cubemap Capture + SH Projection
             // ============================================================
             {
                 let pv = vk::Viewport { x: 0.0, y: 0.0,
@@ -1071,11 +1194,9 @@ impl Renderer {
 
                     let face_matrices = ProbeGrid::probe_capture_matrices(probe_pos);
 
-                    // Render 6 cubemap faces.
                     for face in 0..6u32 {
                         let (face_view, face_proj) = face_matrices[face as usize];
 
-                        // Phase 4: Push per-face GlobalUbo with probe face view/proj.
                         let probe_global = GlobalUbo {
                             view: face_view, proj: face_proj,
                             camera_pos: [probe_pos[0], probe_pos[1], probe_pos[2], self.global_frame as f32],
@@ -1100,32 +1221,41 @@ impl Renderer {
                         self.device.cmd_set_viewport(cmd, 0, &[pv]);
                         self.device.cmd_set_scissor(cmd, 0, &[ps]);
 
-                        // Phase 4: Bind set 0 with probe-face-specific dynamic offsets.
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 0,
-                            &[self.frame_descriptors.per_frame_sets[self.current_frame]], &probe_dyn_off);
+                            &[self.frame_descriptors.per_frame_sets[f]], &probe_dyn_off);
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 1, &[self.texture_manager.descriptor_set], &[]);
                         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                             self.pipelines.layout, 2,
-                            &[self.frame_descriptors.shadow_map_sets[self.current_frame]], &[]);
+                            &[self.frame_descriptors.shadow_map_sets[f]], &[]);
 
-                        // Draw all opaque objects with probe view/proj (from set 0).
-                        for draw in &self.world.opaque_draws {
-                            self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
-                            self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                            // Phase 4: PerDrawUbo — model + material_id only.
-                            let ubo = PerDrawUbo::new(draw.transform, draw.material_id);
-                            let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: probe capture UBO");
-                            self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                                self.pipelines.layout, 3,
-                                &[self.frame_descriptors.per_draw_sets[self.current_frame]], &[rs.offset as u32]);
-                            self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
+                        // Phase 8A: Bind object SSBO (set 3)
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 3,
+                            &[self.gpu_cull.object_ssbo_set], &[]);
+
+                        // Phase 8A: Indirect draw per buffer group
+                        for group in self.gpu_cull.active_groups() {
+                            self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
+                            self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+
+                            let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
+                            let count_offset = (group.group_index as u64) * 4;
+                            let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
+                            self.device.cmd_draw_indexed_indirect_count(
+                                cmd,
+                                self.gpu_cull.opaque_cmds[f],
+                                cmd_offset,
+                                self.gpu_cull.opaque_counts[f],
+                                count_offset,
+                                max_draws,
+                                INDIRECT_COMMAND_STRIDE,
+                            );
                         }
                         self.device.cmd_end_render_pass(cmd);
                     }
 
-                    // Transition cubemap: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
                     let barrier = vk::ImageMemoryBarrier::default()
                         .image(self.probe_bake_target.color_image)
                         .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1145,8 +1275,7 @@ impl Renderer {
                         vk::DependencyFlags::empty(), &[], &[],
                         std::slice::from_ref(&barrier));
 
-                    // Dispatch SH projection compute shader.
-                    let push = SHProjectPushConstants {
+                    let sh_push = SHProjectPushConstants {
                         probe_index: probe_idx,
                         face_size: PROBE_CAPTURE_SIZE,
                     };
@@ -1156,10 +1285,9 @@ impl Renderer {
                         &[self.probe_bake_target.sh_compute_set], &[]);
                     self.device.cmd_push_constants(cmd, self.probe_bake_target.sh_compute_pipeline_layout,
                         vk::ShaderStageFlags::COMPUTE, 0,
-                        std::slice::from_raw_parts(&push as *const _ as *const u8, std::mem::size_of_val(&push)));
+                        std::slice::from_raw_parts(&sh_push as *const _ as *const u8, std::mem::size_of_val(&sh_push)));
                     self.device.cmd_dispatch(cmd, 1, 1, 1);
 
-                    // Barrier: SH compute SSBO write → fragment shader read.
                     let ssbo_barrier = vk::MemoryBarrier::default()
                         .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                         .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1178,9 +1306,6 @@ impl Renderer {
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Depth, self.current_frame);
 
-            // Attachment 0: R16G16_SFLOAT normal (octahedral encoded)
-            // Attachment 1: D32_SFLOAT depth
-            // Clear normal to (0.5, 0.5) = octEncode(0,0,1) — benign default for sky pixels.
             let dc = [
                 vk::ClearValue { color: vk::ClearColorValue { float32: [0.5, 0.5, 0.0, 0.0] } },
                 vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
@@ -1195,26 +1320,40 @@ impl Renderer {
             self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor(cmd, 0, &[scissor]);
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.layout, 0,
-                &[self.frame_descriptors.per_frame_sets[self.current_frame], self.texture_manager.descriptor_set], &dyn_off);
+                &[self.frame_descriptors.per_frame_sets[f], self.texture_manager.descriptor_set], &dyn_off);
 
-            let opaque_draws = std::mem::take(&mut self.world.opaque_draws);
-            self.record_draw_list(cmd, &opaque_draws, view_mat, proj_mat);
+            // Phase 8A: Bind object SSBO (set 3)
+            self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines.layout, 3,
+                &[self.gpu_cull.object_ssbo_set], &[]);
+
+            // Phase 8A: Indirect draw per buffer group
+            for group in self.gpu_cull.active_groups() {
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+
+                let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
+                let count_offset = (group.group_index as u64) * 4;
+                let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
+                self.device.cmd_draw_indexed_indirect_count(
+                    cmd,
+                    self.gpu_cull.opaque_cmds[f],
+                    cmd_offset,
+                    self.gpu_cull.opaque_counts[f],
+                    count_offset,
+                    max_draws,
+                    INDIRECT_COMMAND_STRIDE,
+                );
+            }
             self.device.cmd_end_render_pass(cmd);
 
             self.profiler.end_pass(&self.device, cmd, PassId::Depth, self.current_frame);
 
             // ============================================================
-            //  PASS 1.5: HBAO (Phase 6)
+            //  PASS 1.5: HBAO
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Hbao, self.current_frame);
 
-            //
-            // Transition depth to read-only and normal to shader-read for
-            // compute sampling, dispatch HBAO + bilateral blur, then
-            // transition depth back to attachment for the lighting pass.
-
-            // Normal image: render pass leaves it in COLOR_ATTACHMENT_OPTIMAL
-            // (finalLayout). Transition to SHADER_READ_ONLY for HBAO compute.
             let normal_barrier = vk::ImageMemoryBarrier::default()
                 .image(self.normal_image)
                 .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1247,7 +1386,7 @@ impl Renderer {
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Cluster, self.current_frame);
 
-            self.device.cmd_fill_buffer(cmd, self.lighting_buffers.index_ssbo_buffers[self.current_frame], 0, 16, 0);
+            self.device.cmd_fill_buffer(cmd, self.lighting_buffers.index_ssbo_buffers[f], 0, 16, 0);
             let fb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ|vk::AccessFlags::SHADER_WRITE);
             let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::HOST_WRITE)
@@ -1256,7 +1395,7 @@ impl Renderer {
                 vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[fb,hb], &[], &[]);
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipelines.cluster_compute);
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipelines.compute_layout, 0,
-                &[self.frame_descriptors.per_frame_sets[self.current_frame]], &dyn_off);
+                &[self.frame_descriptors.per_frame_sets[f]], &dyn_off);
             self.device.cmd_dispatch(cmd, TOTAL_CLUSTERS, 1, 1);
             let pc = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -1267,7 +1406,7 @@ impl Renderer {
             self.profiler.end_pass(&self.device, cmd, PassId::Cluster, self.current_frame);
 
             // ============================================================
-            //  PASS 3: Lighting Pass
+            //  PASS 3: Lighting Pass — Phase 8A indirect draws
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Lighting, self.current_frame);
 
@@ -1285,18 +1424,37 @@ impl Renderer {
             self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor(cmd, 0, &[scissor]);
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.layout, 0,
-                &[self.frame_descriptors.per_frame_sets[self.current_frame]], &dyn_off);
+                &[self.frame_descriptors.per_frame_sets[f]], &dyn_off);
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.layout, 1,
                 &[self.texture_manager.descriptor_set], &[]);
             self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.layout, 2,
-                &[self.frame_descriptors.shadow_map_sets[self.current_frame]], &[]);
+                &[self.frame_descriptors.shadow_map_sets[f]], &[]);
 
-            self.record_draw_list(cmd, &opaque_draws, view_mat, proj_mat);
-            self.world.opaque_draws = opaque_draws;
+            // Phase 8A: Bind object SSBO (set 3)
+            self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines.layout, 3,
+                &[self.gpu_cull.object_ssbo_set], &[]);
 
-            // ---- Skybox (draw behind all opaque geometry) ----
-            // Pipeline: procedural cube, depth test ≤, no depth write, cull front.
-            // Set 0 already bound with camera view/proj from the lighting pass.
+            // Phase 8A: Indirect draw per buffer group
+            for group in self.gpu_cull.active_groups() {
+                self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+
+                let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
+                let count_offset = (group.group_index as u64) * 4;
+                let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
+                self.device.cmd_draw_indexed_indirect_count(
+                    cmd,
+                    self.gpu_cull.opaque_cmds[f],
+                    cmd_offset,
+                    self.gpu_cull.opaque_counts[f],
+                    count_offset,
+                    max_draws,
+                    INDIRECT_COMMAND_STRIDE,
+                );
+            }
+
+            // Skybox
             if self.has_hdr_skybox {
                 self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.skybox);
                 self.device.cmd_set_viewport(cmd, 0, &[viewport]);
@@ -1304,7 +1462,7 @@ impl Renderer {
                 self.device.cmd_draw(cmd, 36, 1, 0, 0);
             }
 
-            // Phase 7: Debug overlay (renders inside the lighting pass).
+            // Debug overlay
             self.overlay.record_commands(
                 &self.device, cmd, &mut self.memory_ctx.ring,
                 device_ctx.swapchain_extent.width as f32,
@@ -1313,65 +1471,36 @@ impl Renderer {
 
             self.device.cmd_end_render_pass(cmd);
 
-            // Phase 7: End lighting pass timing (after render pass to include
-            // overlay cost within the pass measurement).
             self.profiler.end_pass(&self.device, cmd, PassId::Lighting, self.current_frame);
 
-            // Phase 7: Post pass (placeholder for future bloom/tonemap/FXAA).
+            // Post pass placeholder
             self.profiler.begin_pass(&self.device, cmd, PassId::Post, self.current_frame);
             self.profiler.end_pass(&self.device, cmd, PassId::Post, self.current_frame);
 
             self.device.end_command_buffer(cmd)?;
 
             // ---- Submit + Present ----
-            let ws = [self.image_available[self.current_frame]];
+            let ws = [self.image_available[f]];
             let wst = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let ss2 = [self.render_finished[self.current_frame]];
+            let ss2 = [self.render_finished[f]];
             let sub = vk::SubmitInfo::default().wait_semaphores(&ws).wait_dst_stage_mask(&wst)
                 .command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(&ss2);
-            self.device.queue_submit(device_ctx.queue, &[sub], self.in_flight_fences[self.current_frame])?;
+            self.device.queue_submit(device_ctx.queue, &[sub], self.in_flight_fences[f])?;
 
             let pres = vk::PresentInfoKHR::default().wait_semaphores(&ss2)
                 .swapchains(std::slice::from_ref(&device_ctx.swapchain))
                 .image_indices(std::slice::from_ref(&image_index));
             device_ctx.swapchain_loader.queue_present(device_ctx.queue, &pres)?;
 
+            #[cfg(debug_assertions)]
+            self.gpu_cull.reset_fence_flag();
+
             self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
         Ok(())
     }
 
-    /// Record draw calls using per-object offsets (first_index, vertex_offset).
-    /// Phase 4: Uses PerDrawUbo (model + material_id only, 80 bytes).
-    /// View/proj are read from the per-frame GlobalUbo at set 0.
-    fn record_draw_list(&mut self, cmd: vk::CommandBuffer, draws: &[DrawCommand],
-        _view_mat: [[f32;4];4], _proj_mat: [[f32;4];4]) -> u32 {
-        let mut count = 0u32;
-        let mut bound_vb: Option<vk::Buffer> = None;
-        let mut bound_ib: Option<vk::Buffer> = None;
-
-        for draw in draws { unsafe {
-            // Skip redundant binds — objects in the same sector share buffers.
-            if bound_vb != Some(draw.vertex_buffer) {
-                self.device.cmd_bind_vertex_buffers(cmd, 0, &[draw.vertex_buffer], &[0]);
-                bound_vb = Some(draw.vertex_buffer);
-            }
-            if bound_ib != Some(draw.index_buffer) {
-                self.device.cmd_bind_index_buffer(cmd, draw.index_buffer, 0, vk::IndexType::UINT32);
-                bound_ib = Some(draw.index_buffer);
-            }
-
-            // Phase 4: PerDrawUbo — model + material_id only.
-            let ubo = PerDrawUbo::new(draw.transform, draw.material_id);
-            let rs = self.memory_ctx.ring.push_data(&ubo).expect("Ring: per-draw UBO");
-            self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                self.pipelines.layout, 3,
-                &[self.frame_descriptors.per_draw_sets[self.current_frame]], &[rs.offset as u32]);
-
-            self.device.cmd_draw_indexed(cmd, draw.index_count, 1, draw.first_index, draw.vertex_offset, 0);
-        } count += 1; }
-        count
-    }
+    // Phase 8A: record_draw_list removed — replaced by indirect draws
 
     // ================================================================
     //  Keybind action processing
@@ -1390,7 +1519,6 @@ impl Renderer {
         }
     }
 
-    /// Spawn a shadow-enabled point light at a random position near the camera.
     fn spawn_random_light(&mut self) {
         if self.spawned_light_count >= MAX_SPAWNED_LIGHTS {
             println!("[Spawn] Light limit reached ({}/{})", self.spawned_light_count, MAX_SPAWNED_LIGHTS);
@@ -1402,7 +1530,6 @@ impl Renderer {
         let y = self.rng.range(SPAWN_LIGHT_HEIGHT_MIN, SPAWN_LIGHT_HEIGHT_MAX);
         let z = cam[2] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
 
-        // Random warm-to-cool color.
         let r = self.rng.range(0.3, 1.0);
         let g = self.rng.range(0.3, 1.0);
         let b = self.rng.range(0.3, 1.0);
@@ -1422,8 +1549,6 @@ impl Renderer {
         );
     }
 
-    /// Spawn a random geometry object (cube, pyramid, or column) near the camera.
-    /// Uses the existing async sector upload path with a unique sentinel sector coord.
     fn spawn_random_geometry(&mut self) {
         if self.spawned_geometry_count >= MAX_SPAWNED_GEOMETRY {
             println!("[Spawn] Geometry limit reached ({}/{})", self.spawned_geometry_count, MAX_SPAWNED_GEOMETRY);
@@ -1435,10 +1560,7 @@ impl Renderer {
         let z = cam[2] + self.rng.range(-SPAWN_RADIUS, SPAWN_RADIUS);
         let pos = [x, 0.0, z];
 
-        // Random shape.
         let shape: u32 = (self.rng.next_u64() % 3) as u32;
-        // Material palette: 2=polished_metal 3=rough_stone 4=copper 5=ceramic_red
-        //   6=ceramic_blue 7=gold 8=rubber 9=marble 10=emissive_warm 11=emissive_cool
         let mat = self.rng.pick(&[2u32, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
         let r = self.rng.range(0.3, 1.0);
@@ -1475,11 +1597,9 @@ impl Renderer {
             bounds,
         };
 
-        // Unique sector coord for this spawn batch.
         let sector_coord: SectorCoord = (DYNAMIC_SECTOR_BASE + self.next_dynamic_sector, 0);
         self.next_dynamic_sector += 1;
 
-        // Insert sector into world.
         self.world.sectors.entry(sector_coord)
             .or_insert_with(|| Sector::new(sector_coord));
         if let Some(sec) = self.world.sectors.get_mut(&sector_coord) {
@@ -1509,7 +1629,6 @@ impl Renderer {
         unsafe { self.device.device_wait_idle()? };
         self.framebuffers.destroy(&self.device);
 
-        // Recreate G-buffer normal image at new resolution.
         unsafe {
             self.device.destroy_image_view(self.normal_view, None);
             self.device.destroy_image(self.normal_image, None);
@@ -1545,13 +1664,6 @@ impl Renderer {
     pub fn texture_manager_mut(&mut self) -> &mut TextureManager { &mut self.texture_manager }
     pub fn light_manager_mut(&mut self) -> &mut LightManager { &mut self.light_manager }
 
-    // ================================================================
-    //  G-buffer normal image creation
-    // ================================================================
-
-    /// Create a full-resolution R16G16_SFLOAT image for octahedral-encoded
-    /// view-space normals.  Written by the depth pre-pass fragment shader,
-    /// sampled by the HBAO compute shader at binding 3.
     fn create_normal_image(
         device: &Device,
         allocator: &GpuAllocator,
@@ -1616,16 +1728,15 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) { unsafe {
         let _ = self.device.device_wait_idle();
-        // Flush any remaining deferred buffer deletions — device is idle
-        // so all command buffers have completed.
         for entry in self.deferred_frees.drain(..) {
             self.memory_ctx.allocator.free_buffer(entry.handle);
         }
-        // Free glTF asset buffers (VB/IB per mesh primitive).
         for handle in self.gltf_buffer_handles.drain(..) {
             self.memory_ctx.budget.untrack(handle);
             self.memory_ctx.allocator.free_buffer(handle);
         }
+        // Phase 8A: Destroy GPU cull resources
+        self.gpu_cull.destroy(&mut self.memory_ctx.allocator);
         for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }
         for &s in &self.render_finished { self.device.destroy_semaphore(s, None); }
         for &s in &self.image_available { self.device.destroy_semaphore(s, None); }
@@ -1637,7 +1748,6 @@ impl Drop for Renderer {
         self.shadow_atlas.destroy(&self.device);
         self.sun_shadow.destroy(&self.device);
         self.gi_resources.destroy(&self.device);
-        // G-buffer normal image (owned by Renderer, read by HbaoPass).
         self.device.destroy_image_view(self.normal_view, None);
         self.device.destroy_image(self.normal_image, None);
         self.device.free_memory(self.normal_memory, None);
@@ -1645,7 +1755,6 @@ impl Drop for Renderer {
         self.probe_bake_target.destroy(&self.device);
         self.profiler.destroy(&self.device);
         self.overlay.destroy(&self.device);
-        // probe_grid SSBO freed via allocator on MemoryContext drop
         self.lighting_buffers.destroy(&mut self.memory_ctx.allocator);
     }}
 }

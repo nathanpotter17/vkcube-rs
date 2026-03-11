@@ -56,7 +56,8 @@ pub const LIGHT_INDEX_CAPACITY: u32 = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER as
 const SHADOW_HYSTERESIS_BONUS: f32 = 2.0;
 
 pub const SUN_COLOR: [f32; 3] = [1.0, 0.95, 0.85]; 
-pub const SUN_INTENSITY: f32 = 0.1;
+pub const SUN_INTENSITY: f32 = 2.5;
+pub const SUN_DIR: [f32; 3] = [0.6, -0.4, 0.5];
 /// Resolution of the sun shadow map (single 2D texture).
 pub const SUN_SHADOW_SIZE: u32 = 2048;
 
@@ -1132,9 +1133,9 @@ pub fn compute_sun_shadow_matrices(
 
     let proj = [
         [1.0 / half, 0.0, 0.0, 0.0],
-        [0.0, -1.0 / half, 0.0, 0.0],       // Y-flip for Vulkan
-        [0.0, 0.0, 1.0 / (far - near), 0.0],
-        [0.0, 0.0, -near / (far - near), 1.0],
+        [0.0, -1.0 / half, 0.0, 0.0],                  // Y-flip for Vulkan
+        [0.0, 0.0, -1.0 / (far - near), 0.0],          // NEGATIVE Z-scale
+        [0.0, 0.0, -near / (far - near), 1.0],         // Z-offset in row 3
     ];
 
     (view, proj)

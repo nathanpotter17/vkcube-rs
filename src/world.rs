@@ -4,9 +4,13 @@
 //! - `Sector` — 256 m streaming region.  Owns shared vertex/index buffer
 //!   handles; objects store offsets into these shared buffers.
 //! - `RenderObject` — per-entity renderable with AABB, LOD, offsets.
-//! - `SpatialGrid` — 64 m uniform grid for broad-phase frustum culling.
-//! - `DrawCommand` — fully resolved draw with offsets for cmd_draw_indexed.
-//! - `World` — orchestrates sectors, objects, spatial index, per-frame culling.
+//! - `World` — orchestrates sectors, objects, per-frame state.
+//!
+//! **Phase 8A Changes:**
+//! - Removed SpatialGrid CPU-side spatial index (GPU does frustum culling)
+//! - Removed DrawCommand struct (replaced by GPU indirect commands)
+//! - Removed cull_and_select_lod (GPU compute handles culling)
+//! - Removed opaque_draws/shadow_draws/transparent_draws vectors
 //!
 //! **Procedural generation:**
 //! - `ObjectDescriptor` — CPU-side object data before GPU upload.
@@ -68,6 +72,10 @@ pub struct Sector {
     pub vertex_handle: Option<BufferHandle>,
     /// Shared index buffer handle for all objects in this sector.
     pub index_handle: Option<BufferHandle>,
+    /// Phase 8A: vk::Buffer for deactivating buffer groups on eviction.
+    pub vertex_buffer: Option<vk::Buffer>,
+    /// Phase 8A: vk::Buffer for deactivating buffer groups on eviction.
+    pub index_buffer: Option<vk::Buffer>,
     /// Actual world-space AABB of all geometry in this sector (XYZ).
     /// `None` when sector has no registered objects (Unloaded/Streaming).
     /// Includes SECTOR_BORDER_PADDING margin for border meshes.
@@ -79,6 +87,7 @@ impl Sector {
         Self {
             coord, state: SectorState::Unloaded, objects: Vec::new(),
             priority: 0.0, vertex_handle: None, index_handle: None,
+            vertex_buffer: None, index_buffer: None,
             content_bounds: None,
         }
     }
@@ -292,95 +301,25 @@ pub struct RenderObject {
     pub alive: bool,
 }
 
-// ====================================================================
-//  DrawCommand
-// ====================================================================
-
-#[derive(Debug, Clone, Copy)]
-pub struct DrawCommand {
-    pub object_id: RenderObjectId,
-    pub vertex_buffer: vk::Buffer,
-    pub index_buffer: vk::Buffer,
-    pub first_index: u32,
-    pub index_count: u32,
-    pub vertex_offset: i32,
-    pub transform: [[f32; 4]; 4],
-    pub material_id: u32,
-    pub distance_sq: f32,
-    pub flags: RenderFlags,
-}
-
-// ====================================================================
-//  SpatialGrid
-// ====================================================================
-
-pub type GridCell = (i32, i32);
-
-pub struct SpatialGrid {
-    cell_size: f32, inv_cell_size: f32,
-    cells: HashMap<GridCell, Vec<RenderObjectId>>,
-    object_cells: HashMap<RenderObjectId, Vec<GridCell>>,
-}
-
-impl SpatialGrid {
-    pub fn new(cell_size: f32) -> Self {
-        Self {
-            cell_size, inv_cell_size: 1.0 / cell_size,
-            cells: HashMap::with_capacity(4096),
-            object_cells: HashMap::with_capacity(8192),
-        }
-    }
-    #[inline] fn to_cell(&self, v: f32) -> i32 { (v * self.inv_cell_size).floor() as i32 }
-
-    pub fn insert(&mut self, id: RenderObjectId, bounds: &Aabb) {
-        let (mnx, mnz) = (self.to_cell(bounds.min[0]), self.to_cell(bounds.min[2]));
-        let (mxx, mxz) = (self.to_cell(bounds.max[0]), self.to_cell(bounds.max[2]));
-        let mut occ = Vec::new();
-        for cx in mnx..=mxx { for cz in mnz..=mxz {
-            self.cells.entry((cx,cz)).or_default().push(id);
-            occ.push((cx,cz));
-        }}
-        self.object_cells.insert(id, occ);
-    }
-
-    pub fn remove(&mut self, id: RenderObjectId) {
-        if let Some(cells) = self.object_cells.remove(&id) {
-            for c in cells { if let Some(l) = self.cells.get_mut(&c) { l.retain(|&o| o != id); } }
-        }
-    }
-
-    pub fn query_frustum(&self, frustum: &[[f32;4];6], xz: &[f32;4]) -> Vec<RenderObjectId> {
-        let (mnx,mnz) = (self.to_cell(xz[0]), self.to_cell(xz[1]));
-        let (mxx,mxz) = (self.to_cell(xz[2]), self.to_cell(xz[3]));
-        let cap = ((mxx-mnx+1)*(mxz-mnz+1)) as usize;
-        let mut res = Vec::with_capacity(cap.min(256)*30);
-        let mut seen: HashMap<u32,()> = HashMap::with_capacity(cap.min(256)*30);
-        for cx in mnx..=mxx { for cz in mnz..=mxz {
-            let x0 = cx as f32*self.cell_size;
-            let z0 = cz as f32*self.cell_size;
-            if !aabb_visible(frustum, [x0,-500.0,z0], [x0+self.cell_size,5000.0,z0+self.cell_size]) { continue; }
-            if let Some(objs) = self.cells.get(&(cx,cz)) {
-                for &o in objs { if seen.insert(o.0,()).is_none() { res.push(o); } }
-            }
-        }}
-        res
-    }
-
-    pub fn object_count(&self) -> usize { self.object_cells.len() }
-}
+// Phase 8A: DrawCommand REMOVED - replaced by GPU indirect draw commands.
+// Phase 8A: SpatialGrid REMOVED - GPU compute does frustum culling.
 
 // ====================================================================
 //  World
 // ====================================================================
 
+/// Phase 8A: Simplified World struct.
+/// 
+/// Removed:
+/// - `spatial: SpatialGrid` (GPU does frustum culling)
+/// - `opaque_draws: Vec<DrawCommand>` (GPU writes indirect commands)
+/// - `transparent_draws: Vec<DrawCommand>` (CPU path for alpha-sorted)
+/// - `shadow_draws: Vec<DrawCommand>` (GPU writes shadow indirect commands)
 pub struct World {
     pub sectors: HashMap<SectorCoord, Sector>,
     pub objects: Vec<RenderObject>,
-    free_ids: Vec<u32>, next_id: u32,
-    pub spatial: SpatialGrid,
-    pub opaque_draws: Vec<DrawCommand>,
-    pub transparent_draws: Vec<DrawCommand>,
-    pub shadow_draws: Vec<DrawCommand>,
+    pub free_ids: Vec<u32>,
+    next_id: u32,
 }
 
 impl World {
@@ -388,11 +327,8 @@ impl World {
         Self {
             sectors: HashMap::with_capacity(256),
             objects: Vec::with_capacity(4096),
-            free_ids: Vec::new(), next_id: 0,
-            spatial: SpatialGrid::new(SPATIAL_CELL_SIZE),
-            opaque_draws: Vec::with_capacity(4096),
-            transparent_draws: Vec::with_capacity(256),
-            shadow_draws: Vec::with_capacity(2048),
+            free_ids: Vec::new(),
+            next_id: 0,
         }
     }
 
@@ -418,7 +354,7 @@ impl World {
                 id: RenderObjectId(u32::MAX), alive: false,
             });
         }
-        self.spatial.insert(id, &bounds);
+        // Phase 8A: spatial.insert REMOVED - objects tracked in GPU SSBO via gpu_cull.rs
         self.objects[idx] = obj;
         if let Some(sec) = self.sectors.get_mut(&sector) {
             sec.objects.push(id);
@@ -434,53 +370,20 @@ impl World {
             sec.state = SectorState::Unloaded;
             sec.vertex_handle = None;
             sec.index_handle = None;
+            sec.vertex_buffer = None;  // Phase 8A
+            sec.index_buffer = None;   // Phase 8A
             sec.content_bounds = None;  // Reset — will be rebuilt on reload.
             ids
         } else { Vec::new() };
         for &id in &ids {
-            self.spatial.remove(id);
+            // Phase 8A: spatial.remove REMOVED - GPU SSBO managed by gpu_cull.rs
             if let Some(o) = self.objects.get_mut(id.0 as usize) { o.alive = false; }
             self.free_ids.push(id.0);
         }
         ids
     }
 
-    pub fn cull_and_select_lod(
-        &mut self, camera_pos: [f32;3], frustum: &[[f32;4];6], xz: &[f32;4],
-    ) {
-        self.opaque_draws.clear();
-        self.transparent_draws.clear();
-        self.shadow_draws.clear();
-
-        for oid in self.spatial.query_frustum(frustum, xz) {
-            let idx = oid.0 as usize;
-            if idx >= self.objects.len() { continue; }
-            let obj = &self.objects[idx];
-            if !obj.alive || !obj.bounds.is_visible(frustum) { continue; }
-
-            let dist_sq = obj.bounds.distance_sq_to_point(camera_pos);
-            let mesh = match obj.lod.select(dist_sq) { Some(m) => *m, None => continue };
-
-            let cmd = DrawCommand {
-                object_id: oid,
-                vertex_buffer: mesh.vertex_buffer, index_buffer: mesh.index_buffer,
-                first_index: mesh.first_index, index_count: mesh.index_count,
-                vertex_offset: mesh.vertex_offset,
-                transform: obj.transform, material_id: obj.material_id,
-                distance_sq: dist_sq, flags: obj.flags,
-            };
-            if obj.flags.contains(RenderFlags::TRANSPARENT) {
-                self.transparent_draws.push(cmd);
-            } else {
-                self.opaque_draws.push(cmd);
-            }
-            if obj.flags.contains(RenderFlags::SHADOW_CASTER) {
-                self.shadow_draws.push(cmd);
-            }
-        }
-        self.transparent_draws.sort_unstable_by(|a,b| b.distance_sq.total_cmp(&a.distance_sq));
-        self.opaque_draws.sort_unstable_by(|a,b| a.distance_sq.total_cmp(&b.distance_sq));
-    }
+    // Phase 8A: cull_and_select_lod REMOVED - GPU compute shader handles culling.
 
     pub fn update_sector_grid(&mut self, camera_xz: [f32;2], r: f32) {
         let cx = (camera_xz[0]/SECTOR_SIZE).floor() as i32;
@@ -506,43 +409,6 @@ impl World {
         }}
     }
 
-    /// Apply a buffer remap (from defragmentation) to all MeshRange
-    /// entries in all live RenderObjects.
-    ///
-    /// Call this immediately after `defragment_one_block` returns
-    /// `Some(remap)`.  Must run before the next `cull_and_select_lod`
-    /// call to prevent draw commands from binding destroyed buffers.
-    pub fn apply_buffer_remap(
-        &mut self,
-        remap: &HashMap<vk::Buffer, vk::Buffer>,
-    ) {
-        if remap.is_empty() { return; }
-
-        let mut remapped = 0usize;
-        for obj in &mut self.objects {
-            if !obj.alive { continue; }
-            for level in &mut obj.lod.levels {
-                if let Some(mesh) = level {
-                    if let Some(&new_vb) = remap.get(&mesh.vertex_buffer) {
-                        mesh.vertex_buffer = new_vb;
-                        remapped += 1;
-                    }
-                    if let Some(&new_ib) = remap.get(&mesh.index_buffer) {
-                        mesh.index_buffer = new_ib;
-                        remapped += 1;
-                    }
-                }
-            }
-        }
-
-        if remapped > 0 {
-            println!(
-                "[World] Buffer remap applied: {} MeshRange references updated",
-                remapped,
-            );
-        }
-    }
-
     pub fn prioritized_unloaded_sectors(
         &mut self, cam: [f32;2], vel: [f32;2], frustum: &[[f32;4];6],
     ) -> Vec<SectorCoord> {
@@ -556,12 +422,34 @@ impl World {
         v.into_iter().map(|(c,_)| c).collect()
     }
 
-    pub fn total_objects(&self) -> usize { self.spatial.object_count() }
+    /// Phase 8A: Count alive objects directly (no spatial grid).
+    pub fn total_objects(&self) -> usize {
+        self.objects.iter().filter(|o| o.alive).count()
+    }
+
     pub fn ready_sector_count(&self) -> usize {
         self.sectors.values().filter(|s| s.state == SectorState::Ready).count()
     }
+
     pub fn streaming_sector_count(&self) -> usize {
         self.sectors.values().filter(|s| s.state == SectorState::Streaming).count()
+    }
+
+    // ================================================================
+    // Phase 8A: New helpers for GPU-driven rendering
+    // ================================================================
+
+    /// Iterate over all alive objects with their indices.
+    /// Used by renderer to populate GPU object SSBO.
+    pub fn alive_objects(&self) -> impl Iterator<Item = (u32, &RenderObject)> {
+        self.objects.iter().enumerate()
+            .filter(|(_, o)| o.alive)
+            .map(|(i, o)| (i as u32, o))
+    }
+
+    /// Count of alive objects (as u32 for GPU dispatch).
+    pub fn alive_count(&self) -> u32 {
+        self.objects.iter().filter(|o| o.alive).count() as u32
     }
 }
 
@@ -580,9 +468,7 @@ pub fn aabb_visible(frustum: &[[f32;4];6], mn: [f32;3], mx: [f32;3]) -> bool {
     true
 }
 
-pub fn frustum_aabb_xz(pos: [f32;3], far: f32) -> [f32;4] {
-    [pos[0]-far, pos[2]-far, pos[0]+far, pos[2]+far]
-}
+// Phase 8A: frustum_aabb_xz REMOVED - not needed with GPU culling.
 
 fn transform_point(m: [[f32;4];4], p: [f32;3]) -> [f32;3] {
     [

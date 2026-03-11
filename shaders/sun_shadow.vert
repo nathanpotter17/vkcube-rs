@@ -1,24 +1,22 @@
-// Phase 8A: Depth Pre-Pass Vertex Shader with GPU-Driven Object SSBO
-// Compile: glslangValidator -V depth.vert -o compiled/depth.vert.spv
+// Phase 8A: Sun Shadow (Directional Light) Vertex Shader
+// Compile: glslangValidator -V sun_shadow.vert -o compiled/sun_shadow.vert.spv
 //
-// Writes depth (automatic) and view-space normal (color attachment 0).
-// The normal is passed to the fragment shader for octahedral encoding.
-//
-// NOTE: This shader is also used by the sun shadow pipeline (which has
-// no color attachment).  The fragment output is simply discarded by
-// Vulkan when no color attachment exists — no validation error.
+// Minimal vertex shader for orthographic directional shadow mapping.
+// Uses hardware depth (no gl_FragDepth override) - orthographic projection
+// naturally produces linear depth which is ideal for shadow comparison.
 //
 // Phase 8A: Object data read from persistent SSBO via gl_InstanceIndex.
 
 #version 450
 
 layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inNormal;
-layout(location = 2) in vec4 inTangent;    // unused here but must match vertex layout
+layout(location = 1) in vec3 inNormal;     // unused, declared for vertex layout compatibility
+layout(location = 2) in vec4 inTangent;    // unused
 layout(location = 3) in vec2 inUV;         // unused
 layout(location = 4) in vec3 inColor;      // unused
 
-// Per-frame UBO (set 0, binding 0) — provides view and proj matrices.
+// Per-frame UBO (set 0, binding 0).
+// For sun shadows, view/proj contain the sun's orthographic matrices.
 layout(set = 0, binding = 0) uniform PerFrameUBO {
     mat4 view;
     mat4 proj;
@@ -46,21 +44,12 @@ layout(set = 3, binding = 0) readonly buffer ObjectSSBO {
     ObjectData objects[];
 };
 
-layout(location = 0) out vec3 outViewNormal;
-
 invariant gl_Position;
 
 void main() {
-    // Index into object SSBO using gl_InstanceIndex
+    // Index into object SSBO using gl_InstanceIndex (== firstInstance from indirect cmd)
     ObjectData obj = objects[gl_InstanceIndex];
 
-    // Must match PBR vertex shader computation order exactly to
-    // produce bit-identical depth values (prevents z-fighting).
     vec4 worldPos = obj.model * vec4(inPosition, 1.0);
     gl_Position = frame.proj * frame.view * worldPos;
-
-    // Transform normal to view space for HBAO consumption.
-    // The normal matrix is transpose(inverse(mat3(view * model))).
-    mat3 normalMat = transpose(inverse(mat3(frame.view * obj.model)));
-    outViewNormal = normalize(normalMat * inNormal);
 }

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::time::Instant;
 use image::ImageDecoder;
-use crate::light::{cube_face_matrices, LightManager};
+use crate::light::{cube_face_matrices, LightManager, SUN_DIR};
 use crate::memory::{BufferHandle, GpuAllocator, ImageHandle, MemoryContext, MemoryLocation};
 use crate::world::SectorCoord;
 
@@ -1532,7 +1532,7 @@ impl GIResources {
     ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView,
                  vk::Image, vk::DeviceMemory, vk::ImageView, u32),
                Box<dyn std::error::Error>> {
-        let sun_dir = normalize3([0.5, 0.7, 0.3]);
+        let sun_dir = normalize3(SUN_DIR);
         println!("[GI] Generating procedural sky cube map ({}×{} per face)...", ENV_MAP_SIZE, ENV_MAP_SIZE);
         let sky_faces = generate_sky_cubemap(sun_dir);
 

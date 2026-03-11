@@ -1,4 +1,4 @@
-//! Pipeline Management (Phase 1 + Phase 2 + Phase 3)
+//! Pipeline Management (Phase 1 + Phase 2 + Phase 3 + Phase 8A)
 //!
 //! Pass structure (Phase 2):
 //!   1. Shadow pass     (per shadow-casting light × 6 cube faces)
@@ -21,7 +21,8 @@
 //!
 //! Descriptor Set 1: Bindless textures (from TextureManager)
 //! Descriptor Set 2: Shadow maps (cube map array sampler)
-//! Descriptor Set 3: Per-draw dynamic UBO (ring buffer)
+//! Descriptor Set 3: Object SSBO (Phase 8A: replaces per-draw dynamic UBO)
+//!   binding 0: STORAGE_BUFFER — GpuObjectData[] indexed by gl_InstanceIndex
 //!
 //! Push constants (16 bytes): ShadowPushConstants (shadow pass only).
 
@@ -64,7 +65,7 @@ pub struct DescriptorLayouts {
     pub per_frame: vk::DescriptorSetLayout,         // set 0
     pub bindless_textures: vk::DescriptorSetLayout,  // set 1 (TextureManager-owned)
     pub shadow_maps: vk::DescriptorSetLayout,        // set 2
-    pub per_draw: vk::DescriptorSetLayout,           // set 3
+    pub per_draw: vk::DescriptorSetLayout,           // set 3 (now object SSBO layout)
 }
 
 impl DescriptorLayouts {
@@ -203,10 +204,13 @@ impl DescriptorLayouts {
             )?
         };
 
-        // ---- Set 3: Per-draw dynamic UBO ----
+        // ---- Set 3: Object SSBO (Phase 8A: replaces per-draw dynamic UBO) ----
+        //
+        // The persistent GpuObjectData SSBO is bound once per pass.
+        // Vertex shaders index via gl_InstanceIndex (== firstInstance from indirect cmd).
         let set3_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)  // Changed from UNIFORM_BUFFER_DYNAMIC
             .descriptor_count(1)
             .stage_flags(
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -325,20 +329,26 @@ impl RenderPasses {
         let dependency = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
-                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            .src_stage_mask(
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            )
+            .dst_stage_mask(
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            )
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            );
 
         let info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
-
-        unsafe { Ok(device.create_render_pass(&info, None)?) }
+        Ok(unsafe { device.create_render_pass(&info, None)? })
     }
 
     fn create_lighting_pass(
@@ -383,13 +393,13 @@ impl RenderPasses {
             .dst_subpass(0)
             .src_stage_mask(
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
             )
-            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .dst_stage_mask(
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                     | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
             )
+            .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
@@ -399,17 +409,9 @@ impl RenderPasses {
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
-
-        unsafe { Ok(device.create_render_pass(&info, None)?) }
+        Ok(unsafe { device.create_render_pass(&info, None)? })
     }
 
-    /// Shadow render pass: depth-only into a cube map face layer.
-    ///
-    /// The depth attachment is cleared each face (CLEAR + STORE).
-    /// All shadow atlas layers are pre-transitioned to
-    /// SHADER_READ_ONLY_OPTIMAL at atlas creation time, so:
-    ///   initial = SHADER_READ_ONLY_OPTIMAL (from init or previous frame)
-    ///   final   = SHADER_READ_ONLY_OPTIMAL (ready for PBR sampling)
     fn create_shadow_pass(
         device: &Device,
     ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
@@ -420,7 +422,7 @@ impl RenderPasses {
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
         let depth_ref = vk::AttachmentReference::default()
@@ -436,15 +438,15 @@ impl RenderPasses {
                 .src_subpass(vk::SUBPASS_EXTERNAL)
                 .dst_subpass(0)
                 .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
             vk::SubpassDependency::default()
                 .src_subpass(0)
                 .dst_subpass(vk::SUBPASS_EXTERNAL)
                 .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
-                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
         ];
 
@@ -452,29 +454,15 @@ impl RenderPasses {
             .attachments(std::slice::from_ref(&attachment))
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(&dependencies);
-
-        unsafe { Ok(device.create_render_pass(&info, None)?) }
+        Ok(unsafe { device.create_render_pass(&info, None)? })
     }
 
-    pub fn destroy(&self, device: &Device) {
-        unsafe {
-            device.destroy_render_pass(self.depth_prepass, None);
-            device.destroy_render_pass(self.lighting, None);
-            device.destroy_render_pass(self.shadow, None);
-            device.destroy_render_pass(self.probe_capture, None);
-        }
-    }
-
-    /// Probe capture render pass: HDR color + depth per cubemap face.
-    ///
-    /// Color: R16G16B16A16_SFLOAT, CLEAR+STORE, UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
-    /// Depth: D32_SFLOAT, CLEAR+DONT_CARE, UNDEFINED → DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
-    /// After all 6 faces, a manual barrier transitions color to SHADER_READ_ONLY.
+    /// Probe capture pass: HDR color + depth into a cubemap face (Phase 3).
     fn create_probe_capture_pass(
         device: &Device,
     ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
         let attachments = [
-            // Color (HDR).
+            // Color attachment: HDR R16G16B16A16_SFLOAT (must match gi.rs ProbeBakeTarget).
             vk::AttachmentDescription::default()
                 .format(vk::Format::R16G16B16A16_SFLOAT)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -484,7 +472,7 @@ impl RenderPasses {
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-            // Depth (transient, reused per face).
+            // Depth attachment.
             vk::AttachmentDescription::default()
                 .format(vk::Format::D32_SFLOAT)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -511,23 +499,25 @@ impl RenderPasses {
         let dependency = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
-            .src_stage_mask(
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
 
         let info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
+        Ok(unsafe { device.create_render_pass(&info, None)? })
+    }
 
-        unsafe { Ok(device.create_render_pass(&info, None)?) }
+    pub fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_render_pass(self.depth_prepass, None);
+            device.destroy_render_pass(self.lighting, None);
+            device.destroy_render_pass(self.shadow, None);
+            device.destroy_render_pass(self.probe_capture, None);
+        }
     }
 }
 
@@ -568,6 +558,8 @@ impl Pipelines {
         probe_capture_frag_spv: &[u8],
         skybox_vert_spv: &[u8],
         skybox_frag_spv: &[u8],
+        sun_shadow_vert_spv: &[u8],
+        sun_shadow_frag_spv: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cache = unsafe {
             device.create_pipeline_cache(
@@ -628,19 +620,17 @@ impl Pipelines {
         )?;
 
         // ---- Probe capture pipeline (Phase 3) ----
-        // Reuses the PBR vertex shader + same pipeline layout.
-        // Different fragment shader (all-lights, no GI, raw HDR).
         let probe_capture = Self::create_probe_capture_pipeline(
             device, cache, layout, passes.probe_capture,
             vert_spv, probe_capture_frag_spv,
         )?;
 
         // ---- Sun shadow pipeline (depth-only with hardware z, ortho) ----
-        // Uses the shadow render pass (SHADER_READ_ONLY ↔ SHADER_READ_ONLY)
-        // but with depth shaders (no gl_FragDepth override → standard ortho depth).
+        // Uses dedicated sun_shadow shaders - no color output, no validation warning.
+        // Orthographic projection naturally produces linear depth ideal for shadow comparison.
         let sun_shadow = Self::create_depth_pipeline(
             device, cache, layout, passes.shadow,
-            depth_vert_spv, depth_frag_spv,
+            sun_shadow_vert_spv, sun_shadow_frag_spv,
         )?;
 
         // ---- Skybox pipeline ----
@@ -737,9 +727,6 @@ impl Pipelines {
         }
     }
 
-    /// Depth pre-pass pipeline with G-buffer normal color output.
-    /// Same as `create_depth_pipeline` but includes one color blend
-    /// attachment for the R16G16_SFLOAT normal render target.
     fn create_depth_normal_pipeline(
         device: &Device,
         cache: vk::PipelineCache,
@@ -973,50 +960,8 @@ impl Pipelines {
         }
     }
 
-    fn create_compute_pipeline(
-        device: &Device,
-        cache: vk::PipelineCache,
-        layout: vk::PipelineLayout,
-        comp_spv: &[u8],
-    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
-        unsafe {
-            let module = create_shader_module(device, comp_spv)?;
-
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(c"main");
-
-            let info = vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(layout);
-
-            let pipelines = device
-                .create_compute_pipelines(cache, &[info], None)
-                .map_err(|(_, e)| e)?;
-            device.destroy_shader_module(module, None);
-            Ok(pipelines[0])
-        }
-    }
-
-    pub fn destroy(&self, device: &Device) {
-        unsafe {
-            device.destroy_pipeline(self.depth_prepass, None);
-            device.destroy_pipeline(self.lighting, None);
-            device.destroy_pipeline(self.shadow, None);
-            device.destroy_pipeline(self.cluster_compute, None);
-            device.destroy_pipeline(self.probe_capture, None);
-            device.destroy_pipeline(self.sun_shadow, None);
-            device.destroy_pipeline(self.skybox, None);
-            device.destroy_pipeline_layout(self.layout, None);
-            device.destroy_pipeline_layout(self.compute_layout, None);
-            device.destroy_pipeline_cache(self.cache, None);
-        }
-    }
-
-    /// Phase 3: Probe cubemap capture pipeline.
-    /// Same vertex layout as PBR, but uses the probe_capture fragment shader
-    /// and renders into the probe capture render pass (HDR color + depth).
+    /// Probe capture pipeline: simplified PBR for cubemap rendering (Phase 3).
+    /// Uses the same vertex shader as lighting, but a simplified fragment shader.
     fn create_probe_capture_pipeline(
         device: &Device,
         cache: vk::PipelineCache,
@@ -1093,8 +1038,7 @@ impl Pipelines {
         }
     }
 
-    /// Skybox pipeline: procedural cube, no vertex input, depth test ≤, no depth write.
-    /// Renders inside the lighting pass after all opaque geometry.
+    /// Skybox pipeline: procedural cube, depth test only (no write), renders last.
     fn create_skybox_pipeline(
         device: &Device,
         cache: vk::PipelineCache,
@@ -1165,6 +1109,47 @@ impl Pipelines {
             device.destroy_shader_module(vert_module, None);
             device.destroy_shader_module(frag_module, None);
             Ok(pipelines[0])
+        }
+    }
+
+    fn create_compute_pipeline(
+        device: &Device,
+        cache: vk::PipelineCache,
+        layout: vk::PipelineLayout,
+        comp_spv: &[u8],
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        unsafe {
+            let comp_module = create_shader_module(device, comp_spv)?;
+
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(comp_module)
+                .name(c"main");
+
+            let pipeline_info = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(layout);
+
+            let pipelines = device
+                .create_compute_pipelines(cache, &[pipeline_info], None)
+                .map_err(|(_, e)| e)?;
+            device.destroy_shader_module(comp_module, None);
+            Ok(pipelines[0])
+        }
+    }
+
+    pub fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_pipeline(self.depth_prepass, None);
+            device.destroy_pipeline(self.lighting, None);
+            device.destroy_pipeline(self.shadow, None);
+            device.destroy_pipeline(self.cluster_compute, None);
+            device.destroy_pipeline(self.probe_capture, None);
+            device.destroy_pipeline(self.sun_shadow, None);
+            device.destroy_pipeline(self.skybox, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_pipeline_layout(self.compute_layout, None);
+            device.destroy_pipeline_cache(self.cache, None);
         }
     }
 }
@@ -1386,21 +1371,29 @@ impl FrameLightingBuffers {
 //  Per-Frame Descriptor Sets
 // ====================================================================
 
+/// Per-frame descriptor sets.
+///
+/// Phase 8A: `per_draw_sets` removed — the object SSBO descriptor set is now
+/// owned and managed by `GpuCullResources` instead of here.
 pub struct FrameDescriptors {
     pub pool: vk::DescriptorPool,
     pub per_frame_sets: Vec<vk::DescriptorSet>,
-    pub per_draw_sets: Vec<vk::DescriptorSet>,
     pub shadow_map_sets: Vec<vk::DescriptorSet>,
+    // Phase 8A: per_draw_sets removed — now managed by GpuCullResources
 }
 
 impl FrameDescriptors {
+    /// Create per-frame descriptor sets.
+    ///
+    /// Phase 8A: `per_draw_ubo_range` parameter removed — the per-draw dynamic
+    /// UBO is replaced by the persistent object SSBO managed by GpuCullResources.
     pub fn new(
         device: &Device,
         layouts: &DescriptorLayouts,
         ring_buffer: vk::Buffer,
         global_ubo_range: u64,
         cluster_params_range: u64,
-        per_draw_ubo_range: u64,
+        // Phase 8A: per_draw_ubo_range removed
         material_ssbo: vk::Buffer,
         material_ssbo_size: u64,
         lighting: &FrameLightingBuffers,
@@ -1424,31 +1417,30 @@ impl FrameDescriptors {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let n = MAX_FRAMES_IN_FLIGHT as u32;
 
+        // Phase 8A: Pool sizes updated — removed per-draw UNIFORM_BUFFER_DYNAMIC
         let pool_sizes = [
             // Set 0: 3× UNIFORM_BUFFER_DYNAMIC (global + cluster + probe grid)
             //       + 5× STORAGE_BUFFER (light, cluster, index, material, probe)
-            //       + 3× COMBINED_IMAGE_SAMPLER (brdf, irradiance, prefiltered) per frame
+            //       + 4× COMBINED_IMAGE_SAMPLER (brdf, irradiance, prefiltered, ao) per frame
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(n * 3),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(n * 5),
-            // Set 0 GI samplers (3) + Set 2 shadow samplers + 1 AO (2: cube + sun)
+            // Set 0 GI samplers (4) + Set 2 shadow samplers (2: cube + sun)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(n * 6),
-            // Set 3: 1× UNIFORM_BUFFER_DYNAMIC per frame
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(n),
+            // Phase 8A: Removed per-draw UNIFORM_BUFFER_DYNAMIC pool size
+            // (object SSBO now managed by GpuCullResources)
         ];
 
         let pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .pool_sizes(&pool_sizes)
-                    .max_sets(n * 3), // N per-frame + N shadow + N per-draw
+                    .max_sets(n * 2), // N per-frame + N shadow (per_draw removed)
                 None,
             )?
         };
@@ -1473,15 +1465,7 @@ impl FrameDescriptors {
             )?
         };
 
-        // Allocate per-draw sets (set 3).
-        let per_draw_layouts = vec![layouts.per_draw; MAX_FRAMES_IN_FLIGHT];
-        let per_draw_sets = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&per_draw_layouts),
-            )?
-        };
+        // Phase 8A: per_draw_sets allocation removed — now in GpuCullResources
 
         // Write descriptors.
         for i in 0..MAX_FRAMES_IN_FLIGHT {
@@ -1636,25 +1620,14 @@ impl FrameDescriptors {
             ];
             unsafe { device.update_descriptor_sets(&shadow_writes, &[]) };
 
-            // ---- Set 3: Per-draw dynamic UBO ----
-            let per_draw_info = vk::DescriptorBufferInfo::default()
-                .buffer(ring_buffer)
-                .offset(0)
-                .range(per_draw_ubo_range);
-
-            let draw_write = vk::WriteDescriptorSet::default()
-                .dst_set(per_draw_sets[i])
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .buffer_info(std::slice::from_ref(&per_draw_info));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&draw_write), &[]) };
+            // Phase 8A: per_draw_sets writing removed — now in GpuCullResources
         }
 
         Ok(Self {
             pool,
             per_frame_sets,
-            per_draw_sets,
             shadow_map_sets,
+            // Phase 8A: per_draw_sets removed
         })
     }
 

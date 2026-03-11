@@ -1,0 +1,151 @@
+// Phase 8A: GPU Frustum Culling Compute Shader
+// Compile: glslc shaders/cull.comp -o shaders/compiled/cull.comp.spv --target-env=vulkan1.1 --target-spv=spv1.3
+//
+// Performs frustum culling on the GPU and writes visible objects to
+// indirect command buffers for vkCmdDrawIndexedIndirectCount.
+//
+// Per-group atomic append: objects are routed to their buffer_group's
+// section of the indirect command buffer using prefix-summed base offsets.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ====================================================================
+//  Data Structures (must match Rust GpuObjectData exactly)
+// ====================================================================
+
+struct ObjectData {
+    mat4  model;        // 64 bytes
+    vec4  aabb_min;     // 16 bytes (w unused)
+    vec4  aabb_max;     // 16 bytes (w unused)
+    uint  first_index;  //  4 bytes
+    uint  index_count;  //  4 bytes — 0 = slot empty, skip
+    int   vertex_offset;//  4 bytes
+    uint  material_id;  //  4 bytes
+    uint  buffer_group; //  4 bytes — VB/IB pair index
+    uint  flags;        //  4 bytes — RenderFlags bits
+    float lod_bias;     //  4 bytes
+    uint  _pad;         //  4 bytes
+};
+// Total: 128 bytes
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+// Total: 20 bytes
+
+// ====================================================================
+//  Descriptor Bindings
+// ====================================================================
+
+layout(set = 0, binding = 0) readonly  buffer Objects          { ObjectData objects[]; };
+layout(set = 0, binding = 1) writeonly buffer OpaqueDraws      { DrawIndexedIndirectCommand opaque_draws[];  };
+layout(set = 0, binding = 2)           buffer OpaqueGroupCounts{ uint opaque_counts[];  };
+layout(set = 0, binding = 3) writeonly buffer ShadowDraws      { DrawIndexedIndirectCommand shadow_draws[];  };
+layout(set = 0, binding = 4)           buffer ShadowGroupCounts{ uint shadow_counts[];  };
+layout(set = 0, binding = 5) readonly  buffer GroupBases       { uint group_bases[];   };
+
+// ====================================================================
+//  Push Constants
+// ====================================================================
+
+layout(push_constant) uniform CullParams {
+    vec4  frustum[6];    // 96 bytes — frustum planes (Ax + By + Cz + D)
+    vec3  camera_pos;    // 12 bytes
+    uint  total_objects; //  4 bytes
+};
+// Total: 112 bytes
+
+// ====================================================================
+//  RenderFlags Constants (must match Rust RenderFlags)
+// ====================================================================
+
+const uint FLAG_SHADOW_CASTER = 1u;   // 1 << 0
+const uint FLAG_TERRAIN       = 2u;   // 1 << 1
+const uint FLAG_FOLIAGE       = 4u;   // 1 << 2
+const uint FLAG_STATIC        = 8u;   // 1 << 3
+const uint FLAG_TRANSPARENT   = 16u;  // 1 << 4
+
+// ====================================================================
+//  Frustum Test
+// ====================================================================
+
+// Test if an AABB is visible against 6 frustum planes.
+// Uses the "p-vertex" technique: for each plane, check if the
+// positive-most corner (relative to the plane normal) is outside.
+bool frustum_test(vec3 aabb_min, vec3 aabb_max) {
+    for (int i = 0; i < 6; i++) {
+        vec3 p;
+        // Select the corner that is furthest in the direction of the plane normal
+        p.x = frustum[i].x >= 0.0 ? aabb_max.x : aabb_min.x;
+        p.y = frustum[i].y >= 0.0 ? aabb_max.y : aabb_min.y;
+        p.z = frustum[i].z >= 0.0 ? aabb_max.z : aabb_min.z;
+
+        // If this corner is behind the plane, the AABB is fully outside
+        if (dot(frustum[i].xyz, p) + frustum[i].w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ====================================================================
+//  Main
+// ====================================================================
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    // Bounds check
+    if (id >= total_objects) {
+        return;
+    }
+
+    ObjectData obj = objects[id];
+
+    // Skip empty slots (index_count == 0 marks deleted objects)
+    if (obj.index_count == 0u) {
+        return;
+    }
+
+    // Skip objects with no flags (dead/invalid)
+    if (obj.flags == 0u) {
+        return;
+    }
+
+    // Skip transparent objects (handled separately with CPU sort)
+    if ((obj.flags & FLAG_TRANSPARENT) != 0u) {
+        return;
+    }
+
+    // Frustum culling
+    if (!frustum_test(obj.aabb_min.xyz, obj.aabb_max.xyz)) {
+        return;
+    }
+
+    // Object is visible — write to opaque indirect buffer
+    uint group = obj.buffer_group;
+    uint slot = atomicAdd(opaque_counts[group], 1u) + group_bases[group];
+
+    opaque_draws[slot].indexCount    = obj.index_count;
+    opaque_draws[slot].instanceCount = 1u;
+    opaque_draws[slot].firstIndex    = obj.first_index;
+    opaque_draws[slot].vertexOffset  = obj.vertex_offset;
+    opaque_draws[slot].firstInstance = id;  // Vertex shader reads SSBO[gl_InstanceIndex]
+
+    // If shadow caster, also write to shadow indirect buffer
+    if ((obj.flags & FLAG_SHADOW_CASTER) != 0u) {
+        uint shadow_slot = atomicAdd(shadow_counts[group], 1u) + group_bases[group];
+
+        shadow_draws[shadow_slot].indexCount    = obj.index_count;
+        shadow_draws[shadow_slot].instanceCount = 1u;
+        shadow_draws[shadow_slot].firstIndex    = obj.first_index;
+        shadow_draws[shadow_slot].vertexOffset  = obj.vertex_offset;
+        shadow_draws[shadow_slot].firstInstance = id;
+    }
+}

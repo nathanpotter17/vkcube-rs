@@ -224,20 +224,26 @@ impl DeviceContext {
             //   - shader_sampled_image_array_non_uniform_indexing:
             //     nonuniformEXT() qualifier in fragment shader for
             //     dynamically indexed bindless texture sampling
+            //   - draw_indirect_count: Phase 8A GPU-driven rendering
+            //     vkCmdDrawIndexedIndirectCount for variable draw count
             let mut vk12_features =
                 vk::PhysicalDeviceVulkan12Features::default()
                     .timeline_semaphore(true)
                     .descriptor_binding_partially_bound(true)
                     .descriptor_binding_sampled_image_update_after_bind(true)
                     .runtime_descriptor_array(true)
-                    .shader_sampled_image_array_non_uniform_indexing(true);
+                    .shader_sampled_image_array_non_uniform_indexing(true)
+                    .draw_indirect_count(true);  // Phase 8A: GPU-driven rendering
 
             // Core 1.0 features:
             //   - sampler_anisotropy: texture filtering
             //   - image_cube_array:   samplerCubeArray for shadow cube maps (Phase 2)
+            //   - multi_draw_indirect: Phase 8A GPU-driven rendering
+            //     multiple indirect draw commands per dispatch
             let physical_features = vk::PhysicalDeviceFeatures::default()
                 .sampler_anisotropy(true)
-                .image_cube_array(true);
+                .image_cube_array(true)
+                .multi_draw_indirect(true);  // Phase 8A: GPU-driven rendering
 
             let device = instance.create_device(
                 physical_device,

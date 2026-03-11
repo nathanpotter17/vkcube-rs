@@ -68,37 +68,13 @@ impl Vertex {
     }
 }
 
-// ===== Per-Draw UBO (Phase 4: slimmed — view/proj moved to set 0 GlobalUbo) =====
-
-/// Per-draw dynamic UBO pushed into the ring buffer per draw call.
-///
-/// Phase 4: removed redundant `view` and `proj` matrices which duplicate
-/// the per-frame UBO at set 0 binding 0.  Shadow and probe passes now
-/// push a per-face GlobalUbo and rebind set 0 instead.
-///
-/// Layout (80 bytes, std140):
-///   mat4 model       (64 bytes)
-///   uint materialId  (4 bytes)
-///   uint _pad[3]     (12 bytes)
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PerDrawUbo {
-    pub model: [[f32; 4]; 4],
-    pub material_id: u32,
-    pub _pad: [u32; 3],
-}
-
-const _: () = assert!(std::mem::size_of::<PerDrawUbo>() == 80);
-
-impl PerDrawUbo {
-    pub fn new(model: [[f32; 4]; 4], material_id: u32) -> Self {
-        Self { model, material_id, _pad: [0; 3] }
-    }
-}
-
-/// Backward-compatible alias.  Old code that references `UniformBufferObject`
-/// can migrate incrementally.
-pub type UniformBufferObject = PerDrawUbo;
+// Phase 8A: PerDrawUbo REMOVED
+//
+// Per-draw data is now stored in GpuObjectData SSBO (gpu_cull.rs).
+// Vertex shaders read object data via gl_InstanceIndex from set 3 binding 0 STORAGE_BUFFER.
+// This eliminates:
+//   - ~8000 ring buffer pushes per frame
+//   - ~8000 descriptor rebinds with dynamic offsets
 
 // ===== Input =====
 
@@ -322,11 +298,6 @@ impl Scene {
             self.camera.position[0] - self.prev_camera_pos[0],
             self.camera.position[2] - self.prev_camera_pos[2],
         ]
-    }
-
-    /// Phase 4: returns PerDrawUbo (model + material_id only).
-    pub fn get_ubo(&self, material_id: u32) -> PerDrawUbo {
-        PerDrawUbo::new(identity_matrix(), material_id)
     }
 }
 

@@ -1176,6 +1176,117 @@ impl TransferQueue {
         })
     }
 
+    /// Upload `data` into `dst_buffer` at `dst_offset`.
+    ///
+    /// Unlike `upload_buffer_async`, this targets a specific region within
+    /// an existing buffer rather than the entire buffer. Used by GpuCullResources
+    /// to upload dirty object entries to the persistent SSBO.
+    ///
+    /// Returns Ok(()) on success. The upload is synchronous with respect to
+    /// the transfer queue timeline - caller should ensure proper barriers.
+    pub fn upload_region(
+        &mut self,
+        data: &[u8],
+        dst_buffer: vk::Buffer,
+        dst_offset: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let size = data.len() as u64;
+        if size == 0 {
+            return Ok(());
+        }
+
+        assert!(
+            size <= self.staging_size,
+            "Region upload {} B exceeds transfer staging belt {} B",
+            size,
+            self.staging_size,
+        );
+
+        // Wrap around the staging ring if needed.
+        if self.staging_offset + size > self.staging_size {
+            self.staging_offset = 0;
+        }
+
+        // Copy data into the staging region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.staging_mapped.as_ptr().add(self.staging_offset as usize),
+                data.len(),
+            );
+        }
+
+        let staging_offset = self.staging_offset;
+        self.staging_offset += align_up(size, 64);
+
+        // Record the copy command.
+        let cmd = unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            self.device.allocate_command_buffers(&info)?[0]
+        };
+
+        unsafe {
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+
+            let region = vk::BufferCopy::default()
+                .src_offset(staging_offset)
+                .dst_offset(dst_offset)  // Target specific offset
+                .size(size);
+            self.device.cmd_copy_buffer(
+                cmd,
+                self.staging_buffer,
+                dst_buffer,
+                std::slice::from_ref(&region),
+            );
+
+            // If using a dedicated transfer family, insert a release barrier.
+            if self.is_dedicated {
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .buffer(dst_buffer)
+                    .offset(dst_offset)
+                    .size(size)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(self.queue_family_index)
+                    .dst_queue_family_index(self.graphics_family_index);
+
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&barrier),
+                    &[],
+                );
+            }
+
+            self.device.end_command_buffer(cmd)?;
+        }
+
+        // Submit and wait for completion (synchronous for simplicity).
+        // For high-frequency SSBO updates, consider batching into fewer transfers.
+        let timeline_value = self.submit_timeline(cmd)?;
+
+        // Wait for completion
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(std::slice::from_ref(&self.timeline_semaphore))
+            .values(std::slice::from_ref(&timeline_value));
+
+        unsafe {
+            self.device.wait_semaphores(&wait_info, u64::MAX)?;
+        }
+
+        Ok(())
+    }
+
     /// Copy `data` into a staging region and submit a transfer command
     /// that copies it into `dst_buffer`.  Returns a ticket whose
     /// `timeline_value` the caller can poll with [`is_complete`].

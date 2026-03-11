@@ -8,6 +8,15 @@
 //   - Emissive texture multiplication when emissive_tex > 0
 //   - AO texture sampling when ao_tex > 0
 //   - ACES filmic tone mapping (replaces Reinhard from Phase 3)
+//
+// Phase 8A modification:
+//   - Sun shadow now affects ambient lighting (not just direct)
+//   - Shadowed areas receive reduced IBL/probe contribution for visible shadows
+//
+// Phase 8B modification:
+//   - Normal offset bias eliminates peter-panning (shadow detachment)
+//   - Slope-scaled depth bias adapts to surface angle
+//   - 16-sample rotated Poisson disk PCF for soft shadow edges
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -170,6 +179,11 @@ const uint FLAG_DOUBLE_SIDED = 1u;
 const uint FLAG_ALPHA_BLEND  = 2u;
 const uint FLAG_ALPHA_CUTOFF = 4u;
 
+// Phase 8A: Sun shadow ambient attenuation.
+// In full shadow, ambient is reduced to this fraction (0.0 = pure black, 1.0 = no effect).
+// 0.25-0.4 gives realistic outdoor shadow darkness while preserving fill light.
+const float SUN_SHADOW_AMBIENT_MIN = 0.3;
+
 // ====================================================================
 //  ACES Filmic Tone Mapping (Phase 4: replaces Reinhard)
 // ====================================================================
@@ -283,27 +297,122 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
     return currentDist - SHADOW_BIAS > closestDist ? 0.0 : 1.0;
 }
 
-// Sample the sun's 2D shadow map (orthographic projection).
-float sampleSunShadow(vec3 worldPos) {
+// ====================================================================
+//  Sun Shadow Sampling (Phase 8B: improved bias + PCF)
+// ====================================================================
+
+// Poisson disk samples for soft shadow PCF (16 samples, well-distributed).
+const vec2 poissonDisk[16] = vec2[](
+    vec2(-0.94201624, -0.39906216),
+    vec2( 0.94558609, -0.76890725),
+    vec2(-0.09418410, -0.92938870),
+    vec2( 0.34495938,  0.29387760),
+    vec2(-0.91588581,  0.45771432),
+    vec2(-0.81544232, -0.87912464),
+    vec2(-0.38277543,  0.27676845),
+    vec2( 0.97484398,  0.75648379),
+    vec2( 0.44323325, -0.97511554),
+    vec2( 0.53742981, -0.47373420),
+    vec2(-0.26496911, -0.41893023),
+    vec2( 0.79197514,  0.19090188),
+    vec2(-0.24188840,  0.99706507),
+    vec2(-0.81409955,  0.91437590),
+    vec2( 0.19984126,  0.78641367),
+    vec2( 0.14383161, -0.14100790)
+);
+
+// Interleaved gradient noise for sample rotation (stable, no banding).
+float interleavedGradientNoise(vec2 screenPos) {
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(screenPos, magic.xy)));
+}
+
+// Sample the sun's 2D shadow map with slope-scaled bias and normal offset.
+// N = surface normal (world space), used for bias calculation.
+// Returns 0.0 in shadow, 1.0 in light.
+float sampleSunShadow(vec3 worldPos, vec3 N) {
     if (frame.sun_direction.w < 0.5) return 1.0; // shadow disabled
 
+    vec3 L = -frame.sun_direction.xyz; // direction TO the sun
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+
+    // Normal offset: push sample position along normal to reduce self-shadowing.
+    // Larger offset for surfaces facing away from light (grazing angles).
+    // This is the key technique to eliminate peter-panning.
+    float normalOffsetScale = 0.4; // world units
+    float offsetBias = normalOffsetScale * (1.0 - NdotL);
+    vec3 offsetPos = worldPos + N * offsetBias;
+
     // Transform to sun light-space clip coordinates.
-    vec4 lightClip = frame.sun_light_vp * vec4(worldPos, 1.0);
-    // Perspective divide (ortho: w=1, but be safe).
+    vec4 lightClip = frame.sun_light_vp * vec4(offsetPos, 1.0);
     vec3 ndc = lightClip.xyz / lightClip.w;
-    // NDC to UV: x,y [-1,1] → [0,1].
     vec2 shadowUV = ndc.xy * 0.5 + 0.5;
 
-    // Out-of-bounds → lit (border sampler returns 1.0 = max depth).
+    // Out-of-bounds → lit.
     if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0)
         return 1.0;
 
     float currentDepth = ndc.z;
     float closestDepth = texture(sunShadowMap, shadowUV).r;
 
-    // Simple bias to prevent shadow acne.
-    float bias = 0.002;
+    // Slope-scaled depth bias: larger for grazing angles.
+    float baseBias = 0.0005;
+    float slopeBias = 0.002 * sqrt(1.0 - NdotL * NdotL); // sin(angle)
+    float bias = baseBias + slopeBias;
+
     return currentDepth - bias > closestDepth ? 0.0 : 1.0;
+}
+
+// PCF with Poisson disk sampling for soft sun shadows.
+// N = surface normal (world space).
+// Uses 16 rotated Poisson samples for smooth penumbra.
+float sampleSunShadowPCF(vec3 worldPos, vec3 N) {
+    if (frame.sun_direction.w < 0.5) return 1.0; // shadow disabled
+
+    vec3 L = -frame.sun_direction.xyz;
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+
+    // Normal offset bias (critical for eliminating peter-panning).
+    // Pushes sample point "into" the surface from the light's perspective.
+    float normalOffsetScale = 0.4;
+    float offsetBias = normalOffsetScale * (1.0 - NdotL);
+    vec3 offsetPos = worldPos + N * offsetBias;
+
+    vec4 lightClip = frame.sun_light_vp * vec4(offsetPos, 1.0);
+    vec3 ndc = lightClip.xyz / lightClip.w;
+    vec2 shadowUV = ndc.xy * 0.5 + 0.5;
+
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0)
+        return 1.0;
+
+    float currentDepth = ndc.z;
+
+    // Slope-scaled bias.
+    float baseBias = 0.0003;
+    float slopeBias = 0.0015 * sqrt(1.0 - NdotL * NdotL);
+    float bias = baseBias + slopeBias;
+
+    // Texel size and PCF spread.
+    // 2048 shadow map, 300m extent → ~0.146m per texel.
+    // Use 3-texel radius for ~0.9m soft shadow edge.
+    vec2 texelSize = vec2(1.0 / 2048.0);
+    float spreadRadius = 3.0; // in texels
+
+    // Rotate samples per-pixel using interleaved gradient noise.
+    // This breaks up banding artifacts into imperceptible noise.
+    float rotation = interleavedGradientNoise(gl_FragCoord.xy) * 6.283185;
+    float cosR = cos(rotation);
+    float sinR = sin(rotation);
+    mat2 rotationMatrix = mat2(cosR, sinR, -sinR, cosR);
+
+    float shadow = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec2 offset = rotationMatrix * poissonDisk[i] * spreadRadius * texelSize;
+        float closestDepth = texture(sunShadowMap, shadowUV + offset).r;
+        shadow += currentDepth - bias > closestDepth ? 0.0 : 1.0;
+    }
+
+    return shadow / 16.0;
 }
 
 // ====================================================================
@@ -436,9 +545,10 @@ vec3 evaluateLight(
         shadow = samplePointShadow(fragWorldPos, light.position_radius.xyz,
             light.position_radius.w, light.shadow_index);
     }
-    // Directional (sun) shadow.
+    // Directional (sun) shadow — handled separately in main() for ambient effect.
+    // Here we still apply it to the sun's direct contribution.
     if (lightType == 2u) {
-        shadow = sampleSunShadow(fragWorldPos);
+        shadow = sampleSunShadowPCF(fragWorldPos, N);
     }
 
     vec3 lightColor = light.color_intensity.rgb * light.color_intensity.w;
@@ -487,6 +597,15 @@ void main() {
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     float NdotV = max(dot(N, V), 0.0);
 
+    // ════════════════════════════════════════════════════════════════════════
+    // Phase 8A: Sample sun shadow ONCE, use for both direct and ambient
+    // ════════════════════════════════════════════════════════════════════════
+    float sunShadow = sampleSunShadowPCF(fragWorldPos, N);
+
+    // Compute ambient shadow factor: in full shadow, reduce ambient to SUN_SHADOW_AMBIENT_MIN.
+    // This simulates reduced sky visibility in shadowed areas.
+    float ambientShadowFactor = mix(SUN_SHADOW_AMBIENT_MIN, 1.0, sunShadow);
+
     // ---- Clustered direct lighting ----
     uint clusterIdx = getClusterIndex();
     GpuCluster c = clusterBuf.clusters[clusterIdx];
@@ -516,7 +635,10 @@ void main() {
     // Screen-space AO modulates the ambient term.
     vec2 screenUV = gl_FragCoord.xy / vec2(cluster.screen_size);
     float ao_screen = texture(aoScreen, screenUV).r;
-    vec3 ambient = (diffuseGI + indirectSpecular) * ao * ao_screen;
+
+    // Phase 8A: Apply sun shadow to ambient (IBL + probes).
+    // This makes shadows clearly visible even with strong ambient lighting.
+    vec3 ambient = (diffuseGI + indirectSpecular) * ao * ao_screen * ambientShadowFactor;
 
     // ---- Phase 4: Emissive texture multiplication ----
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;
@@ -525,6 +647,9 @@ void main() {
     }
 
     vec3 color = ambient + Lo + emissive;
+
+    // ---- DEBUG: Uncomment to visualize sun shadow ----
+    // outColor = vec4(vec3(sunShadow), 1.0); return;
 
     // ---- Phase 4: ACES Filmic Tone Mapping (replaces Reinhard) ----
     color = acesFilm(color);
