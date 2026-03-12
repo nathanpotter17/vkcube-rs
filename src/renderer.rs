@@ -20,7 +20,7 @@ use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
                        MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightCategory, LightManager, LightType,
-    ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, SunShadow,
+    ShadowAtlas, ShadowBudgetManager, ShadowLod, ShadowPushConstants, SunShadow,
     compute_sun_shadow_matrices,
     CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE,
     SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY, SUN_DIR,
@@ -1035,6 +1035,8 @@ impl Renderer {
                     self.overlay.stats.lights_dynamic = dynamic;
                 }
                 self.overlay.stats.effective_shadow_slots = self.shadow_budget.effective_max_slots();
+                // Phase 8D.1: LOD tier breakdown.
+                self.overlay.stats.shadow_lod_counts = self.shadow_budget.lod_tier_counts();
                 self.overlay.stats.draw_calls_opaque = 1; // Phase 8B: single indirect_count
                 self.overlay.stats.draw_calls_shadow = 1;
                 self.overlay.stats.staging_fill_pct = self.memory_ctx.transfer.staging_fill_ratio() * 100.0;
@@ -1103,7 +1105,7 @@ impl Renderer {
                 self.device.cmd_end_render_pass(cmd);
             }
 
-            // ---- Point light cube map shadows (Phase 8C.2: with caching) ----
+            // ---- Point light cube map shadows (Phase 8D.1: LOD cadence gating) ----
             let sv = vk::Viewport { x:0.0,y:0.0, width:SHADOW_MAP_SIZE as f32, height:SHADOW_MAP_SIZE as f32, min_depth:0.0, max_depth:1.0 };
             let ss = vk::Rect2D { offset:vk::Offset2D{x:0,y:0}, extent:vk::Extent2D{width:SHADOW_MAP_SIZE,height:SHADOW_MAP_SIZE} };
 
@@ -1111,15 +1113,18 @@ impl Renderer {
             // while also needing &mut self for mark_slot_clean.
             let assigned: Vec<(u32, usize)> = self.shadow_budget.assigned_slots().collect();
 
-            // Phase 8E stability: Cap dirty slot re-renders per frame.
-            // Prevents spikes when invalidate_all() fires on sector load/unload.
-            // 8 slots × 6 faces × ~0.02ms/face ≈ 1ms max spike.
-            const MAX_DIRTY_RENDERS_PER_FRAME: u32 = 8;
+            // Phase 8D.1: Stagger cap increased from 8 to 16.
+            // LOD cadence is the primary throttle; this is a safety valve for
+            // invalidate_all() spikes (sector load/unload).
+            // 16 slots × 6 faces × ~0.02 ms/face ≈ 1.9 ms max spike.
+            const MAX_DIRTY_RENDERS_PER_FRAME: u32 = 16;
             let mut dirty_rendered = 0u32;
 
             for (slot, light_idx) in assigned {
-                // Phase 8C.2: Shadow caching — skip clean (unchanged) slots.
-                if !self.shadow_budget.is_slot_dirty(slot) {
+                // Phase 8D.1: Combined dirty + LOD cadence check.
+                // should_render_slot returns false for clean slots, respects
+                // per-tier cadence, and bypasses cadence for first renders.
+                if !self.shadow_budget.should_render_slot(slot, self.global_frame) {
                     continue;
                 }
 

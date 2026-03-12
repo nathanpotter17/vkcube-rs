@@ -34,7 +34,8 @@ pub const MAX_LIGHTS: usize = 4096;
 pub const MAX_LIGHTS_PER_CLUSTER: usize = 128;
 
 /// Number of point light shadow slots (cube map slices).
-pub const MAX_SHADOW_SLOTS: usize = 32;
+/// Phase 8D.1: 32→64 for 63 point shadow casters + 1 sun.
+pub const MAX_SHADOW_SLOTS: usize = 64;
 
 /// Shadow map resolution per face (pixels).
 pub const SHADOW_MAP_SIZE: u32 = 256;
@@ -54,6 +55,59 @@ pub const LIGHT_INDEX_CAPACITY: u32 = TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER as
 
 /// Hysteresis bonus score for lights retaining shadow slots across frames.
 const SHADOW_HYSTERESIS_BONUS: f32 = 2.0;
+
+// ====================================================================
+//  Phase 8D.1: Shadow LOD tiers
+// ====================================================================
+
+/// Distance-based shadow quality tier. Determines re-render cadence.
+///
+/// Tiers reduce shadow cost by rendering distant lights less frequently.
+/// Tier 3 lights receive no shadow slot — the shader sees
+/// `shadow_index == 0xFFFFFFFF` and returns `shadow = 1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShadowLod {
+    /// < 30 m — full resolution, every frame.
+    Near = 0,
+    /// 30–60 m — every 2nd frame.
+    Mid = 1,
+    /// 60–100 m — every 4th frame.
+    Far = 2,
+    /// > 100 m — no shadow slot, shadow = 1.0 in shader.
+    Distant = 3,
+}
+
+/// Squared distance thresholds for LOD tier boundaries.
+const LOD_DIST_SQ_NEAR: f32 = 30.0 * 30.0;   // 900
+const LOD_DIST_SQ_MID: f32  = 60.0 * 60.0;   // 3600
+const LOD_DIST_SQ_FAR: f32  = 100.0 * 100.0;  // 10000
+
+/// Determine shadow LOD tier from squared camera distance.
+#[inline]
+fn lod_for_distance_sq(d2: f32) -> ShadowLod {
+    if d2 < LOD_DIST_SQ_NEAR {
+        ShadowLod::Near
+    } else if d2 < LOD_DIST_SQ_MID {
+        ShadowLod::Mid
+    } else if d2 < LOD_DIST_SQ_FAR {
+        ShadowLod::Far
+    } else {
+        ShadowLod::Distant
+    }
+}
+
+/// Re-render cadence for a given LOD tier (in frames).
+/// Tier 3 returns 0 — meaning "never render" (no slot assigned).
+#[inline]
+fn lod_cadence(lod: ShadowLod) -> u64 {
+    match lod {
+        ShadowLod::Near => 1,
+        ShadowLod::Mid => 2,
+        ShadowLod::Far => 4,
+        ShadowLod::Distant => 0,
+    }
+}
 
 pub const SUN_COLOR: [f32; 3] = [1.0, 0.95, 0.85]; 
 pub const SUN_INTENSITY: f32 = 2.5;
@@ -624,6 +678,7 @@ impl LightManager {
 ///
 /// Phase 8C.2: Includes per-slot cache state for temporal shadow caching.
 /// Phase 8C.5: Adaptive budget driven by profiler feedback.
+/// Phase 8D.1: Distance-based LOD tiers with cadence-gated re-rendering.
 pub struct ShadowBudgetManager {
     /// Current slot assignments: slot index → global light index.
     slot_to_light: [Option<usize>; MAX_SHADOW_SLOTS],
@@ -631,6 +686,8 @@ pub struct ShadowBudgetManager {
     light_to_slot: HashMap<usize, u32>,
     /// Phase 8C.2: Per-slot cache state for temporal shadow caching.
     slot_cache: Vec<ShadowSlotCache>,
+    /// Phase 8D.1: LOD tier assigned to each slot this frame.
+    slot_lod: [ShadowLod; MAX_SHADOW_SLOTS],
     /// Phase 8C.5: Target shadow pass time budget (ms). Default: 4.0.
     pub time_budget_ms: f32,
     /// Phase 8C.5: Previous frame's measured shadow pass time (from GpuProfiler).
@@ -640,6 +697,7 @@ pub struct ShadowBudgetManager {
 }
 
 /// Phase 8C.2: Per-slot shadow cache state.
+/// Phase 8D.1: Extended with LOD tier for cadence-based re-rendering.
 #[derive(Debug, Clone)]
 pub struct ShadowSlotCache {
     /// Global light index occupying this slot (None = empty).
@@ -652,6 +710,13 @@ pub struct ShadowSlotCache {
     pub cached_radius: f32,
     /// True if slot content is stale and needs re-render.
     pub dirty: bool,
+    /// Phase 8D.1: True when dirty was caused by actual light movement
+    /// (position/radius change). Bypasses LOD cadence gating to prevent
+    /// shadow-position mismatch flicker on animated lights.
+    /// False when dirty was caused by external invalidation (sector load).
+    pub movement_dirty: bool,
+    /// Phase 8D.1: Current LOD tier for this slot's light.
+    pub lod_tier: ShadowLod,
 }
 
 impl ShadowSlotCache {
@@ -662,6 +727,8 @@ impl ShadowSlotCache {
             position_hash: 0,
             cached_radius: 0.0,
             dirty: true,
+            movement_dirty: false,
+            lod_tier: ShadowLod::Near,
         }
     }
 }
@@ -682,6 +749,7 @@ impl ShadowBudgetManager {
             slot_cache: (0..MAX_SHADOW_SLOTS)
                 .map(|_| ShadowSlotCache::empty())
                 .collect(),
+            slot_lod: [ShadowLod::Near; MAX_SHADOW_SLOTS],
             time_budget_ms: 4.0,
             last_shadow_time_ms: 0.0,
             effective_max_slots: MAX_SHADOW_SLOTS,
@@ -714,13 +782,18 @@ impl ShadowBudgetManager {
 
     /// Score and assign shadow slots for the current frame's active lights.
     ///
+    /// Phase 8D.1: Computes per-light LOD tier from camera distance.
+    /// Tier 3 (Distant, >100m) lights are excluded — they receive no slot
+    /// and the shader sees `shadow_index == 0xFFFFFFFF` → `shadow = 1.0`.
+    ///
     /// Returns a map: global light index → shadow slot.
     pub fn assign(
         &mut self,
         light_manager: &LightManager,
         camera_pos: [f32; 3],
     ) -> HashMap<usize, u32> {
-        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        // (light_idx, score, distance_sq)
+        let mut candidates: Vec<(usize, f32, f32)> = Vec::new();
 
         for &idx in light_manager.active_indices() {
             let Some(light) = light_manager.get(idx) else { continue };
@@ -736,6 +809,11 @@ impl ShadowBudgetManager {
 
             let d2 = dist_sq(camera_pos, light.position).max(1.0);
 
+            // Phase 8D.1: Tier 3 (Distant) lights don't compete for slots.
+            if lod_for_distance_sq(d2) == ShadowLod::Distant {
+                continue;
+            }
+
             // Score: inverse distance² × radius (screen-space proxy).
             let mut score = (light.radius * light.radius) / d2;
 
@@ -744,7 +822,7 @@ impl ShadowBudgetManager {
                 score += SHADOW_HYSTERESIS_BONUS;
             }
 
-            candidates.push((idx, score));
+            candidates.push((idx, score, d2));
         }
 
         // Sort descending by score.
@@ -753,16 +831,19 @@ impl ShadowBudgetManager {
         // Clear previous assignments.
         let prev_light_to_slot = std::mem::take(&mut self.light_to_slot);
         self.slot_to_light = [None; MAX_SHADOW_SLOTS];
+        self.slot_lod = [ShadowLod::Near; MAX_SHADOW_SLOTS];
 
         // Assign top N candidates.
         let mut next_slot: u32 = 0;
         let mut assignments = HashMap::new();
 
-        for (light_idx, _score) in candidates {
+        for (light_idx, _score, d2) in candidates {
             // Phase 8C.5: use adaptive effective_max_slots instead of MAX_SHADOW_SLOTS.
             if next_slot as usize >= self.effective_max_slots {
                 break;
             }
+
+            let lod = lod_for_distance_sq(d2);
 
             // Prefer re-using the light's previous slot (reduces shadow
             // flicker from re-rendering a different atlas slice).
@@ -796,6 +877,7 @@ impl ShadowBudgetManager {
             };
 
             self.slot_to_light[slot as usize] = Some(light_idx);
+            self.slot_lod[slot as usize] = lod;
             self.light_to_slot.insert(light_idx, slot);
             assignments.insert(light_idx, slot);
         }
@@ -822,6 +904,7 @@ impl ShadowBudgetManager {
 
     /// Update cache state after shadow slot assignment.
     /// Call AFTER assign() each frame.
+    /// Phase 8D.1: Also propagates LOD tier from slot_lod into slot_cache.
     pub fn update_cache(
         &mut self,
         light_manager: &LightManager,
@@ -852,8 +935,13 @@ impl ShadowBudgetManager {
                         cache.position_hash = pos_hash;
                         cache.cached_radius = light.radius;
                         cache.dirty = true;
+                        // Phase 8D.1: Actual light change → bypass cadence.
+                        cache.movement_dirty = true;
                     }
                     // If nothing changed, dirty stays false from last clear.
+
+                    // Phase 8D.1: Propagate LOD tier.
+                    cache.lod_tier = self.slot_lod[slot];
                 }
             }
         }
@@ -864,10 +952,60 @@ impl ShadowBudgetManager {
         self.slot_cache.get(slot as usize).map_or(true, |c| c.dirty)
     }
 
+    /// Phase 8D.1: Determine if a slot should be rendered this frame.
+    ///
+    /// Combines dirty-state with LOD cadence gating:
+    /// - Tier 0 (Near): render every dirty frame
+    /// - Tier 1 (Mid): render every 2nd frame (slot-offset spread)
+    /// - Tier 2 (Far): render every 4th frame (slot-offset spread)
+    /// - Tier 3 (Distant): never (no slot assigned anyway)
+    ///
+    /// Cadence bypassed when:
+    /// - `movement_dirty`: light actually moved → must re-render to avoid
+    ///   shadow-position mismatch flicker on animated lights.
+    /// - `last_rendered_frame == 0`: first render, prevent pop-in.
+    ///
+    /// Cadence ONLY throttles mass-invalidation (`invalidate_all` on sector
+    /// load/unload) where the shadow content is still roughly correct and
+    /// spreading re-renders prevents frame spikes.
+    pub fn should_render_slot(&self, slot: u32, current_frame: u64) -> bool {
+        let Some(cache) = self.slot_cache.get(slot as usize) else {
+            return false;
+        };
+
+        // Not dirty → nothing to render.
+        if !cache.dirty {
+            return false;
+        }
+
+        let cadence = lod_cadence(cache.lod_tier);
+        if cadence == 0 {
+            // Tier 3 — should never happen (no slot assigned), but guard.
+            return false;
+        }
+
+        // Movement-dirty: light actually moved. Shadow MUST update this
+        // frame or the cubemap shows a stale position while the SSBO has
+        // the new one → visible flicker.
+        if cache.movement_dirty {
+            return true;
+        }
+
+        // First render: bypass cadence to avoid pop-in.
+        if cache.last_rendered_frame == 0 {
+            return true;
+        }
+
+        // Cadence check: only applies to invalidation-dirty slots.
+        // Spread renders across frames using slot offset.
+        (current_frame % cadence) == ((slot as u64) % cadence)
+    }
+
     /// Mark a slot as clean after rendering. Call after shadow pass completes.
     pub fn mark_slot_clean(&mut self, slot: u32, frame: u64) {
         if let Some(cache) = self.slot_cache.get_mut(slot as usize) {
             cache.dirty = false;
+            cache.movement_dirty = false;
             cache.last_rendered_frame = frame;
         }
     }
@@ -877,6 +1015,18 @@ impl ShadowBudgetManager {
         for cache in &mut self.slot_cache {
             cache.dirty = true;
         }
+    }
+
+    /// Phase 8D.1: Count slots per LOD tier (for debug overlay).
+    /// Returns [near, mid, far, distant(unused)].
+    pub fn lod_tier_counts(&self) -> [u32; 4] {
+        let mut counts = [0u32; 4];
+        for (slot, opt) in self.slot_to_light.iter().enumerate() {
+            if opt.is_some() {
+                counts[self.slot_lod[slot] as usize] += 1;
+            }
+        }
+        counts
     }
 }
 

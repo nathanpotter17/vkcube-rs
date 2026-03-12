@@ -106,6 +106,8 @@ pub struct OverlayStats {
     pub lights_dynamic: u32,
     /// Phase 8C.5: Current adaptive shadow slot cap.
     pub effective_shadow_slots: usize,
+    /// Phase 8D.1: Shadow slots per LOD tier [near, mid, far, distant].
+    pub shadow_lod_counts: [u32; 4],
 
     // Drawing
     pub draw_calls_opaque: usize,
@@ -168,6 +170,12 @@ impl OverlayStats {
         lines.push(format!(
             "  {} dynamic  {} baked (no shadow)",
             self.lights_dynamic, self.lights_baked,
+        ));
+        // Phase 8D.1: Shadow LOD tier breakdown.
+        let lc = self.shadow_lod_counts;
+        lines.push(format!(
+            "  LOD: {} near  {} mid  {} far  ({} distant unshadowed)",
+            lc[0], lc[1], lc[2], lc[3],
         ));
 
         // Line 6: draws
