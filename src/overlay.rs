@@ -100,6 +100,12 @@ pub struct OverlayStats {
     pub lights_total: usize,
     pub lights_active: u32,
     pub lights_shadow: u32,
+    /// Phase 8C: Baked (no-shadow) light count among active lights.
+    pub lights_baked: u32,
+    /// Phase 8C: Dynamic (shadow-eligible) light count among active lights.
+    pub lights_dynamic: u32,
+    /// Phase 8C.5: Current adaptive shadow slot cap.
+    pub effective_shadow_slots: usize,
 
     // Drawing
     pub draw_calls_opaque: usize,
@@ -153,10 +159,15 @@ impl OverlayStats {
             self.budget_mb, self.tracked_mb,
         ));
 
-        // Line 5: lights
+        // Line 5: lights (Phase 8C: show baked/dynamic breakdown + budget)
         lines.push(format!(
-            "Lights: {} total  {} active  {} shadow",
-            self.lights_total, self.lights_active, self.lights_shadow,
+            "Lights: {} total  {} active  {} shadow/{}slots",
+            self.lights_total, self.lights_active,
+            self.lights_shadow, self.effective_shadow_slots,
+        ));
+        lines.push(format!(
+            "  {} dynamic  {} baked (no shadow)",
+            self.lights_dynamic, self.lights_baked,
         ));
 
         // Line 6: draws

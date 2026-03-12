@@ -59,7 +59,7 @@ struct GpuLight {
     vec4  position_radius;
     vec4  direction_cos_outer;
     vec4  color_intensity;
-    uint  type_flags;
+    uint  type_flags;           // bits 0-1: type, bit 2: shadow_capable, bit 3: baked (8C.1)
     uint  shadow_index;
     float falloff;
     float cos_inner_angle;
@@ -540,15 +540,20 @@ vec3 evaluateLight(
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 diffuse = kD * albedo / PI;
 
+    // Phase 8C.1: Skip shadow sampling for baked lights (bit 3 = baked).
     float shadow = 1.0;
-    if (light.shadow_index != 0xFFFFFFFFu && lightType != 2u) {
-        shadow = samplePointShadow(fragWorldPos, light.position_radius.xyz,
-            light.position_radius.w, light.shadow_index);
-    }
-    // Directional (sun) shadow — handled separately in main() for ambient effect.
-    // Here we still apply it to the sun's direct contribution.
-    if (lightType == 2u) {
-        shadow = sampleSunShadowPCF(fragWorldPos, N);
+    bool is_baked = (light.type_flags & 8u) != 0u;
+
+    if (!is_baked) {
+        if (light.shadow_index != 0xFFFFFFFFu && lightType != 2u) {
+            shadow = samplePointShadow(fragWorldPos, light.position_radius.xyz,
+                light.position_radius.w, light.shadow_index);
+        }
+        // Directional (sun) shadow — handled separately in main() for ambient effect.
+        // Here we still apply it to the sun's direct contribution.
+        if (lightType == 2u) {
+            shadow = sampleSunShadowPCF(fragWorldPos, N);
+        }
     }
 
     vec3 lightColor = light.color_intensity.rgb * light.color_intensity.w;
@@ -606,13 +611,22 @@ void main() {
     // This simulates reduced sky visibility in shadowed areas.
     float ambientShadowFactor = mix(SUN_SHADOW_AMBIENT_MIN, 1.0, sunShadow);
 
-    // ---- Clustered direct lighting ----
+    // ---- Clustered direct lighting (Phase 8C.4: with luminance early exit) ----
     uint clusterIdx = getClusterIndex();
     GpuCluster c = clusterBuf.clusters[clusterIdx];
     vec3 Lo = vec3(0.0);
     for (uint i = 0; i < c.count; i++) {
         uint lightIdx = indexBuf.indices[c.offset + i];
         Lo += evaluateLight(lightBuf.lights[lightIdx], N, V, albedo, metallic, roughness, F0);
+
+        // Phase 8C.4: Luminance-based early exit — if accumulated contribution is
+        // saturated AND we've processed at least half the lights, bail.
+        // Check every 4th iteration to minimize branch overhead.
+        // Threshold 1.5: ACES maps this to ~0.95 (near-white), imperceptible savings.
+        if ((i & 3u) == 3u && i > (c.count >> 1u)) {
+            float lum = dot(Lo, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 1.5) break;
+        }
     }
 
     // ---- Phase 3: Indirect diffuse (SH probes + irradiance map) ----

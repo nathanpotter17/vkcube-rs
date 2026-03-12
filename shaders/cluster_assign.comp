@@ -19,7 +19,7 @@ layout(local_size_x = 64) in;
 #define MAX_LIGHTS_PER_CLUSTER 128
 #define CLUSTER_X 16
 #define CLUSTER_Y 9
-#define CLUSTER_Z 24
+#define CLUSTER_Z 32
 
 // --------------------------------------------------------------------
 //  GPU types
@@ -169,8 +169,12 @@ void main() {
     barrier();
     memoryBarrierBuffer();
 
-    // ---- Fast path: <50 lights → assign all to all clusters ----
-    if (numLights < 50) {
+    // ---- Fast path: <8 lights → assign all to all clusters ----
+    // Phase 8C: Lowered from 50. With tight radii (8-30m), spatial culling
+    // rejects most lights from most clusters even at modest counts.
+    // At 44 lights with 30m radii, brute-force assigns all 44 to every
+    // fragment — spatial culling reduces this to ~3-8 per cluster.
+    if (numLights < 8) {
         uint count = min(numLights, MAX_LIGHTS_PER_CLUSTER);
 
         if (gl_LocalInvocationID.x == 0) {

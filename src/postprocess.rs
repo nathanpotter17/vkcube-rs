@@ -4,6 +4,11 @@
 //! its separable bilateral blur.  Integrates between the depth pre-pass
 //! and the cluster-assign compute pass in the render graph.
 //!
+//! Phase 8E: AO images are allocated at half resolution (W/2 × H/2).
+//! The HBAO and blur compute dispatches run at half-res, then the PBR
+//! fragment shader reads the result via a LINEAR sampler for automatic
+//! bilinear upscale.  This provides a ~4× speedup with minimal quality loss.
+//!
 //! Resources owned:
 //! - AO output image (`R8_UNORM`, full resolution)
 //! - AO temp image (intermediate for separable blur)
@@ -132,6 +137,11 @@ impl HbaoPass {
         let w = extent.width;
         let h = extent.height;
 
+        // Phase 8E: HBAO at half resolution — 4× fewer pixels to process.
+        // The PBR pass reads via LINEAR sampler → automatic bilinear upscale.
+        let ao_w = w / 2;
+        let ao_h = h / 2;
+
         // ---- Samplers ----
 
         let depth_sampler = unsafe {
@@ -160,12 +170,12 @@ impl HbaoPass {
             )?
         };
 
-        // ---- AO images ----
+        // ---- AO images (Phase 8E: half-resolution) ----
 
         let (ao_image, ao_memory, ao_storage_view, ao_sampled_view) =
-            Self::create_ao_image(device, allocator, w, h)?;
+            Self::create_ao_image(device, allocator, ao_w, ao_h)?;
         let (ao_temp_image, ao_temp_memory, ao_temp_storage_view, ao_temp_sampled) =
-            Self::create_ao_image(device, allocator, w, h)?;
+            Self::create_ao_image(device, allocator, ao_w, ao_h)?;
         unsafe { device.destroy_image_view(ao_temp_sampled, None) };
 
         // ---- Params UBO ----
@@ -180,8 +190,8 @@ impl HbaoPass {
         let params_buffer = alloc.buffer;
         let params_ptr = alloc.mapped_ptr.ok_or("HBAO UBO not mapped")?;
 
-        // Write initial params.
-        Self::write_params(params_ptr, w, h, proj, inv_proj);
+        // Phase 8E: UBO resolution is half-res so shaders index correctly.
+        Self::write_params(params_ptr, ao_w, ao_h, proj, inv_proj);
 
         // ---- Descriptor pool ----
         // Need: 3 sets total (hbao, blur_h, blur_v)
@@ -352,9 +362,9 @@ impl HbaoPass {
         )?;
 
         println!(
-            "[HbaoPass] Initialized: {}×{} AO texture, radius={:.2}m, \
+            "[HbaoPass] Initialized: {}×{} AO texture (half-res from {}×{}), radius={:.2}m, \
              bias={:.2}, intensity={:.1}",
-            w, h, HBAO_RADIUS, HBAO_BIAS, HBAO_INTENSITY,
+            ao_w, ao_h, w, h, HBAO_RADIUS, HBAO_BIAS, HBAO_INTENSITY,
         );
 
         Ok(Self {
@@ -367,7 +377,7 @@ impl HbaoPass {
             blur_pipeline, blur_pipeline_layout, blur_set_layout,
             blur_h_set, blur_v_set,
             descriptor_pool,
-            width: w, height: h,
+            width: ao_w, height: ao_h,
         })
     }
 
@@ -607,30 +617,34 @@ impl HbaoPass {
         let w = extent.width;
         let h = extent.height;
 
+        // Phase 8E: half-resolution AO.
+        let ao_w = w / 2;
+        let ao_h = h / 2;
+
         // Destroy old AO images.
         Self::destroy_ao_image(device, self.ao_image, self.ao_memory,
                                self.ao_storage_view, self.ao_sampled_view);
         Self::destroy_ao_image(device, self.ao_temp_image, self.ao_temp_memory,
                                self.ao_temp_storage_view, vk::ImageView::null());
 
-        // Recreate.
-        let (ai, am, asv, asmv) = Self::create_ao_image(device, allocator, w, h)?;
+        // Recreate at half resolution.
+        let (ai, am, asv, asmv) = Self::create_ao_image(device, allocator, ao_w, ao_h)?;
         self.ao_image = ai;
         self.ao_memory = am;
         self.ao_storage_view = asv;
         self.ao_sampled_view = asmv;
 
-        let (ti, tm, tsv, temp_sampled) = Self::create_ao_image(device, allocator, w, h)?;
+        let (ti, tm, tsv, temp_sampled) = Self::create_ao_image(device, allocator, ao_w, ao_h)?;
         unsafe { device.destroy_image_view(temp_sampled, None) };
         self.ao_temp_image = ti;
         self.ao_temp_memory = tm;
         self.ao_temp_storage_view = tsv;
 
-        self.width = w;
-        self.height = h;
+        self.width = ao_w;
+        self.height = ao_h;
 
-        // Update UBO.
-        Self::write_params(self.params_ptr, w, h, proj, inv_proj);
+        // Update UBO with half-res dimensions.
+        Self::write_params(self.params_ptr, ao_w, ao_h, proj, inv_proj);
 
         // Re-write descriptors with new views.
         Self::write_hbao_descriptors(
@@ -652,7 +666,7 @@ impl HbaoPass {
             depth_image_view, self.depth_sampler,
         );
 
-        println!("[HbaoPass] Resized to {}×{}", w, h);
+        println!("[HbaoPass] Resized to {}×{} (half-res AO: {}×{})", w, h, ao_w, ao_h);
         Ok(())
     }
 

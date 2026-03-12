@@ -45,7 +45,7 @@ pub const SHADOW_NEAR: f32 = 0.1;
 /// Cluster grid dimensions for 1080p with logarithmic depth slicing.
 pub const CLUSTER_X: u32 = 16;
 pub const CLUSTER_Y: u32 = 9;
-pub const CLUSTER_Z: u32 = 24;
+pub const CLUSTER_Z: u32 = 32; // Phase 8C.3: was 24, finer depth binning
 pub const TOTAL_CLUSTERS: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
 
 /// Max entries in the global light index buffer (clusters × max per cluster).
@@ -84,6 +84,16 @@ pub enum LightType {
     Directional = 2,
 }
 
+/// Phase 8C.1: Light update category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightCategory {
+    /// Updated per-frame. Eligible for real-time shadows.
+    Dynamic,
+    /// Uploaded once when sector loads. No shadows. Never updated.
+    /// Removed when sector evicts. Skips shadow sampling in shader.
+    Baked,
+}
+
 /// CPU-side light definition.  Registered per-sector, culled per-frame.
 #[derive(Debug, Clone)]
 pub struct Light {
@@ -102,6 +112,8 @@ pub struct Light {
     pub cos_inner_angle: f32,
     /// Can this light cast shadows?
     pub shadow_capable: bool,
+    /// Phase 8C.1: Light update category (dynamic vs baked).
+    pub category: LightCategory,
     /// Sector that registered this light (for bulk unregister).
     pub(crate) source_sector: SectorCoord,
 }
@@ -125,6 +137,7 @@ impl Light {
             cos_outer_angle: -1.0,
             cos_inner_angle: -1.0,
             shadow_capable: true,
+            category: LightCategory::Dynamic,
             source_sector: (0, 0),
         }
     }
@@ -156,6 +169,7 @@ impl Light {
             cos_outer_angle: -1.0,
             cos_inner_angle: -1.0,
             shadow_capable: false,
+            category: LightCategory::Dynamic,
             source_sector: (0, 0),
         }
     }
@@ -191,6 +205,30 @@ impl Light {
             cos_outer_angle: outer_angle_deg.to_radians().cos(),
             cos_inner_angle: inner_angle_deg.to_radians().cos(),
             shadow_capable: true,
+            category: LightCategory::Dynamic,
+            source_sector: (0, 0),
+        }
+    }
+
+    /// Phase 8C.1: Create a baked point light. No shadows, no per-frame updates.
+    pub fn baked_point(
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        radius: f32,
+    ) -> Self {
+        Self {
+            light_type: LightType::Point,
+            position,
+            direction: [0.0, -1.0, 0.0],
+            color,
+            intensity,
+            radius,
+            falloff: 2.0,
+            cos_outer_angle: -1.0,
+            cos_inner_angle: -1.0,
+            shadow_capable: false,
+            category: LightCategory::Baked,
             source_sector: (0, 0),
         }
     }
@@ -207,7 +245,7 @@ impl Light {
 ///     vec4  position_radius;      // xyz = pos, w = radius
 ///     vec4  direction_cos_outer;   // xyz = dir, w = cos(outer_angle)
 ///     vec4  color_intensity;       // xyz = color, w = intensity
-///     uint  type_flags;            // bits 0-1: type, bit 2: shadow_capable
+///     uint  type_flags;            // bits 0-1: type, bit 2: shadow_capable, bit 3: baked (8C.1)
 ///     uint  shadow_index;          // cube map slice (0xFFFFFFFF = none)
 ///     float falloff;
 ///     float cos_inner_angle;
@@ -229,8 +267,10 @@ const _: () = assert!(std::mem::size_of::<GpuLight>() == 64);
 
 impl GpuLight {
     pub fn from_light(light: &Light, shadow_index: Option<u32>) -> Self {
+        // Phase 8C.1: bit 3 encodes baked status
         let type_flags = light.light_type as u32
-            | if light.shadow_capable { 1 << 2 } else { 0 };
+            | if light.shadow_capable { 1 << 2 } else { 0 }
+            | if light.category == LightCategory::Baked { 1 << 3 } else { 0 };
 
         Self {
             position_radius: [
@@ -581,11 +621,57 @@ impl LightManager {
 /// Scoring: inverse distance² × projected screen radius + hysteresis.
 /// Directional sun always keeps its CSM cascades (not competing for
 /// point-light slots).
+///
+/// Phase 8C.2: Includes per-slot cache state for temporal shadow caching.
+/// Phase 8C.5: Adaptive budget driven by profiler feedback.
 pub struct ShadowBudgetManager {
     /// Current slot assignments: slot index → global light index.
     slot_to_light: [Option<usize>; MAX_SHADOW_SLOTS],
     /// Reverse: global light index → slot index.
     light_to_slot: HashMap<usize, u32>,
+    /// Phase 8C.2: Per-slot cache state for temporal shadow caching.
+    slot_cache: Vec<ShadowSlotCache>,
+    /// Phase 8C.5: Target shadow pass time budget (ms). Default: 4.0.
+    pub time_budget_ms: f32,
+    /// Phase 8C.5: Previous frame's measured shadow pass time (from GpuProfiler).
+    pub last_shadow_time_ms: f32,
+    /// Phase 8C.5: Current effective max slots (may be less than MAX_SHADOW_SLOTS).
+    effective_max_slots: usize,
+}
+
+/// Phase 8C.2: Per-slot shadow cache state.
+#[derive(Debug, Clone)]
+pub struct ShadowSlotCache {
+    /// Global light index occupying this slot (None = empty).
+    pub light_idx: Option<usize>,
+    /// Frame number when this slot was last rendered.
+    pub last_rendered_frame: u64,
+    /// Position hash at time of last render.
+    pub position_hash: u64,
+    /// Radius at time of last render.
+    pub cached_radius: f32,
+    /// True if slot content is stale and needs re-render.
+    pub dirty: bool,
+}
+
+impl ShadowSlotCache {
+    pub fn empty() -> Self {
+        Self {
+            light_idx: None,
+            last_rendered_frame: 0,
+            position_hash: 0,
+            cached_radius: 0.0,
+            dirty: true,
+        }
+    }
+}
+
+/// Hash a light position for cache invalidation.
+/// Uses bit-cast to u64 for exact equality (no floating point tolerance).
+fn hash_position(pos: [f32; 3]) -> u64 {
+    let a = (pos[0].to_bits() as u64) ^ ((pos[1].to_bits() as u64) << 20);
+    let b = (pos[2].to_bits() as u64) << 40;
+    a ^ b
 }
 
 impl ShadowBudgetManager {
@@ -593,7 +679,37 @@ impl ShadowBudgetManager {
         Self {
             slot_to_light: [None; MAX_SHADOW_SLOTS],
             light_to_slot: HashMap::new(),
+            slot_cache: (0..MAX_SHADOW_SLOTS)
+                .map(|_| ShadowSlotCache::empty())
+                .collect(),
+            time_budget_ms: 4.0,
+            last_shadow_time_ms: 0.0,
+            effective_max_slots: MAX_SHADOW_SLOTS,
         }
+    }
+
+    /// Phase 8C.5: Called each frame BEFORE assign(). Adjusts effective_max_slots
+    /// based on last frame's measured shadow time.
+    pub fn adapt_budget(&mut self) {
+        if self.last_shadow_time_ms > self.time_budget_ms * 1.2 {
+            // Over budget by >20%: reduce slots.
+            self.effective_max_slots = (self.effective_max_slots.saturating_sub(1)).max(4);
+        } else if self.last_shadow_time_ms < self.time_budget_ms * 0.6
+            && self.effective_max_slots < MAX_SHADOW_SLOTS
+        {
+            // Under budget by >40%: allow one more slot.
+            self.effective_max_slots += 1;
+        }
+    }
+
+    /// Phase 8C.5: Feed the profiler's shadow pass time for next frame's adaptation.
+    pub fn set_last_shadow_time(&mut self, ms: f32) {
+        self.last_shadow_time_ms = ms;
+    }
+
+    /// Current effective max slots (for debug overlay).
+    pub fn effective_max_slots(&self) -> usize {
+        self.effective_max_slots
     }
 
     /// Score and assign shadow slots for the current frame's active lights.
@@ -610,7 +726,11 @@ impl ShadowBudgetManager {
             let Some(light) = light_manager.get(idx) else { continue };
 
             // Only shadow-capable point/spot lights compete for slots.
-            if !light.shadow_capable || light.light_type == LightType::Directional {
+            // Phase 8C.1: baked lights never get shadow slots.
+            if !light.shadow_capable
+                || light.light_type == LightType::Directional
+                || light.category == LightCategory::Baked
+            {
                 continue;
             }
 
@@ -639,34 +759,37 @@ impl ShadowBudgetManager {
         let mut assignments = HashMap::new();
 
         for (light_idx, _score) in candidates {
-            if next_slot as usize >= MAX_SHADOW_SLOTS {
+            // Phase 8C.5: use adaptive effective_max_slots instead of MAX_SHADOW_SLOTS.
+            if next_slot as usize >= self.effective_max_slots {
                 break;
             }
 
             // Prefer re-using the light's previous slot (reduces shadow
             // flicker from re-rendering a different atlas slice).
             let slot = if let Some(&prev) = prev_light_to_slot.get(&light_idx) {
-                if self.slot_to_light[prev as usize].is_none() {
+                if (prev as usize) < self.effective_max_slots
+                    && self.slot_to_light[prev as usize].is_none()
+                {
                     prev
                 } else {
-                    // Previous slot taken; find next free.
-                    while (next_slot as usize) < MAX_SHADOW_SLOTS
+                    // Previous slot taken or out of budget; find next free.
+                    while (next_slot as usize) < self.effective_max_slots
                         && self.slot_to_light[next_slot as usize].is_some()
                     {
                         next_slot += 1;
                     }
-                    if next_slot as usize >= MAX_SHADOW_SLOTS {
+                    if next_slot as usize >= self.effective_max_slots {
                         break;
                     }
                     next_slot
                 }
             } else {
-                while (next_slot as usize) < MAX_SHADOW_SLOTS
+                while (next_slot as usize) < self.effective_max_slots
                     && self.slot_to_light[next_slot as usize].is_some()
                 {
                     next_slot += 1;
                 }
-                if next_slot as usize >= MAX_SHADOW_SLOTS {
+                if next_slot as usize >= self.effective_max_slots {
                     break;
                 }
                 next_slot
@@ -691,6 +814,69 @@ impl ShadowBudgetManager {
     /// Number of active shadow slots this frame.
     pub fn active_shadow_count(&self) -> u32 {
         self.slot_to_light.iter().filter(|s| s.is_some()).count() as u32
+    }
+
+    // ================================================================
+    //  Phase 8C.2: Shadow cache methods
+    // ================================================================
+
+    /// Update cache state after shadow slot assignment.
+    /// Call AFTER assign() each frame.
+    pub fn update_cache(
+        &mut self,
+        light_manager: &LightManager,
+        current_frame: u64,
+    ) {
+        for (slot, opt_light) in self.slot_to_light.iter().enumerate() {
+            let cache = &mut self.slot_cache[slot];
+
+            match opt_light {
+                None => {
+                    // Slot freed — mark empty.
+                    *cache = ShadowSlotCache::empty();
+                }
+                Some(light_idx) => {
+                    let Some(light) = light_manager.get(*light_idx) else {
+                        cache.dirty = true;
+                        continue;
+                    };
+
+                    let pos_hash = hash_position(light.position);
+
+                    if cache.light_idx != Some(*light_idx)
+                        || cache.position_hash != pos_hash
+                        || (cache.cached_radius - light.radius).abs() > 0.001
+                    {
+                        // Light changed or slot reassigned — must re-render.
+                        cache.light_idx = Some(*light_idx);
+                        cache.position_hash = pos_hash;
+                        cache.cached_radius = light.radius;
+                        cache.dirty = true;
+                    }
+                    // If nothing changed, dirty stays false from last clear.
+                }
+            }
+        }
+    }
+
+    /// Check if a shadow slot needs re-rendering this frame.
+    pub fn is_slot_dirty(&self, slot: u32) -> bool {
+        self.slot_cache.get(slot as usize).map_or(true, |c| c.dirty)
+    }
+
+    /// Mark a slot as clean after rendering. Call after shadow pass completes.
+    pub fn mark_slot_clean(&mut self, slot: u32, frame: u64) {
+        if let Some(cache) = self.slot_cache.get_mut(slot as usize) {
+            cache.dirty = false;
+            cache.last_rendered_frame = frame;
+        }
+    }
+
+    /// Mark all slots dirty (e.g., after sector load/unload).
+    pub fn invalidate_all(&mut self) {
+        for cache in &mut self.slot_cache {
+            cache.dirty = true;
+        }
     }
 }
 

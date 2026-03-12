@@ -19,7 +19,7 @@ use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
 use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
                        MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
 use crate::light::{
-    self, cube_face_matrices, ClusterParamsUbo, Light, LightManager, LightType,
+    self, cube_face_matrices, ClusterParamsUbo, Light, LightCategory, LightManager, LightType,
     ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, SunShadow,
     compute_sun_shadow_matrices,
     CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE,
@@ -62,6 +62,8 @@ struct GlobalUbo {
 // ====================================================================
 
 const MAX_SPAWNED_LIGHTS: usize = 32;
+/// Phase 8C.1: After dynamic limit, user spawns become baked (no shadow cost).
+const MAX_SPAWNED_BAKED_LIGHTS: usize = 256;
 const MAX_SPAWNED_GEOMETRY: usize = 50;
 const SPAWN_RADIUS: f32 = 40.0;
 const SPAWN_LIGHT_HEIGHT_MIN: f32 = 3.0;
@@ -172,6 +174,7 @@ pub struct Renderer {
 
     rng: SimpleRng,
     spawned_light_count: usize,
+    spawned_baked_light_count: usize,
     spawned_light_sector: SectorCoord,
     spawned_geometry_count: usize,
     next_dynamic_sector: i32,
@@ -462,11 +465,12 @@ impl Renderer {
         let dynamic_sector: (i32, i32) = (i32::MAX - 2, i32::MAX - 2);
         let dynamic_light_indices;
         {
-            let mut dl1 = Light::point([25.0, 6.0, 0.0], [1.0, 0.7, 0.3], 200.0, 40.0);
+            // Phase 8C perf: tighter radii reduce cluster overlap.
+            let mut dl1 = Light::point([25.0, 6.0, 0.0], [1.0, 0.7, 0.3], 280.0, 25.0);
             dl1.shadow_capable = true;
-            let mut dl2 = Light::point([0.0, 8.0, 35.0], [0.3, 0.5, 1.0], 180.0, 45.0);
+            let mut dl2 = Light::point([0.0, 8.0, 35.0], [0.3, 0.5, 1.0], 250.0, 28.0);
             dl2.shadow_capable = true;
-            let mut dl3 = Light::point([18.0, 4.0, 0.0], [1.0, 0.3, 0.8], 160.0, 35.0);
+            let mut dl3 = Light::point([18.0, 4.0, 0.0], [1.0, 0.3, 0.8], 220.0, 22.0);
             dl3.shadow_capable = true;
             dynamic_light_indices = light_manager.register(dynamic_sector, vec![dl1, dl2, dl3]);
         }
@@ -501,6 +505,7 @@ impl Renderer {
             current_frame: 0, global_frame: 0,
             rng: SimpleRng::new(seed),
             spawned_light_count: 0,
+            spawned_baked_light_count: 0,
             spawned_light_sector,
             spawned_geometry_count: 0,
             next_dynamic_sector: 0,
@@ -691,6 +696,8 @@ impl Renderer {
                 );
             }
             self.register_sector_lights(upload.sector);
+            // Phase 8C.2: Invalidate shadow cache — new geometry/lights may affect shadows.
+            self.shadow_budget.invalidate_all();
             self.probe_grid.bake_sector_probes(upload.sector, &self.light_manager);
         }
     }
@@ -700,9 +707,6 @@ impl Renderer {
             return;
         }
         let is_demo_origin = sector.0.abs() <= 1 && sector.1.abs() <= 1;
-        if is_demo_origin {
-            return;
-        }
         let tiles = (SECTOR_SIZE / GROUND_TILE_SIZE) as i32;
         let bx = sector.0 * tiles;
         let bz = sector.1 * tiles;
@@ -710,11 +714,39 @@ impl Renderer {
         for dx in 0..tiles { for dz in 0..tiles {
             let cx = (bx+dx) as f32 * GROUND_TILE_SIZE + GROUND_TILE_SIZE * 0.5;
             let cz = (bz+dz) as f32 * GROUND_TILE_SIZE + GROUND_TILE_SIZE * 0.5;
-            let mut l = Light::point([cx,12.0,cz], [1.0,0.95,0.85], 120.0, 50.0);
-            l.shadow_capable = true;
-            lights.push(l);
+
+            // Dynamic shadow-casters only outside demo origin (avoids competing
+            // with the 3 orbiting showcase lights for shadow slots).
+            if !is_demo_origin {
+                // Phase 8C perf: radius 50→30 cuts cluster overlap ~4.6×.
+                // Intensity 120→180 compensates for tighter falloff window.
+                let mut l = Light::point([cx,12.0,cz], [1.0,0.95,0.85], 180.0, 30.0);
+                l.shadow_capable = true;
+                lights.push(l);
+            }
+
+            // Phase 8C.1: Baked ambient fill lights — always emitted, even at origin.
+            // Zero shadow cost: no cubemap samples, no slot competition.
+            // Phase 8C perf: tighter radii reduce cluster overlap.
+            let baked1 = Light::baked_point(
+                [cx - 10.0, 3.0, cz + 10.0],
+                [0.8, 0.75, 0.65], // warm ambient fill
+                1.2,               // was 0.8, boosted for tighter radius
+                10.0,              // was 15.0
+            );
+            lights.push(baked1);
+
+            let baked2 = Light::baked_point(
+                [cx + 10.0, 5.0, cz - 10.0],
+                [0.65, 0.7, 0.85], // cool ambient fill
+                1.0,               // was 0.6, boosted for tighter radius
+                8.0,               // was 12.0
+            );
+            lights.push(baked2);
         }}
-        self.light_manager.register(sector, lights);
+        if !lights.is_empty() {
+            self.light_manager.register(sector, lights);
+        }
     }
 
     fn update_dynamic_lights(&mut self, dt: f32) {
@@ -767,6 +799,8 @@ impl Renderer {
             }
  
             self.light_manager.unregister(coord);
+            // Phase 8C.2: Invalidate shadow cache — evicted geometry may leave stale shadows.
+            self.shadow_budget.invalidate_all();
             self.probe_grid.invalidate_sector(coord);
             self.world.sectors.remove(&coord);
  
@@ -823,7 +857,14 @@ impl Renderer {
 
             // Phase 8A: CPU cull_and_select_lod removed — GPU does this now
 
+            // Phase 8C.5: Adaptive budget — adjust effective_max_slots before assignment.
+            self.shadow_budget.adapt_budget();
+
             self.shadow_assignments = self.shadow_budget.assign(&self.light_manager, camera_pos);
+
+            // Phase 8C.2: Update shadow cache state after slot assignment.
+            self.shadow_budget.update_cache(&self.light_manager, self.global_frame);
+
             let active_light_count = self.light_manager.cull_and_sort(camera_pos, &frustum, &self.shadow_assignments);
 
             self.lighting_buffers.upload_lights_direct(
@@ -977,6 +1018,23 @@ impl Renderer {
                 self.overlay.stats.lights_total = self.light_manager.total_count();
                 self.overlay.stats.lights_active = active_light_count;
                 self.overlay.stats.lights_shadow = self.shadow_budget.active_shadow_count();
+                // Phase 8C: Count baked vs dynamic among active lights.
+                {
+                    let mut baked = 0u32;
+                    let mut dynamic = 0u32;
+                    for &idx in self.light_manager.active_indices() {
+                        if let Some(light) = self.light_manager.get(idx) {
+                            if light.category == LightCategory::Baked {
+                                baked += 1;
+                            } else {
+                                dynamic += 1;
+                            }
+                        }
+                    }
+                    self.overlay.stats.lights_baked = baked;
+                    self.overlay.stats.lights_dynamic = dynamic;
+                }
+                self.overlay.stats.effective_shadow_slots = self.shadow_budget.effective_max_slots();
                 self.overlay.stats.draw_calls_opaque = 1; // Phase 8B: single indirect_count
                 self.overlay.stats.draw_calls_shadow = 1;
                 self.overlay.stats.staging_fill_pct = self.memory_ctx.transfer.staging_fill_ratio() * 100.0;
@@ -1045,11 +1103,31 @@ impl Renderer {
                 self.device.cmd_end_render_pass(cmd);
             }
 
-            // ---- Point light cube map shadows ----
+            // ---- Point light cube map shadows (Phase 8C.2: with caching) ----
             let sv = vk::Viewport { x:0.0,y:0.0, width:SHADOW_MAP_SIZE as f32, height:SHADOW_MAP_SIZE as f32, min_depth:0.0, max_depth:1.0 };
             let ss = vk::Rect2D { offset:vk::Offset2D{x:0,y:0}, extent:vk::Extent2D{width:SHADOW_MAP_SIZE,height:SHADOW_MAP_SIZE} };
 
-            for (slot, light_idx) in self.shadow_budget.assigned_slots() {
+            // Collect assigned slots into a Vec to avoid borrowing self.shadow_budget
+            // while also needing &mut self for mark_slot_clean.
+            let assigned: Vec<(u32, usize)> = self.shadow_budget.assigned_slots().collect();
+
+            // Phase 8E stability: Cap dirty slot re-renders per frame.
+            // Prevents spikes when invalidate_all() fires on sector load/unload.
+            // 8 slots × 6 faces × ~0.02ms/face ≈ 1ms max spike.
+            const MAX_DIRTY_RENDERS_PER_FRAME: u32 = 8;
+            let mut dirty_rendered = 0u32;
+
+            for (slot, light_idx) in assigned {
+                // Phase 8C.2: Shadow caching — skip clean (unchanged) slots.
+                if !self.shadow_budget.is_slot_dirty(slot) {
+                    continue;
+                }
+
+                // Stagger: defer remaining dirty slots to subsequent frames.
+                if dirty_rendered >= MAX_DIRTY_RENDERS_PER_FRAME {
+                    break;
+                }
+
                 let Some(light) = self.light_manager.get(light_idx) else { continue };
                 if light.light_type == LightType::Directional { continue; }
                 let push = ShadowPushConstants { light_pos: light.position, light_radius: light.radius };
@@ -1095,10 +1173,7 @@ impl Renderer {
                     self.device.cmd_bind_index_buffer(cmd,
                         self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
 
-                    // Phase 8C fix: use shadow_cmds (shadow casters only),
-                    // not opaque_cmds (all visible). Matches sun shadow
-                    // pass at line 1038. cull.comp:142-149 populates
-                    // shadow_cmds with FLAG_SHADOW_CASTER objects only.
+                    // Phase 8C §2 bug fix: use shadow caster commands, not opaque
                     self.device.cmd_draw_indexed_indirect_count(
                         cmd,
                         self.gpu_cull.shadow_cmds[f],
@@ -1110,9 +1185,19 @@ impl Renderer {
                     );
                     self.device.cmd_end_render_pass(cmd);
                 }
+
+                // Phase 8C.2: Mark slot as clean after all 6 faces rendered.
+                self.shadow_budget.mark_slot_clean(slot, self.global_frame);
+                dirty_rendered += 1;
             }
 
             self.profiler.end_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
+
+            // Phase 8C.5: Feed measured shadow pass time into the budget manager.
+            {
+                let shadow_ms = self.profiler.latest_ms(PassId::Shadow);
+                self.shadow_budget.set_last_shadow_time(shadow_ms);
+            }
 
             // ============================================================
             //  PASS 0.5: GPU Probe Cubemap Capture + SH Projection
@@ -1449,8 +1534,15 @@ impl Renderer {
     }
 
     fn spawn_random_light(&mut self) {
-        if self.spawned_light_count >= MAX_SPAWNED_LIGHTS {
-            println!("[Spawn] Light limit reached ({}/{})", self.spawned_light_count, MAX_SPAWNED_LIGHTS);
+        // Phase 8C.1: After dynamic limit, spawn baked (no-shadow) fill lights
+        // that still contribute to scene lighting.
+        let is_baked = self.spawned_light_count >= MAX_SPAWNED_LIGHTS;
+
+        if is_baked && self.spawned_baked_light_count >= MAX_SPAWNED_BAKED_LIGHTS {
+            println!(
+                "[Spawn] Baked light limit reached ({}/{})",
+                self.spawned_baked_light_count, MAX_SPAWNED_BAKED_LIGHTS,
+            );
             return;
         }
 
@@ -1463,19 +1555,31 @@ impl Renderer {
         let g = self.rng.range(0.3, 1.0);
         let b = self.rng.range(0.3, 1.0);
 
-        let intensity = self.rng.range(80.0, 250.0);
-        let radius = self.rng.range(25.0, 60.0);
-
-        let mut light = Light::point([x, y, z], [r, g, b], intensity, radius);
-        light.shadow_capable = true;
-
-        self.light_manager.register(self.spawned_light_sector, vec![light]);
-        self.spawned_light_count += 1;
-
-        println!(
-            "[Spawn] Light #{} at [{:.1}, {:.1}, {:.1}] color=[{:.2},{:.2},{:.2}] I={:.0} R={:.0}",
-            self.spawned_light_count, x, y, z, r, g, b, intensity, radius,
-        );
+        if is_baked {
+            // Phase 8C perf: baked spawns use tighter radii (no shadow cost
+            // but still occupies cluster slots → fragment shader cost).
+            let intensity = self.rng.range(100.0, 250.0);
+            let radius = self.rng.range(10.0, 25.0);
+            let light = Light::baked_point([x, y, z], [r, g, b], intensity, radius);
+            self.light_manager.register(self.spawned_light_sector, vec![light]);
+            self.spawned_baked_light_count += 1;
+            println!(
+                "[Spawn] Baked light #{} at [{:.1}, {:.1}, {:.1}] color=[{:.2},{:.2},{:.2}] I={:.0} R={:.0} (no shadow)",
+                self.spawned_baked_light_count, x, y, z, r, g, b, intensity, radius,
+            );
+        } else {
+            // Phase 8C perf: tighter radii reduce cluster overlap.
+            let intensity = self.rng.range(120.0, 300.0);
+            let radius = self.rng.range(15.0, 35.0);
+            let mut light = Light::point([x, y, z], [r, g, b], intensity, radius);
+            light.shadow_capable = true;
+            self.light_manager.register(self.spawned_light_sector, vec![light]);
+            self.spawned_light_count += 1;
+            println!(
+                "[Spawn] Dynamic light #{} at [{:.1}, {:.1}, {:.1}] color=[{:.2},{:.2},{:.2}] I={:.0} R={:.0}",
+                self.spawned_light_count, x, y, z, r, g, b, intensity, radius,
+            );
+        }
     }
 
     fn spawn_random_geometry(&mut self) {
