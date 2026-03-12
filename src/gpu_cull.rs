@@ -38,7 +38,7 @@ pub const MAX_BUFFER_GROUPS: u32 = 256;
 pub const MEGA_VB_SIZE: u64 = 128 * 1024 * 1024;
 /// Phase 8B: Mega index buffer capacity (64 MB)
 pub const MEGA_IB_SIZE: u64 = 64 * 1024 * 1024;
-
+pub const VERTEX_STRIDE: u64 = 60;
 // ====================================================================
 //  GpuObjectData — 128 bytes, std430
 // ====================================================================
@@ -161,16 +161,24 @@ pub struct MegaAlloc {
 impl MegaAlloc {
     /// First vertex index (in vertices, not bytes) for this allocation.
     /// Used as the base vertex_offset for objects within this sector.
-    #[inline]
     pub fn base_vertex(&self) -> i32 {
-        (self.vertex_offset_bytes / 60) as i32 // sizeof(Vertex) == 60
+        debug_assert!(
+            self.vertex_offset_bytes % VERTEX_STRIDE == 0,
+            "vertex_offset_bytes {} is not aligned to VERTEX_STRIDE {}",
+            self.vertex_offset_bytes, VERTEX_STRIDE,
+        );
+        (self.vertex_offset_bytes / VERTEX_STRIDE) as i32
     }
 
     /// First index position (in indices, not bytes) for this allocation.
     /// Used as the base first_index for objects within this sector.
-    #[inline]
     pub fn base_index(&self) -> u32 {
-        (self.index_offset_bytes / 4) as u32 // sizeof(u32) == 4
+        debug_assert!(
+            self.index_offset_bytes % 4 == 0,
+            "index_offset_bytes {} is not aligned to sizeof(u32)",
+            self.index_offset_bytes,
+        );
+        (self.index_offset_bytes / 4) as u32
     }
 }
 
@@ -235,7 +243,7 @@ impl MegaBuffers {
         vertex_bytes: u64,
         index_bytes: u64,
     ) -> Option<MegaAlloc> {
-        let v_off = Self::alloc_region(&mut self.vertex_free, vertex_bytes, 64)?;
+        let v_off = Self::alloc_region(&mut self.vertex_free, vertex_bytes, VERTEX_STRIDE)?;
         match Self::alloc_region(&mut self.index_free, index_bytes, 4) {
             Some(i_off) => Some(MegaAlloc {
                 vertex_offset_bytes: v_off,
@@ -285,7 +293,7 @@ impl MegaBuffers {
     ) -> Option<u64> {
         for i in 0..free_list.len() {
             let region = &free_list[i];
-            let aligned = crate::memory::align_up(region.offset, alignment);
+            let aligned = align_up_general(region.offset, alignment);
             let padding = aligned - region.offset;
             let needed = padding + size;
 
@@ -406,6 +414,14 @@ pub struct GpuCullResources {
 
     /// CPU-side mirror of SSBO data for read-modify-write workflows
     pub object_mirror: Vec<GpuObjectData>,
+}
+
+/// Align `value` up to the next multiple of `alignment`.
+/// Works for ANY alignment (not just power-of-2), unlike `memory::align_up`.
+#[inline(always)]
+const fn align_up_general(value: u64, alignment: u64) -> u64 {
+    let remainder = value % alignment;
+    if remainder == 0 { value } else { value + alignment - remainder }
 }
 
 // Safety: GpuCullResources contains raw pointers but they're either null
