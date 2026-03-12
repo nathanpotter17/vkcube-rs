@@ -1095,11 +1095,15 @@ impl Renderer {
                     self.device.cmd_bind_index_buffer(cmd,
                         self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
 
+                    // Phase 8C fix: use shadow_cmds (shadow casters only),
+                    // not opaque_cmds (all visible). Matches sun shadow
+                    // pass at line 1038. cull.comp:142-149 populates
+                    // shadow_cmds with FLAG_SHADOW_CASTER objects only.
                     self.device.cmd_draw_indexed_indirect_count(
                         cmd,
-                        self.gpu_cull.opaque_cmds[f],
+                        self.gpu_cull.shadow_cmds[f],
                         0,
-                        self.gpu_cull.opaque_counts[f],
+                        self.gpu_cull.shadow_counts[f],
                         0,
                         MAX_INDIRECT_DRAWS,
                         INDIRECT_COMMAND_STRIDE,
