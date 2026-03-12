@@ -59,8 +59,13 @@ void main() {
     vec4 worldPos = obj.model * vec4(inPosition, 1.0);
     gl_Position = frame.proj * frame.view * worldPos;
 
-    // Transform normal to view space for HBAO consumption.
-    // The normal matrix is transpose(inverse(mat3(view * model))).
-    mat3 normalMat = transpose(inverse(mat3(frame.view * obj.model)));
-    outViewNormal = normalize(normalMat * inNormal);
+    // Full cofactor normal matrix — equivalent to transpose(inverse(M))
+    // but avoids the matrix inversion. 9 cross products vs 1 inverse.
+    mat3 M = mat3(frame.view * obj.model);
+    mat3 cofactor = mat3(
+        cross(M[1], M[2]),
+        cross(M[2], M[0]),
+        cross(M[0], M[1])
+    );
+    outViewNormal = normalize(cofactor * inNormal);
 }

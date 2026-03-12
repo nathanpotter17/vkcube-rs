@@ -969,7 +969,7 @@ impl Renderer {
             // ════════════════════════════════════════════════════════════
             // STEP 6: GPU Cull Dispatch
             // ════════════════════════════════════════════════════════════
-            self.gpu_cull.update_group_base_offsets(&mut self.memory_ctx);
+            self.gpu_cull.update_group_base_offsets_inline(&device_ctx.device, cmd);
 
             let cull_push = CullPushConstants::new(&frustum, camera_pos, self.gpu_cull.total_alive);
 

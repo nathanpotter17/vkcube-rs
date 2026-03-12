@@ -1,13 +1,8 @@
+// hbao.comp — full replacement
 // Phase 6 §6.1: Horizon-Based Ambient Occlusion — compute shader
+// Optimized: 6 directions, dual-noise anti-crosshatch, no shared memory
+//
 // Compile: glslangValidator -V hbao.comp -o compiled/hbao.comp.spv
-//
-// Reads the depth pre-pass output (D32_SFLOAT) and produces a
-// single-channel AO texture (R8_UNORM).  Runs at full resolution
-// with 8×8 workgroup tiles.
-//
-// Algorithm: per-pixel horizon estimation in 8 rotated screen-space
-// directions with adaptive step size based on view distance.
-// Interleaved gradient noise eliminates banding across tiles.
 
 #version 450
 
@@ -33,38 +28,44 @@ const float PI       = 3.14159265359;
 const float TWO_PI   = 6.28318530718;
 const float EPSILON  = 0.0001;
 
-const int   NUM_DIRECTIONS = 8;
+const int   NUM_DIRECTIONS = 6;
 const int   NUM_STEPS      = 4;
 
-// Pre-computed base sampling directions (uniform on unit circle).
-const vec2 BASE_DIRS[8] = vec2[8](
-    vec2( 1.0,  0.0),
-    vec2( 0.7071,  0.7071),
-    vec2( 0.0,  1.0),
-    vec2(-0.7071,  0.7071),
-    vec2(-1.0,  0.0),
-    vec2(-0.7071, -0.7071),
-    vec2( 0.0, -1.0),
-    vec2( 0.7071, -0.7071)
+// 6 directions at 60-degree intervals — 6-fold symmetry is perceptually
+// harder to detect than 8-fold (no axis-aligned components).
+const vec2 BASE_DIRS[6] = vec2[6](
+    vec2( 1.0,    0.0),
+    vec2( 0.5,    0.866025),
+    vec2(-0.5,    0.866025),
+    vec2(-1.0,    0.0),
+    vec2(-0.5,   -0.866025),
+    vec2( 0.5,   -0.866025)
 );
 
-// ---- Helpers ----
+// ---- Noise functions ----
 
-// Interleaved gradient noise (Jimenez 2014).  Low discrepancy,
-// better visual distribution than white noise, cheap.
+// Interleaved gradient noise (Jimenez 2014) — primary rotation channel
 float interleavedGradientNoise(vec2 coord) {
     vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
     return fract(magic.z * fract(dot(coord, magic.xy)));
 }
 
-// Reconstruct view-space position from UV + raw depth.
+// Second independent hash — drives per-direction and per-step jitter.
+// Decorrelated from IGN to avoid correlated rotation+offset patterns.
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// ---- Helpers ----
+
 vec3 reconstructViewPos(vec2 uv, float depth) {
     vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
     vec4 view = hbao.invProj * clip;
     return view.xyz / view.w;
 }
 
-// Decode octahedral-encoded view-space normal from G-buffer.
 vec3 octDecode(vec2 e) {
     e = e * 2.0 - 1.0;
     vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
@@ -77,23 +78,17 @@ vec3 octDecode(vec2 e) {
     return normalize(n);
 }
 
-vec3 reconstructNormal(vec2 uv, vec3 P, float centerDepth) {
-    // Read the actual geometry normal from the G-buffer instead of
-    // reconstructing from depth derivatives. Eliminates artifacts on
-    // large steep surfaces where depth-gradient-based reconstruction
-    // oscillates between neighbors.
-    vec2 encoded = texture(normalTexture, uv).rg;
-    return octDecode(encoded);
-}
-
 // ---- Main AO kernel ----
 
 float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
-    float noise       = interleavedGradientNoise(pixelCoord);
-    float randomAngle = noise * TWO_PI;
-    float cosA        = cos(randomAngle);
-    float sinA        = sin(randomAngle);
-    mat2  rotMat      = mat2(cosA, -sinA, sinA, cosA);
+    // Two independent noise channels to decorrelate rotation and offset
+    float noise1 = interleavedGradientNoise(pixelCoord);
+    float noise2 = hash12(pixelCoord);
+
+    float randomAngle = noise1 * TWO_PI;
+    float cosA = cos(randomAngle);
+    float sinA = sin(randomAngle);
+    mat2  rotMat = mat2(cosA, -sinA, sinA, cosA);
 
     float viewDist    = -P.z;
     float worldRadius = hbao.params.x;
@@ -101,19 +96,18 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
     float intensity   = hbao.params.z;
     float maxDist     = hbao.params.w;
 
-    float radiusPixels = worldRadius * hbao.resolution.x
-                         / max(viewDist, 1.0);
+    float radiusPixels = worldRadius * hbao.resolution.x / max(viewDist, 1.0);
     radiusPixels = clamp(radiusPixels, 2.0, 256.0);
 
     float stepSize = radiusPixels / float(NUM_STEPS);
 
-    // ---- Depth-gradient edge detection ----
+    // ---- Edge detection (depth discontinuity attenuation) ----
     vec2 texel = hbao.resolution.zw;
+    float centerDepth = texture(depthTexture, uv).r;
     float dL = texture(depthTexture, uv - vec2(texel.x, 0.0)).r;
     float dR = texture(depthTexture, uv + vec2(texel.x, 0.0)).r;
     float dT = texture(depthTexture, uv - vec2(0.0, texel.y)).r;
     float dB = texture(depthTexture, uv + vec2(0.0, texel.y)).r;
-    float centerDepth = texture(depthTexture, uv).r;
 
     float maxDepthDiff = max(max(abs(dL - centerDepth), abs(dR - centerDepth)),
                              max(abs(dT - centerDepth), abs(dB - centerDepth)));
@@ -124,18 +118,32 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
     for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
         vec2 direction = rotMat * BASE_DIRS[dir];
 
+        // Per-direction micro-rotation using second noise channel.
+        // Golden-ratio spacing ensures each direction gets a decorrelated
+        // angular offset, breaking the N-fold symmetry that causes
+        // cross-hatch patterns.
+        float dirNoise = fract(noise2 + float(dir) * 0.618034);
+        float microAngle = (dirNoise - 0.5) * (TWO_PI / float(NUM_DIRECTIONS));
+        float mc = cos(microAngle);
+        float ms = sin(microAngle);
+        direction = mat2(mc, -ms, ms, mc) * direction;
+
         float tanHorizon = bias;
         float sinHorizon = tanHorizon / sqrt(1.0 + tanHorizon * tanHorizon);
 
         for (int step = 1; step <= NUM_STEPS; ++step) {
-            float t = float(step) + noise * 0.5 - 0.25;
-            vec2 sampleUV = uv + direction * t * stepSize
-                            * hbao.resolution.zw;
+            // Per-step jitter from second noise channel, golden-ratio offset
+            // per step ensures decorrelation between steps within a direction.
+            float stepNoise = fract(noise2 + float(step) * 0.381966);
+            float t = float(step) + stepNoise - 0.5;
 
-            if (any(lessThan(sampleUV, vec2(0.0)))
-             || any(greaterThan(sampleUV, vec2(1.0))))
+            vec2 sampleUV = uv + direction * t * stepSize * hbao.resolution.zw;
+
+            if (any(lessThan(sampleUV, vec2(0.0))) ||
+                any(greaterThan(sampleUV, vec2(1.0))))
                 continue;
 
+            // Hardware bilinear-filtered depth read — no quantization artifacts
             float sampleDepth = texture(depthTexture, sampleUV).r;
             if (sampleDepth >= 1.0 - EPSILON) continue;
 
@@ -149,8 +157,7 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
             float sinS = tanS / sqrt(1.0 + tanS * tanS);
 
             if (sinS > sinHorizon) {
-                float falloff = 1.0 - (dist * dist)
-                                / (maxDist * maxDist);
+                float falloff = 1.0 - (dist * dist) / (maxDist * maxDist);
                 falloff = max(falloff, 0.0);
 
                 ao += (sinS - sinHorizon) * falloff;
@@ -161,9 +168,6 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
         }
     }
 
-    // Fixed denominator — directions that only sampled sky contribute
-    // zero occlusion, which is correct (no geometry = no occlusion).
-    // edgeAttenuation handles the silhouette halo separately.
     ao = ao / float(NUM_DIRECTIONS) * intensity;
     ao *= edgeAttenuation;
 
@@ -181,14 +185,14 @@ void main() {
     vec2  uv    = (vec2(coord) + 0.5) * hbao.resolution.zw;
     float depth = texture(depthTexture, uv).r;
 
-    // Background → no occlusion.
+    // Background — no occlusion.
     if (depth >= 1.0 - EPSILON) {
         imageStore(aoTexture, coord, vec4(1.0));
         return;
     }
 
     vec3  P  = reconstructViewPos(uv, depth);
-    vec3  N  = reconstructNormal(uv, P, depth);
+    vec3  N  = octDecode(texture(normalTexture, uv).rg);
     float ao = computeAO(P, N, uv, vec2(coord));
 
     imageStore(aoTexture, coord, vec4(ao));

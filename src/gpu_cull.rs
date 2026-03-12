@@ -215,6 +215,10 @@ pub struct GpuCullResources {
     /// Debug assertion: fence was waited before flush_dirty
     #[cfg(debug_assertions)]
     fence_waited_this_frame: bool,
+
+    /// CPU-side mirror of SSBO data for read-modify-write workflows
+    /// (e.g., transform updates on dynamic objects).
+    pub object_mirror: Vec<GpuObjectData>,
 }
 
 // Safety: GpuCullResources contains raw pointers but they're either null
@@ -535,6 +539,7 @@ impl GpuCullResources {
             total_alive: 0,
             #[cfg(debug_assertions)]
             fence_waited_this_frame: false,
+            object_mirror: vec![GpuObjectData::default(); MAX_GPU_OBJECTS as usize],
         })
     }
 
@@ -626,26 +631,144 @@ impl GpuCullResources {
         self.dirty_objects.clear();
     }
 
-    /// Staging-based upload for non-ReBAR systems
+    /// Batches all dirty entries into a single staging region + single transfer submit.
     fn flush_dirty_staged(&mut self, memory_ctx: &mut MemoryContext) {
-        // For simplicity, upload each dirty object individually through the transfer queue.
-        // A more optimal implementation would batch into a single staging buffer region.
-        for &(id, ref data) in &self.dirty_objects {
-            let offset = id as u64 * 128;
+        if self.dirty_objects.is_empty() {
+            return;
+        }
+
+        // Calculate total staging bytes needed
+        let entry_size = 128usize; // size_of::<GpuObjectData>()
+        let total_bytes = self.dirty_objects.len() * entry_size;
+
+        // Build a contiguous staging payload with per-region copy descriptors
+        let mut staging_data = Vec::with_capacity(total_bytes);
+        let mut copy_regions = Vec::with_capacity(self.dirty_objects.len());
+
+        for (i, &(id, ref data)) in self.dirty_objects.iter().enumerate() {
+            let src_offset_in_staging = (i * entry_size) as u64;
+            let dst_offset_in_ssbo = (id as u64) * (entry_size as u64);
+
+            // Append object data bytes to contiguous staging buffer
             let bytes = unsafe {
-                std::slice::from_raw_parts(data as *const GpuObjectData as *const u8, 128)
+                std::slice::from_raw_parts(
+                    data as *const GpuObjectData as *const u8,
+                    entry_size,
+                )
             };
-            // Use transfer queue for async upload
-            let _ = memory_ctx.transfer.upload_region(
-                bytes,
-                self.object_ssbo,
-                offset,
+            staging_data.extend_from_slice(bytes);
+
+            copy_regions.push(vk::BufferCopy {
+                src_offset: src_offset_in_staging,
+                dst_offset: dst_offset_in_ssbo,
+                size: entry_size as u64,
+            });
+        }
+
+        // Single transfer submit: write staging, record N-region copy, submit, wait once
+        let transfer = &mut memory_ctx.transfer;
+
+        // Ensure staging has space
+        assert!(
+            staging_data.len() as u64 <= transfer.staging_size,
+            "Batched SSBO flush {} B exceeds staging belt {} B",
+            staging_data.len(),
+            transfer.staging_size,
+        );
+
+        // Wrap staging offset if needed
+        if transfer.staging_offset + staging_data.len() as u64 > transfer.staging_size {
+            transfer.staging_offset = 0;
+        }
+
+        let staging_base = transfer.staging_offset;
+
+        // Copy all data into staging belt
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staging_data.as_ptr(),
+                transfer.staging_mapped.as_ptr().add(staging_base as usize),
+                staging_data.len(),
             );
+        }
+        transfer.staging_offset += crate::memory::align_up(staging_data.len() as u64, 64);
+
+        // Adjust copy regions: src_offset is relative to staging_base
+        for region in &mut copy_regions {
+            region.src_offset += staging_base;
+        }
+
+        // Record single command buffer with all copy regions
+        let cmd = unsafe {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(transfer.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            transfer.device.allocate_command_buffers(&info)
+                .expect("Failed to allocate transfer cmd buffer")[0]
+        };
+
+        unsafe {
+            transfer.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            ).expect("Failed to begin transfer cmd buffer");
+
+            transfer.device.cmd_copy_buffer(
+                cmd,
+                transfer.staging_buffer,
+                self.object_ssbo,
+                &copy_regions,
+            );
+
+            // Queue ownership release if dedicated transfer queue
+            if transfer.is_dedicated {
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .buffer(self.object_ssbo)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .src_queue_family_index(transfer.queue_family_index)
+                    .dst_queue_family_index(transfer.graphics_family_index);
+
+                transfer.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    std::slice::from_ref(&barrier),
+                    &[],
+                );
+            }
+
+            transfer.device.end_command_buffer(cmd)
+                .expect("Failed to end transfer cmd buffer");
+        }
+
+        // Single submit + single wait
+        let timeline_value = transfer.submit_timeline(cmd)
+            .expect("Failed to submit batched SSBO transfer");
+
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(std::slice::from_ref(&transfer.timeline_semaphore))
+            .values(std::slice::from_ref(&timeline_value));
+
+        unsafe {
+            transfer.device.wait_semaphores(&wait_info, u64::MAX)
+                .expect("Failed to wait for batched SSBO transfer");
         }
     }
 
-    /// Queue an object for SSBO update. Called by World::add_object.
+    /// Queue an object for SSBO update. Updates CPU mirror. Called by World::add_object.
     pub fn queue_dirty(&mut self, id: u32, data: GpuObjectData) {
+        // Update CPU-side mirror
+        if (id as usize) < self.object_mirror.len() {
+            self.object_mirror[id as usize] = data;
+        }
+
         // Check if already queued and update in place
         if let Some(entry) = self.dirty_objects.iter_mut().find(|(oid, _)| *oid == id) {
             entry.1 = data;
@@ -654,11 +777,13 @@ impl GpuCullResources {
         }
     }
 
-    /// Get a copy of object data (for modification + re-queue)
-    pub fn get_object_data(&self, _id: u32) -> GpuObjectData {
-        // In a full implementation, this would read from a CPU-side mirror
-        // or directly from the mapped SSBO. For now return default.
-        GpuObjectData::default()
+    /// Get a copy of object data from the CPU mirror (for modification + re-queue).
+    pub fn get_object_data(&self, id: u32) -> GpuObjectData {
+        if (id as usize) < self.object_mirror.len() {
+            self.object_mirror[id as usize]
+        } else {
+            GpuObjectData::default()
+        }
     }
 
     /// Register or update a buffer group. Returns the group index.
@@ -710,33 +835,44 @@ impl GpuCullResources {
         }
     }
 
-    /// Compute and upload group base offsets (prefix sum).
-    /// Call this before the cull dispatch each frame.
-    pub fn update_group_base_offsets(&mut self, memory_ctx: &mut MemoryContext) {
-        let mut base_offsets: Vec<u32> = Vec::with_capacity(MAX_BUFFER_GROUPS as usize);
+    /// Compute and record inline upload of group base offsets (prefix sum).
+    /// Uses vkCmdUpdateBuffer (max 65536 bytes) — no transfer queue, no CPU stall.
+    /// Call after begin_command_buffer, before cull dispatch.
+    pub fn update_group_base_offsets_inline(
+        &mut self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+    ) {
+        let mut base_offsets = [0u32; MAX_BUFFER_GROUPS as usize];
         let mut running_offset = 0u32;
+        let draws_per_group = MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1);
 
-        for group in &mut self.buffer_groups {
+        for (i, group) in self.buffer_groups.iter_mut().enumerate() {
             group.cmd_base_offset = running_offset;
-            base_offsets.push(running_offset);
-            // Reserve space for max draws per group (conservative)
-            // In practice, use previous frame's count + some headroom
-            running_offset += MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1);
+            if i < base_offsets.len() {
+                base_offsets[i] = running_offset;
+            }
+            running_offset += draws_per_group;
         }
 
-        // Pad to MAX_BUFFER_GROUPS
-        while base_offsets.len() < MAX_BUFFER_GROUPS as usize {
-            base_offsets.push(running_offset);
+        // Fill remaining slots
+        for i in self.buffer_groups.len()..MAX_BUFFER_GROUPS as usize {
+            base_offsets[i] = running_offset;
         }
 
-        // Upload via transfer queue
+        let byte_size = (MAX_BUFFER_GROUPS as usize) * 4;
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 base_offsets.as_ptr() as *const u8,
-                base_offsets.len() * 4,
+                byte_size,
             )
         };
-        let _ = memory_ctx.transfer.upload_region(bytes, self.group_bases, 0);
+
+        // vkCmdUpdateBuffer: inline data transfer within the command buffer.
+        // Covered by the pre-cull TRANSFER barrier already in the pipeline.
+        unsafe {
+            device.cmd_update_buffer(cmd, self.group_bases, 0, bytes);
+        }
     }
 
     /// Get active buffer groups for draw dispatch

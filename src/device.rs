@@ -243,7 +243,8 @@ impl DeviceContext {
             let physical_features = vk::PhysicalDeviceFeatures::default()
                 .sampler_anisotropy(true)
                 .image_cube_array(true)
-                .multi_draw_indirect(true);  // Phase 8A: GPU-driven rendering
+                .multi_draw_indirect(true)
+                .draw_indirect_first_instance(true);  // Phase 8A: GPU-driven rendering
 
             let device = instance.create_device(
                 physical_device,
@@ -294,11 +295,43 @@ impl DeviceContext {
 
             let caps = surface_loader
                 .get_physical_device_surface_capabilities(physical_device, surface)?;
+
+            // Query supported present modes and select the lowest-latency option.
+            // MAILBOX: triple-buffer, no tearing, latest frame always shown — ideal.
+            // IMMEDIATE: uncapped, may tear — fast but visually inferior.
+            // FIFO: vsync, guaranteed by spec — fallback.
+            let available_modes = surface_loader
+                .get_physical_device_surface_present_modes(physical_device, surface)?;
+
+            let present_mode = if available_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                println!("[Swapchain] Present mode: MAILBOX (triple-buffered, no tearing)");
+                vk::PresentModeKHR::MAILBOX
+            } else if available_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+                println!("[Swapchain] Present mode: IMMEDIATE (uncapped, may tear)");
+                vk::PresentModeKHR::IMMEDIATE
+            } else {
+                println!("[Swapchain] Present mode: FIFO (vsync)");
+                vk::PresentModeKHR::FIFO
+            };
+
+            // MAILBOX can consume an extra image beyond double-buffering;
+            // request one more than the minimum so the compositor always has
+            // a presentable image while the GPU writes the next.
+            let desired_image_count = if present_mode == vk::PresentModeKHR::MAILBOX {
+                (caps.min_image_count + 2).min(
+                    if caps.max_image_count > 0 { caps.max_image_count } else { u32::MAX },
+                )
+            } else {
+                (caps.min_image_count + 1).min(
+                    if caps.max_image_count > 0 { caps.max_image_count } else { u32::MAX },
+                )
+            };
+
             let swapchain_loader = swapchain::Device::new(&instance, &device);
             let swapchain = swapchain_loader.create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
                     .surface(surface)
-                    .min_image_count(caps.min_image_count + 1)
+                    .min_image_count(desired_image_count)
                     .image_color_space(surface_format.color_space)
                     .image_format(surface_format.format)
                     .image_extent(caps.current_extent)
@@ -306,7 +339,7 @@ impl DeviceContext {
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                    .present_mode(vk::PresentModeKHR::FIFO)
+                    .present_mode(present_mode)
                     .clipped(true)
                     .image_array_layers(1),
                 None,

@@ -63,7 +63,7 @@ pub struct ImageHandle(pub(crate) u64);
 
 /// Align `value` up to the next multiple of `alignment` (power-of-2).
 #[inline(always)]
-const fn align_up(value: u64, alignment: u64) -> u64 {
+pub const fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
 
@@ -1055,19 +1055,19 @@ impl TransferTicket {
 /// queue family, a HOST_VISIBLE staging ring, and a timeline semaphore
 /// for CPU-side completion polling.
 pub struct TransferQueue {
-    device: Device,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    timeline_semaphore: vk::Semaphore,
+    pub device: Device,
+    pub queue: vk::Queue,
+    pub command_pool: vk::CommandPool,
+    pub timeline_semaphore: vk::Semaphore,
     /// Monotonically increasing; bumped once per `upload_async` call.
-    next_timeline: u64,
+    pub next_timeline: u64,
     /// Staging ring: single persistently-mapped buffer used round-robin.
-    staging_buffer: vk::Buffer,
-    staging_memory: vk::DeviceMemory,
-    staging_mapped: NonNull<u8>,
-    staging_size: u64,
+    pub staging_buffer: vk::Buffer,
+    pub staging_memory: vk::DeviceMemory,
+    pub staging_mapped: NonNull<u8>,
+    pub staging_size: u64,
     /// Current write offset into the staging ring.
-    staging_offset: u64,
+    pub staging_offset: u64,
     /// Queue family index for ownership transfer barriers.
     pub queue_family_index: u32,
     /// The graphics queue family (for release/acquire barriers).
@@ -1565,7 +1565,7 @@ impl TransferQueue {
 
     /// Submit a recorded command buffer with timeline signal.
     /// Returns the timeline value.
-    fn submit_timeline(
+    pub fn submit_timeline(
         &mut self,
         cmd: vk::CommandBuffer,
     ) -> Result<u64, Box<dyn std::error::Error>> {
