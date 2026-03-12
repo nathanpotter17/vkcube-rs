@@ -16,8 +16,8 @@ use crate::device::DeviceContext;
 use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
                  SHProjectPushConstants, MAX_PROBE_BAKES_PER_FRAME,
                  PROBE_CAPTURE_NEAR, PROBE_CAPTURE_FAR, PROBE_CAPTURE_SIZE};
-use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants, BufferGroup,
-                       MAX_BUFFER_GROUPS, INDIRECT_COMMAND_STRIDE};
+use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
+                       MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightManager, LightType,
     ShadowAtlas, ShadowBudgetManager, ShadowPushConstants, SunShadow,
@@ -112,14 +112,11 @@ struct PendingObject {
 
 struct PendingSectorUpload {
     sector: SectorCoord,
-    vertex_handle: BufferHandle,
-    index_handle: BufferHandle,
-    vertex_buffer: vk::Buffer,
-    index_buffer: vk::Buffer,
+    /// Phase 8B: mega buffer sub-allocation for this sector's geometry
+    mega_alloc: MegaAlloc,
+    /// Transfer tickets for vertex and index data uploads to mega buffers
     vertex_ticket: crate::memory::TransferTicket,
     index_ticket: crate::memory::TransferTicket,
-    vertex_size: u64,
-    index_size: u64,
     objects: Vec<PendingObject>,
 }
 
@@ -179,9 +176,6 @@ pub struct Renderer {
     spawned_geometry_count: usize,
     next_dynamic_sector: i32,
 
-    deferred_frees: Vec<DeferredFree>,
-    gltf_buffer_handles: Vec<BufferHandle>,
-
     normal_image: vk::Image,
     normal_memory: vk::DeviceMemory,
     normal_view: vk::ImageView,
@@ -233,27 +227,25 @@ impl Renderer {
         material_library.clear_dirty();
 
         let mut texture_manager = TextureManager::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue)?;
+        let mut light_manager = LightManager::new();
+        let shadow_budget = ShadowBudgetManager::new();
+        let descriptor_layouts = DescriptorLayouts::new(&device, texture_manager.descriptor_set_layout)?;
+        let render_passes = RenderPasses::new(&device, device_ctx.surface_format.format)?;
+        let shadow_atlas = ShadowAtlas::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
+        let sun_shadow = SunShadow::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
+        let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
+
+        let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
+        let hdr_path: Option<&Path> = Some(Path::new("assets/park1k.hdr"));
+        let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue, hdr_path)?;
+
+        // Phase 8A: Initialize GPU culling resources
+        let mut gpu_cull = GpuCullResources::new(&device, &mut memory_ctx.allocator)?;
 
         // ================================================================
         //  glTF asset loading
         // ================================================================
-        // Phase 8A: Store mesh info for later registration with gpu_cull
-        #[allow(dead_code)]
-        struct GltfMeshInfo {
-            vertex_buffer: vk::Buffer,
-            index_buffer: vk::Buffer,
-            object_id: RenderObjectId,
-            model: [[f32; 4]; 4],
-            aabb_min: [f32; 3],
-            aabb_max: [f32; 3],
-            first_index: u32,
-            index_count: u32,
-            vertex_offset: i32,
-            material_id: u32,
-            flags: RenderFlags,
-        }
-        let mut gltf_meshes: Vec<GltfMeshInfo> = Vec::new();
-        let mut gltf_buffer_handles: Vec<BufferHandle> = Vec::new();
+        // Phase 8B
         {
             let gltf_path = std::path::Path::new("assets/models/ubg/utility_box_02_1k.gltf");
             if gltf_path.exists() {
@@ -272,18 +264,36 @@ impl Renderer {
                         if let Some(sec) = world.sectors.get_mut(&gltf_sector) {
                             sec.state = SectorState::Ready;
                         }
-
+ 
                         let model_transform = crate::scene::identity_matrix();
-
+ 
                         for mesh in &asset.meshes {
-                            let mesh_range = MeshRange {
-                                vertex_buffer: mesh.vertex_alloc.buffer,
-                                index_buffer: mesh.index_alloc.buffer,
-                                first_index: 0,
-                                index_count: mesh.index_count,
-                                vertex_offset: 0,
-                            };
-
+                            // Phase 8B: Read raw vertex/index data from the temporary
+                            // per-mesh buffers, upload into mega buffer, then free temps.
+                            let vert_bytes = mesh.vertex_count as u64 * 60; // sizeof(Vertex)
+                            let idx_bytes = mesh.index_count as u64 * 4;    // sizeof(u32)
+ 
+                            let mega_alloc = gpu_cull.mega.alloc(vert_bytes, idx_bytes)
+                                .expect("Mega buffer full during glTF load");
+ 
+                            // Upload vertex data to mega buffer region (synchronous for init)
+                            memory_ctx.transfer.upload_region(
+                                &mesh.vertices_raw,
+                                gpu_cull.mega.vertex_buffer,
+                                mega_alloc.vertex_offset_bytes,
+                            ).expect("Failed to upload glTF vertices to mega buffer");
+ 
+                            // Upload index data to mega buffer region
+                            memory_ctx.transfer.upload_region(
+                                &mesh.indices_raw,
+                                gpu_cull.mega.index_buffer,
+                                mega_alloc.index_offset_bytes,
+                            ).expect("Failed to upload glTF indices to mega buffer");
+ 
+                            // Free temporary per-mesh GPU allocations
+                            memory_ctx.allocator.free_buffer(mesh.vertex_alloc.handle);
+                            memory_ctx.allocator.free_buffer(mesh.index_alloc.handle);
+ 
                             let bounds = Aabb::new(
                                 [
                                     mesh.aabb_min[0] + model_transform[3][0],
@@ -296,59 +306,46 @@ impl Renderer {
                                     mesh.aabb_max[2] + model_transform[3][2],
                                 ],
                             );
-
                             let flags = RenderFlags::STATIC | RenderFlags::SHADOW_CASTER;
-
+ 
+                            // Phase 8B: MeshRange offsets are mega-buffer-relative
+                            let mesh_range = MeshRange {
+                                first_index: mega_alloc.base_index(),
+                                index_count: mesh.index_count,
+                                vertex_offset: mega_alloc.base_vertex(),
+                            };
+ 
                             let obj_id = world.add_object(
-                                gltf_sector,
-                                bounds,
+                                gltf_sector, bounds,
                                 LodChain::single(mesh_range),
+                                model_transform, mesh.material_id, flags,
+                            );
+ 
+                            let gpu_data = GpuObjectData::new(
                                 model_transform,
+                                bounds.min, bounds.max,
+                                mega_alloc.base_index(),
+                                mesh.index_count,
+                                mega_alloc.base_vertex(),
                                 mesh.material_id,
                                 flags,
                             );
-
-                            // Phase 8A: Store info for gpu_cull registration
-                            gltf_meshes.push(GltfMeshInfo {
-                                vertex_buffer: mesh.vertex_alloc.buffer,
-                                index_buffer: mesh.index_alloc.buffer,
-                                object_id: obj_id,
-                                model: model_transform,
-                                aabb_min: bounds.min,
-                                aabb_max: bounds.max,
-                                first_index: 0,
-                                index_count: mesh.index_count,
-                                vertex_offset: 0,
-                                material_id: mesh.material_id,
-                                flags,
-                            });
-
-                            memory_ctx.budget.track(mesh.vertex_alloc.handle, mesh.vertex_alloc.size, 0);
-                            memory_ctx.budget.track(mesh.index_alloc.handle, mesh.index_alloc.size, 0);
-                            gltf_buffer_handles.push(mesh.vertex_alloc.handle);
-                            gltf_buffer_handles.push(mesh.index_alloc.handle);
+                            gpu_cull.queue_dirty(obj_id.0, gpu_data);
+                            gpu_cull.total_alive = gpu_cull.total_alive.max(obj_id.0 + 1);
                         }
-
-                        // Phase 8A: Store VB/IB in sector for buffer group tracking
-                        if let Some(mesh) = asset.meshes.first() {
-                            if let Some(sec) = world.sectors.get_mut(&gltf_sector) {
-                                sec.vertex_handle = Some(mesh.vertex_alloc.handle);
-                                sec.index_handle = Some(mesh.index_alloc.handle);
-                                sec.vertex_buffer = Some(mesh.vertex_alloc.buffer);
-                                sec.index_buffer = Some(mesh.index_alloc.buffer);
-                            }
-                        }
-
+ 
+                        // Store mega alloc in sector
+                        // (For glTF with multiple meshes, store the first mesh's alloc;
+                        //  each mesh gets its own MegaAlloc tracked separately)
+                        // Note: for eviction, glTF sectors are special-cased (never evicted)
+ 
                         println!(
-                            "[Renderer] glTF '{}' loaded: {} meshes, {} materials, {} textures",
-                            gltf_path.display(),
-                            asset.meshes.len(),
-                            asset.material_names.len(),
-                            asset.texture_names.len(),
+                            "[Renderer] glTF '{}' loaded to mega buffers: {} meshes",
+                            gltf_path.display(), asset.meshes.len(),
                         );
                     }
                     Err(e) => {
-                        eprintln!("[Renderer] glTF load failed for '{}': {}", gltf_path.display(), e);
+                        eprintln!("[Renderer] glTF load failed: {}", e);
                     }
                 }
             }
@@ -357,44 +354,6 @@ impl Renderer {
         if material_library.is_dirty() {
             material_ssbo.upload(&material_library);
             material_library.clear_dirty();
-        }
-
-        let mut light_manager = LightManager::new();
-        let shadow_budget = ShadowBudgetManager::new();
-        let descriptor_layouts = DescriptorLayouts::new(&device, texture_manager.descriptor_set_layout)?;
-        let render_passes = RenderPasses::new(&device, device_ctx.surface_format.format)?;
-        let shadow_atlas = ShadowAtlas::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
-        let sun_shadow = SunShadow::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
-        let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
-
-        let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
-        let hdr_path: Option<&Path> = Some(Path::new("assets/park1k.hdr"));
-        let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue, hdr_path)?;
-
-        // Phase 8A: Initialize GPU culling resources
-        let mut gpu_cull = GpuCullResources::new(&device, &mut memory_ctx.allocator)?;
-
-        // Phase 8A: Register glTF meshes with gpu_cull (loaded before gpu_cull was created)
-        for mesh_info in &gltf_meshes {
-            let buffer_group = gpu_cull.register_buffer_group(
-                mesh_info.vertex_buffer,
-                mesh_info.index_buffer,
-            );
-
-            let gpu_data = GpuObjectData::new(
-                mesh_info.model,
-                mesh_info.aabb_min,
-                mesh_info.aabb_max,
-                mesh_info.first_index,
-                mesh_info.index_count,
-                mesh_info.vertex_offset,
-                mesh_info.material_id,
-                buffer_group,
-                mesh_info.flags,
-            );
-
-            gpu_cull.queue_dirty(mesh_info.object_id.0, gpu_data);
-            gpu_cull.total_alive = gpu_cull.total_alive.max(mesh_info.object_id.0 + 1);
         }
 
         let vert_spv = include_bytes!("../shaders/compiled/basic.vert.spv");
@@ -520,7 +479,7 @@ impl Renderer {
             .unwrap_or(42);
 
         println!(
-            "[Renderer] Phase 8A GPU-driven culling initialized. {} materials, {} probes.",
+            "[Renderer] GPU-driven culling initialized. {} materials, {} probes.",
             material_library.count(), probe_grid.probe_count(),
         );
 
@@ -545,8 +504,6 @@ impl Renderer {
             spawned_light_sector,
             spawned_geometry_count: 0,
             next_dynamic_sector: 0,
-            deferred_frees: Vec::new(),
-            gltf_buffer_handles,
             normal_image, normal_memory, normal_view,
             hbao_pass,
             has_hdr_skybox: hdr_path.is_some(),
@@ -600,120 +557,131 @@ impl Renderer {
         let mut all_verts: Vec<Vertex> = Vec::new();
         let mut all_indices: Vec<u32> = Vec::new();
         let mut objects: Vec<PendingObject> = Vec::new();
-
+ 
         for desc in &descriptors {
             let vertex_offset = all_verts.len() as i32;
             let first_index = all_indices.len() as u32;
             let index_count = desc.indices.len() as u32;
-
+ 
             all_verts.extend_from_slice(&desc.vertices);
             all_indices.extend_from_slice(&desc.indices);
-
+ 
             objects.push(PendingObject {
                 first_index, index_count, vertex_offset,
                 transform: desc.transform, material_id: desc.material_id,
                 flags: desc.flags, bounds: desc.bounds,
             });
         }
-
-        let (valloc, vticket) = self.memory_ctx.upload_async_typed(
-            &all_verts, vk::BufferUsageFlags::VERTEX_BUFFER,
-        )?;
-
-        let (ialloc, iticket) = match self.memory_ctx.upload_async_typed(
-            &all_indices, vk::BufferUsageFlags::INDEX_BUFFER,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                self.memory_ctx.allocator.free_buffer(valloc.handle);
-                return Err(e);
-            }
+ 
+        let vert_bytes = (all_verts.len() * std::mem::size_of::<Vertex>()) as u64;
+        let idx_bytes = (all_indices.len() * std::mem::size_of::<u32>()) as u64;
+ 
+        // Phase 8B: sub-allocate from mega buffers
+        let mega_alloc = self.gpu_cull.mega.alloc(vert_bytes, idx_bytes)
+            .ok_or_else(|| format!(
+                "Mega buffer full: need {} VB + {} IB bytes",
+                vert_bytes, idx_bytes,
+            ))?;
+ 
+        // Async upload vertex data to mega VB sub-region
+        let vert_raw = unsafe {
+            std::slice::from_raw_parts(
+                all_verts.as_ptr() as *const u8,
+                vert_bytes as usize,
+            )
         };
-
-        self.memory_ctx.budget.track(valloc.handle, valloc.size, self.global_frame);
-        self.memory_ctx.budget.track(ialloc.handle, ialloc.size, self.global_frame);
-
+        let vticket = self.memory_ctx.transfer.upload_buffer_region_async(
+            vert_raw,
+            self.gpu_cull.mega.vertex_buffer,
+            mega_alloc.vertex_offset_bytes,
+        )?;
+ 
+        // Async upload index data to mega IB sub-region
+        let idx_raw = unsafe {
+            std::slice::from_raw_parts(
+                all_indices.as_ptr() as *const u8,
+                idx_bytes as usize,
+            )
+        };
+        let iticket = self.memory_ctx.transfer.upload_buffer_region_async(
+            idx_raw,
+            self.gpu_cull.mega.index_buffer,
+            mega_alloc.index_offset_bytes,
+        )?;
+ 
         if let Some(sec) = self.world.sectors.get_mut(&sector) {
             sec.state = SectorState::Streaming;
-            sec.vertex_handle = Some(valloc.handle);
-            sec.index_handle = Some(ialloc.handle);
-            sec.vertex_buffer = Some(valloc.buffer);
-            sec.index_buffer = Some(ialloc.buffer);
+            sec.mega_alloc = Some(mega_alloc);
         }
-
+ 
         self.pending_sectors.push(PendingSectorUpload {
             sector,
-            vertex_handle: valloc.handle, index_handle: ialloc.handle,
-            vertex_buffer: valloc.buffer, index_buffer: ialloc.buffer,
-            vertex_ticket: vticket, index_ticket: iticket,
-            vertex_size: valloc.size, index_size: ialloc.size,
+            mega_alloc,
+            vertex_ticket: vticket,
+            index_ticket: iticket,
             objects,
         });
-
+ 
         Ok(())
     }
 
-    /// Phase 8A: poll_uploads now registers buffer groups with gpu_cull
-    /// and queues GpuObjectData for SSBO upload.
+    /// Phase 8B
     fn poll_uploads(&mut self) {
         let mut completed: Vec<PendingSectorUpload> = Vec::new();
-
+ 
         let transfer = &self.memory_ctx.transfer;
-
+ 
         self.pending_sectors.retain_mut(|upload| {
             let done = transfer.is_complete(&upload.vertex_ticket)
                 && transfer.is_complete(&upload.index_ticket);
             if done {
                 completed.push(PendingSectorUpload {
                     sector: upload.sector,
-                    vertex_handle: upload.vertex_handle, index_handle: upload.index_handle,
-                    vertex_buffer: upload.vertex_buffer, index_buffer: upload.index_buffer,
+                    mega_alloc: upload.mega_alloc,
                     vertex_ticket: upload.vertex_ticket.clone(),
                     index_ticket: upload.index_ticket.clone(),
-                    vertex_size: upload.vertex_size, index_size: upload.index_size,
                     objects: std::mem::take(&mut upload.objects),
                 });
                 false
             } else { true }
         });
-
+ 
         for upload in completed {
-            let vb = upload.vertex_buffer;
-            let ib = upload.index_buffer;
-
-            // Phase 8A: Register buffer group with GPU cull system
-            let buffer_group = self.gpu_cull.register_buffer_group(vb, ib);
-
+            let ma = upload.mega_alloc;
+ 
             for pobj in &upload.objects {
+                // Phase 8B: Offsets are mega-buffer-relative.
+                // Each object's within-sector offsets are added to the sector's
+                // mega buffer base offsets.
+                let mega_first_index = ma.base_index() + pobj.first_index;
+                let mega_vertex_offset = ma.base_vertex() + pobj.vertex_offset;
+ 
                 let mesh_range = MeshRange {
-                    vertex_buffer: vb, index_buffer: ib,
-                    first_index: pobj.first_index,
+                    first_index: mega_first_index,
                     index_count: pobj.index_count,
-                    vertex_offset: pobj.vertex_offset,
+                    vertex_offset: mega_vertex_offset,
                 };
-
+ 
                 let obj_id = self.world.add_object(
                     upload.sector, pobj.bounds,
                     LodChain::single(mesh_range),
                     pobj.transform, pobj.material_id, pobj.flags,
                 );
-
-                // Phase 8A: Queue GpuObjectData for SSBO upload
+ 
                 let gpu_data = GpuObjectData::new(
                     pobj.transform,
                     pobj.bounds.min,
                     pobj.bounds.max,
-                    pobj.first_index,
+                    mega_first_index,
                     pobj.index_count,
-                    pobj.vertex_offset,
+                    mega_vertex_offset,
                     pobj.material_id,
-                    buffer_group,
                     pobj.flags,
                 );
                 self.gpu_cull.queue_dirty(obj_id.0, gpu_data);
                 self.gpu_cull.total_alive = self.gpu_cull.total_alive.max(obj_id.0 + 1);
             }
-
+ 
             if let Some(sec) = self.world.sectors.get_mut(&upload.sector) {
                 sec.state = SectorState::Ready;
                 let obj_count = sec.objects.len();
@@ -775,8 +743,7 @@ impl Renderer {
         }
     }
 
-    /// Phase 8A: evict_distant_sectors now deactivates buffer groups
-    /// and queues dead GpuObjectData for evicted objects.
+    /// Phase 8B
     fn evict_distant_sectors(&mut self, camera_xz: [f32; 2]) {
         let r2 = EVICTION_RADIUS * EVICTION_RADIUS;
         let to_evict: Vec<SectorCoord> = self.world.sectors.iter()
@@ -784,48 +751,27 @@ impl Renderer {
             .filter(|&(&c, _)| c.0 < DYNAMIC_SECTOR_BASE && c.0 < i32::MAX - 10)
             .filter(|(_, s)| s.distance_sq_to_point_xz(camera_xz) > r2)
             .map(|(&c,_)| c).collect();
-
+ 
         for coord in to_evict {
-            // Phase 8A: Deactivate buffer group using stored vk::Buffer
+            // Phase 8B: Free mega buffer sub-allocation
             if let Some(sec) = self.world.sectors.get(&coord) {
-                if let Some(vb) = sec.vertex_buffer {
-                    self.gpu_cull.deactivate_buffer_group(vb);
-                }
-                if let Some(vh) = sec.vertex_handle {
-                    self.memory_ctx.budget.untrack(vh);
-                    self.deferred_frees.push(DeferredFree { handle: vh, frame: self.global_frame });
-                }
-                if let Some(ih) = sec.index_handle {
-                    self.memory_ctx.budget.untrack(ih);
-                    self.deferred_frees.push(DeferredFree { handle: ih, frame: self.global_frame });
+                if let Some(ref ma) = sec.mega_alloc {
+                    self.gpu_cull.mega.free(ma);
                 }
             }
-
-            // Phase 8A: Zero out GpuObjectData for all objects in this sector
+ 
+            // Zero out GpuObjectData for all objects in this sector
             let ids = self.world.evict_sector(coord);
             for &id in &ids {
                 self.gpu_cull.queue_dirty(id.0, GpuObjectData::dead());
             }
-
+ 
             self.light_manager.unregister(coord);
             self.probe_grid.invalidate_sector(coord);
             self.world.sectors.remove(&coord);
-
+ 
             if !ids.is_empty() {
                 println!("[Renderer] Evicted sector ({},{}) — {} objects", coord.0, coord.1, ids.len());
-            }
-        }
-    }
-
-    fn drain_deferred_frees(&mut self) {
-        let cutoff = self.global_frame.saturating_sub(MAX_FRAMES_IN_FLIGHT as u64);
-        let mut i = 0;
-        while i < self.deferred_frees.len() {
-            if self.deferred_frees[i].frame <= cutoff {
-                let entry = self.deferred_frees.swap_remove(i);
-                self.memory_ctx.allocator.free_buffer(entry.handle);
-            } else {
-                i += 1;
             }
         }
     }
@@ -856,9 +802,6 @@ impl Renderer {
 
             #[cfg(debug_assertions)]
             self.gpu_cull.assert_fence_waited();
-
-            // STEP 2: Resource cleanup (safe now — GPU done with this slot)
-            self.drain_deferred_frees();
 
             self.scene.update(dt, input);
             self.update_dynamic_lights(dt);
@@ -1005,7 +948,7 @@ impl Renderer {
 
             // ---- Stats ----
             let total_alive = self.gpu_cull.total_alive;
-            let active_groups = self.gpu_cull.buffer_groups.iter().filter(|g| g.active).count();
+            let active_groups = 1u32; // Phase 8B: single mega buffer group
             if self.global_frame % 60 == 0 {
                 println!(
                     "[Frame {:>5}] cam:[{:.1},{:.1},{:.1}] spd:{:.0}  objects: {}  groups: {}  lights: {}/{}  shadows: {}",
@@ -1034,8 +977,8 @@ impl Renderer {
                 self.overlay.stats.lights_total = self.light_manager.total_count();
                 self.overlay.stats.lights_active = active_light_count;
                 self.overlay.stats.lights_shadow = self.shadow_budget.active_shadow_count();
-                self.overlay.stats.draw_calls_opaque = active_groups; // Now counts buffer groups
-                self.overlay.stats.draw_calls_shadow = active_groups;
+                self.overlay.stats.draw_calls_opaque = 1; // Phase 8B: single indirect_count
+                self.overlay.stats.draw_calls_shadow = 1;
                 self.overlay.stats.staging_fill_pct = self.memory_ctx.transfer.staging_fill_ratio() * 100.0;
                 self.overlay.stats.ring_fill_pct = self.memory_ctx.ring.frame_fill_ratio() * 100.0;
                 self.overlay.stats.frame_dt_ms = dt * 1000.0;
@@ -1083,26 +1026,22 @@ impl Renderer {
                     self.pipelines.layout, 3,
                     &[self.gpu_cull.object_ssbo_set], &[]);
 
-                // Phase 8A: Indirect draw per buffer group
-                for group in self.gpu_cull.active_groups() {
-                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
-                    self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
-
-                    let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-                    let count_offset = (group.group_index as u64) * 4; // 4 bytes per u32 count
-                    let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
-                    
-                    // Use count-based indirect draw to only issue actual draws
-                    self.device.cmd_draw_indexed_indirect_count(
-                        cmd,
-                        self.gpu_cull.shadow_cmds[f],
-                        cmd_offset,
-                        self.gpu_cull.shadow_counts[f],
-                        count_offset,
-                        max_draws,
-                        INDIRECT_COMMAND_STRIDE,
-                    );
-                }
+                // Phase 8B: single mega VB/IB bind
+                self.device.cmd_bind_vertex_buffers(cmd, 0,
+                    &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd,
+                    self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+ 
+                // Phase 8B: single indirect_count call (group 0, offset 0)
+                self.device.cmd_draw_indexed_indirect_count(
+                    cmd,
+                    self.gpu_cull.shadow_cmds[f],
+                    0, // cmd buffer offset: start of group 0
+                    self.gpu_cull.shadow_counts[f],
+                    0, // count buffer offset: index 0
+                    MAX_INDIRECT_DRAWS,
+                    INDIRECT_COMMAND_STRIDE,
+                );
                 self.device.cmd_end_render_pass(cmd);
             }
 
@@ -1150,26 +1089,21 @@ impl Renderer {
                         self.pipelines.layout, 3,
                         &[self.gpu_cull.object_ssbo_set], &[]);
 
-                    // Phase 8A: Indirect draw per buffer group
-                    // Note: Point light shadows could use a separate cull pass with light frustum,
-                    // but for Phase 8A we draw all shadow casters (GPU cull already filtered them)
-                    for group in self.gpu_cull.active_groups() {
-                        self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
-                        self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
+                    // Phase 8B: single mega VB/IB bind
+                    self.device.cmd_bind_vertex_buffers(cmd, 0,
+                        &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                    self.device.cmd_bind_index_buffer(cmd,
+                        self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
 
-                        let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-                        let count_offset = (group.group_index as u64) * 4;
-                        let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
-                        self.device.cmd_draw_indexed_indirect_count(
-                            cmd,
-                            self.gpu_cull.shadow_cmds[f],
-                            cmd_offset,
-                            self.gpu_cull.shadow_counts[f],
-                            count_offset,
-                            max_draws,
-                            INDIRECT_COMMAND_STRIDE,
-                        );
-                    }
+                    self.device.cmd_draw_indexed_indirect_count(
+                        cmd,
+                        self.gpu_cull.opaque_cmds[f],
+                        0,
+                        self.gpu_cull.opaque_counts[f],
+                        0,
+                        MAX_INDIRECT_DRAWS,
+                        INDIRECT_COMMAND_STRIDE,
+                    );
                     self.device.cmd_end_render_pass(cmd);
                 }
             }
@@ -1235,24 +1169,21 @@ impl Renderer {
                             self.pipelines.layout, 3,
                             &[self.gpu_cull.object_ssbo_set], &[]);
 
-                        // Phase 8A: Indirect draw per buffer group
-                        for group in self.gpu_cull.active_groups() {
-                            self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
-                            self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
-
-                            let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-                            let count_offset = (group.group_index as u64) * 4;
-                            let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
-                            self.device.cmd_draw_indexed_indirect_count(
-                                cmd,
-                                self.gpu_cull.opaque_cmds[f],
-                                cmd_offset,
-                                self.gpu_cull.opaque_counts[f],
-                                count_offset,
-                                max_draws,
-                                INDIRECT_COMMAND_STRIDE,
-                            );
-                        }
+                        // Phase 8B: single mega VB/IB bind
+                        self.device.cmd_bind_vertex_buffers(cmd, 0,
+                            &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                        self.device.cmd_bind_index_buffer(cmd,
+                            self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+ 
+                        self.device.cmd_draw_indexed_indirect_count(
+                            cmd,
+                            self.gpu_cull.opaque_cmds[f],
+                            0,
+                            self.gpu_cull.opaque_counts[f],
+                            0,
+                            MAX_INDIRECT_DRAWS,
+                            INDIRECT_COMMAND_STRIDE,
+                        );
                         self.device.cmd_end_render_pass(cmd);
                     }
 
@@ -1327,24 +1258,21 @@ impl Renderer {
                 self.pipelines.layout, 3,
                 &[self.gpu_cull.object_ssbo_set], &[]);
 
-            // Phase 8A: Indirect draw per buffer group
-            for group in self.gpu_cull.active_groups() {
-                self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
-                self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
-
-                let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-                let count_offset = (group.group_index as u64) * 4;
-                let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
-                self.device.cmd_draw_indexed_indirect_count(
-                    cmd,
-                    self.gpu_cull.opaque_cmds[f],
-                    cmd_offset,
-                    self.gpu_cull.opaque_counts[f],
-                    count_offset,
-                    max_draws,
-                    INDIRECT_COMMAND_STRIDE,
-                );
-            }
+            // Phase 8B: single mega VB/IB bind
+            self.device.cmd_bind_vertex_buffers(cmd, 0,
+                &[self.gpu_cull.mega.vertex_buffer], &[0]);
+            self.device.cmd_bind_index_buffer(cmd,
+                self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+ 
+            self.device.cmd_draw_indexed_indirect_count(
+                cmd,
+                self.gpu_cull.opaque_cmds[f],
+                0,
+                self.gpu_cull.opaque_counts[f],
+                0,
+                MAX_INDIRECT_DRAWS,
+                INDIRECT_COMMAND_STRIDE,
+            );
             self.device.cmd_end_render_pass(cmd);
 
             self.profiler.end_pass(&self.device, cmd, PassId::Depth, self.current_frame);
@@ -1435,24 +1363,21 @@ impl Renderer {
                 self.pipelines.layout, 3,
                 &[self.gpu_cull.object_ssbo_set], &[]);
 
-            // Phase 8A: Indirect draw per buffer group
-            for group in self.gpu_cull.active_groups() {
-                self.device.cmd_bind_vertex_buffers(cmd, 0, &[group.vertex_buffer], &[0]);
-                self.device.cmd_bind_index_buffer(cmd, group.index_buffer, 0, vk::IndexType::UINT32);
-
-                let cmd_offset = (group.cmd_base_offset as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-                let count_offset = (group.group_index as u64) * 4;
-                let max_draws = (crate::gpu_cull::MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1)) as u32;
-                self.device.cmd_draw_indexed_indirect_count(
-                    cmd,
-                    self.gpu_cull.opaque_cmds[f],
-                    cmd_offset,
-                    self.gpu_cull.opaque_counts[f],
-                    count_offset,
-                    max_draws,
-                    INDIRECT_COMMAND_STRIDE,
-                );
-            }
+            // Phase 8B: single mega VB/IB bind
+            self.device.cmd_bind_vertex_buffers(cmd, 0,
+                &[self.gpu_cull.mega.vertex_buffer], &[0]);
+            self.device.cmd_bind_index_buffer(cmd,
+                self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+ 
+            self.device.cmd_draw_indexed_indirect_count(
+                cmd,
+                self.gpu_cull.opaque_cmds[f],
+                0,
+                self.gpu_cull.opaque_counts[f],
+                0,
+                MAX_INDIRECT_DRAWS,
+                INDIRECT_COMMAND_STRIDE,
+            );
 
             // Skybox
             if self.has_hdr_skybox {
@@ -1728,13 +1653,6 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) { unsafe {
         let _ = self.device.device_wait_idle();
-        for entry in self.deferred_frees.drain(..) {
-            self.memory_ctx.allocator.free_buffer(entry.handle);
-        }
-        for handle in self.gltf_buffer_handles.drain(..) {
-            self.memory_ctx.budget.untrack(handle);
-            self.memory_ctx.allocator.free_buffer(handle);
-        }
         // Phase 8A: Destroy GPU cull resources
         self.gpu_cull.destroy(&mut self.memory_ctx.allocator);
         for &f in &self.in_flight_fences { self.device.destroy_fence(f, None); }

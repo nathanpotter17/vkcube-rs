@@ -1,8 +1,13 @@
-//! Phase 8A: GPU-Driven Culling Resources
+//! Phase 8B: GPU-Driven Culling Resources + Mega Buffers
 //!
 //! Replaces CPU-side frustum culling with a compute shader dispatch.
 //! Objects stored in a persistent SSBO; culled results written to
 //! indirect command buffers consumed by `cmd_draw_indexed_indirect_count`.
+//!
+//! Phase 8B additions:
+//! - MegaBuffers: single 128 MB VB + 64 MB IB with free-list sub-allocator
+//! - BufferGroup eliminated: all geometry in mega buffers, single bind per pass
+//! - Cull shader uses single atomic counter (buffer_group always 0)
 //!
 //! Key invariants:
 //! - `flush_dirty()` MUST be called AFTER `wait_for_fences()` (§3.3)
@@ -26,8 +31,13 @@ pub const MAX_GPU_OBJECTS: u32 = 65_536;
 pub const MAX_INDIRECT_DRAWS: u32 = 65_536;
 /// Size of VkDrawIndexedIndirectCommand (20 bytes)
 pub const INDIRECT_COMMAND_STRIDE: u32 = 20;
-/// Maximum buffer groups for Phase 8A (per-sector VB/IB still exist)
+/// Phase 8B: single mega buffer group (retained for descriptor layout compat)
 pub const MAX_BUFFER_GROUPS: u32 = 256;
+
+/// Phase 8B: Mega vertex buffer capacity (128 MB)
+pub const MEGA_VB_SIZE: u64 = 128 * 1024 * 1024;
+/// Phase 8B: Mega index buffer capacity (64 MB)
+pub const MEGA_IB_SIZE: u64 = 64 * 1024 * 1024;
 
 // ====================================================================
 //  GpuObjectData — 128 bytes, std430
@@ -44,15 +54,15 @@ pub struct GpuObjectData {
     pub aabb_min: [f32; 4],
     /// World-space AABB maximum (w unused) — 16 bytes
     pub aabb_max: [f32; 4],
-    /// Index into the shared index buffer (in indices, not bytes)
+    /// Index into the mega index buffer (in indices, not bytes)
     pub first_index: u32,
     /// Number of indices to draw; 0 = slot empty (skip in cull shader)
     pub index_count: u32,
-    /// Base vertex added to each index value
+    /// Base vertex added to each index value (offset into mega vertex buffer)
     pub vertex_offset: i32,
     /// Material ID for fragment shader lookup
     pub material_id: u32,
-    /// VB/IB pair index (Phase 8A); always 0 in Phase 8B
+    /// Phase 8B: always 0 (single mega buffer). Retained for SSBO layout compat.
     pub buffer_group: u32,
     /// RenderFlags bits (SHADOW_CASTER, TRANSPARENT, etc.)
     pub flags: u32,
@@ -73,7 +83,6 @@ impl GpuObjectData {
         index_count: u32,
         vertex_offset: i32,
         material_id: u32,
-        buffer_group: u32,
         flags: RenderFlags,
     ) -> Self {
         Self {
@@ -84,7 +93,7 @@ impl GpuObjectData {
             index_count,
             vertex_offset,
             material_id,
-            buffer_group,
+            buffer_group: 0, // Phase 8B: always mega buffer group 0
             flags: flags.0,
             lod_bias: 0.0,
             _pad: 0,
@@ -126,35 +135,215 @@ impl CullPushConstants {
 }
 
 // ====================================================================
-//  BufferGroup — VB/IB pair tracking for Phase 8A
+//  Phase 8B: MegaBuffers — single VB + IB with free-list sub-allocator
 // ====================================================================
 
-/// Tracks a VB/IB pair for grouped indirect dispatch.
-/// Phase 8B eliminates this when mega buffers merge all geometry.
-#[derive(Clone, Copy, Debug)]
-pub struct BufferGroup {
-    pub vertex_buffer: vk::Buffer,
-    pub index_buffer: vk::Buffer,
-    /// Base offset into the indirect command buffer for this group
-    pub cmd_base_offset: u32,
-    /// Index of this group (for count buffer offset calculation)
-    pub group_index: u32,
-    /// Number of draws written by cull shader (read back from count buffer)
-    pub draw_count: u32,
-    /// Whether this group is active (has geometry)
-    pub active: bool,
+/// A contiguous free byte region within a mega buffer.
+#[derive(Debug, Clone, Copy)]
+struct MegaFreeRegion {
+    offset: u64,
+    size: u64,
 }
 
-impl Default for BufferGroup {
-    fn default() -> Self {
-        Self {
-            vertex_buffer: vk::Buffer::null(),
-            index_buffer: vk::Buffer::null(),
-            cmd_base_offset: 0,
-            group_index: 0,
-            draw_count: 0,
-            active: false,
+/// Tracks a sub-allocation from the mega buffers for one sector's geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct MegaAlloc {
+    /// Byte offset into the mega vertex buffer
+    pub vertex_offset_bytes: u64,
+    /// Byte size of the vertex data
+    pub vertex_size_bytes: u64,
+    /// Byte offset into the mega index buffer
+    pub index_offset_bytes: u64,
+    /// Byte size of the index data
+    pub index_size_bytes: u64,
+}
+
+impl MegaAlloc {
+    /// First vertex index (in vertices, not bytes) for this allocation.
+    /// Used as the base vertex_offset for objects within this sector.
+    #[inline]
+    pub fn base_vertex(&self) -> i32 {
+        (self.vertex_offset_bytes / 60) as i32 // sizeof(Vertex) == 60
+    }
+
+    /// First index position (in indices, not bytes) for this allocation.
+    /// Used as the base first_index for objects within this sector.
+    #[inline]
+    pub fn base_index(&self) -> u32 {
+        (self.index_offset_bytes / 4) as u32 // sizeof(u32) == 4
+    }
+}
+
+/// Single 128 MB vertex buffer + 64 MB index buffer with coalescing free-list.
+///
+/// Mirrors the `PoolBlock` allocator pattern from `memory.rs` but operates
+/// on sub-regions of a single VkBuffer rather than VkDeviceMemory.
+pub struct MegaBuffers {
+    pub vertex_buffer: vk::Buffer,
+    pub vertex_handle: BufferHandle,
+    vertex_capacity: u64,
+    vertex_free: Vec<MegaFreeRegion>,
+
+    pub index_buffer: vk::Buffer,
+    pub index_handle: BufferHandle,
+    index_capacity: u64,
+    index_free: Vec<MegaFreeRegion>,
+}
+
+impl MegaBuffers {
+    pub fn new(
+        allocator: &mut GpuAllocator,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Vertex buffer: VERTEX_BUFFER + TRANSFER_DST (staging uploads)
+        let vb_alloc = allocator.create_buffer(
+            MEGA_VB_SIZE,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+        )?;
+
+        // Index buffer: INDEX_BUFFER + TRANSFER_DST (staging uploads)
+        let ib_alloc = allocator.create_buffer(
+            MEGA_IB_SIZE,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+        )?;
+
+        println!(
+            "[MegaBuffers] VB={:.1} MB, IB={:.1} MB",
+            MEGA_VB_SIZE as f64 / (1024.0 * 1024.0),
+            MEGA_IB_SIZE as f64 / (1024.0 * 1024.0),
+        );
+
+        Ok(Self {
+            vertex_buffer: vb_alloc.buffer,
+            vertex_handle: vb_alloc.handle,
+            vertex_capacity: MEGA_VB_SIZE,
+            vertex_free: vec![MegaFreeRegion { offset: 0, size: MEGA_VB_SIZE }],
+
+            index_buffer: ib_alloc.buffer,
+            index_handle: ib_alloc.handle,
+            index_capacity: MEGA_IB_SIZE,
+            index_free: vec![MegaFreeRegion { offset: 0, size: MEGA_IB_SIZE }],
+        })
+    }
+
+    /// Sub-allocate `vertex_bytes` from VB and `index_bytes` from IB.
+    /// Alignment: vertices to 64 bytes (cache line), indices to 4 bytes.
+    /// Returns None if either allocation fails (mega buffer full).
+    pub fn alloc(
+        &mut self,
+        vertex_bytes: u64,
+        index_bytes: u64,
+    ) -> Option<MegaAlloc> {
+        let v_off = Self::alloc_region(&mut self.vertex_free, vertex_bytes, 64)?;
+        match Self::alloc_region(&mut self.index_free, index_bytes, 4) {
+            Some(i_off) => Some(MegaAlloc {
+                vertex_offset_bytes: v_off,
+                vertex_size_bytes: vertex_bytes,
+                index_offset_bytes: i_off,
+                index_size_bytes: index_bytes,
+            }),
+            None => {
+                // Roll back vertex allocation
+                Self::free_region(&mut self.vertex_free, v_off, vertex_bytes);
+                None
+            }
         }
+    }
+
+    /// Free a previously allocated region, returning it to the free list.
+    pub fn free(&mut self, alloc: &MegaAlloc) {
+        Self::free_region(
+            &mut self.vertex_free,
+            alloc.vertex_offset_bytes,
+            alloc.vertex_size_bytes,
+        );
+        Self::free_region(
+            &mut self.index_free,
+            alloc.index_offset_bytes,
+            alloc.index_size_bytes,
+        );
+    }
+
+    /// Current usage stats (vertex_used, vertex_total, index_used, index_total).
+    pub fn usage(&self) -> (u64, u64, u64, u64) {
+        let vb_free: u64 = self.vertex_free.iter().map(|r| r.size).sum();
+        let ib_free: u64 = self.index_free.iter().map(|r| r.size).sum();
+        (
+            self.vertex_capacity - vb_free,
+            self.vertex_capacity,
+            self.index_capacity - ib_free,
+            self.index_capacity,
+        )
+    }
+
+    /// First-fit allocation with alignment. Returns byte offset or None.
+    fn alloc_region(
+        free_list: &mut Vec<MegaFreeRegion>,
+        size: u64,
+        alignment: u64,
+    ) -> Option<u64> {
+        for i in 0..free_list.len() {
+            let region = &free_list[i];
+            let aligned = crate::memory::align_up(region.offset, alignment);
+            let padding = aligned - region.offset;
+            let needed = padding + size;
+
+            if region.size < needed {
+                continue;
+            }
+
+            let remaining = region.size - needed;
+
+            if padding > 0 && remaining > 0 {
+                // Split: padding region stays, allocated in middle, remainder after
+                free_list[i].size = padding;
+                free_list.insert(
+                    i + 1,
+                    MegaFreeRegion { offset: aligned + size, size: remaining },
+                );
+            } else if padding > 0 {
+                // Only padding remains
+                free_list[i].size = padding;
+            } else if remaining > 0 {
+                // Remainder stays in-place
+                free_list[i] = MegaFreeRegion { offset: aligned + size, size: remaining };
+            } else {
+                // Exact fit — remove region
+                free_list.remove(i);
+            }
+
+            return Some(aligned);
+        }
+        None
+    }
+
+    /// Return a region to the free list with coalescing of adjacent regions.
+    fn free_region(free_list: &mut Vec<MegaFreeRegion>, offset: u64, size: u64) {
+        let pos = free_list.partition_point(|r| r.offset < offset);
+        free_list.insert(pos, MegaFreeRegion { offset, size });
+
+        // Coalesce right
+        if pos + 1 < free_list.len() {
+            let cur_end = free_list[pos].offset + free_list[pos].size;
+            if cur_end == free_list[pos + 1].offset {
+                free_list[pos].size += free_list[pos + 1].size;
+                free_list.remove(pos + 1);
+            }
+        }
+        // Coalesce left
+        if pos > 0 {
+            let prev_end = free_list[pos - 1].offset + free_list[pos - 1].size;
+            if prev_end == free_list[pos].offset {
+                free_list[pos - 1].size += free_list[pos].size;
+                free_list.remove(pos);
+            }
+        }
+    }
+
+    pub fn destroy(&mut self, allocator: &mut GpuAllocator) {
+        allocator.free_buffer(self.vertex_handle);
+        allocator.free_buffer(self.index_handle);
     }
 }
 
@@ -180,12 +369,14 @@ pub struct GpuCullResources {
     pub shadow_cmds_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
 
     // ---- Atomic draw count buffers (one u32 per group, double-buffered) ----
+    // Phase 8B: only index 0 is used (single mega buffer group)
     pub opaque_counts: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
     pub opaque_counts_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
     pub shadow_counts: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
     pub shadow_counts_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
 
     // ---- Group base offsets (prefix sum, read by cull shader) ----
+    // Phase 8B: retained for descriptor layout compat; group_bases[0] = 0 always
     pub group_bases: vk::Buffer,
     pub group_bases_handle: BufferHandle,
 
@@ -201,13 +392,10 @@ pub struct GpuCullResources {
     pub object_ssbo_set: vk::DescriptorSet,
 
     // ---- Dirty object queue ----
-    /// Objects needing SSBO re-upload this frame.
-    /// Populated by add_object / transform updates.
-    /// Flushed in flush_dirty(), called AFTER wait_for_fences (§3.3).
     pub dirty_objects: Vec<(u32, GpuObjectData)>,
 
-    // ---- Buffer groups for Phase 8A ----
-    pub buffer_groups: Vec<BufferGroup>,
+    // ---- Phase 8B: Mega Buffers ----
+    pub mega: MegaBuffers,
 
     /// Total number of alive objects (next available slot)
     pub total_alive: u32,
@@ -217,7 +405,6 @@ pub struct GpuCullResources {
     fence_waited_this_frame: bool,
 
     /// CPU-side mirror of SSBO data for read-modify-write workflows
-    /// (e.g., transform updates on dynamic objects).
     pub object_mirror: Vec<GpuObjectData>,
 }
 
@@ -236,9 +423,7 @@ impl GpuCullResources {
         let group_bases_size = (MAX_BUFFER_GROUPS as u64) * 4;
 
         // ---- Allocate Object SSBO (try ReBAR first) ----
-        // ReBAR = Resizable BAR: CPU can directly write to GPU VRAM
         let (object_ssbo, object_ssbo_handle, object_ssbo_mapped) = {
-            // First try HOST_VISIBLE | DEVICE_LOCAL (ReBAR)
             match allocator.create_buffer(
                 ssbo_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -253,7 +438,6 @@ impl GpuCullResources {
                     (alloc.buffer, alloc.handle, None)
                 }
                 Err(_) => {
-                    // Fallback to GpuOnly + staging transfers
                     let alloc = allocator.create_buffer(
                         ssbo_size,
                         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -362,7 +546,7 @@ impl GpuCullResources {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            // binding 5: group_base_offsets[] (read)
+            // binding 5: group_base_offsets[] (read) — Phase 8B: [0]=0 always
             vk::DescriptorSetLayoutBinding::default()
                 .binding(5)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -411,7 +595,7 @@ impl GpuCullResources {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(6 * MAX_FRAMES_IN_FLIGHT as u32 + 1), // cull sets + ssbo set
+                .descriptor_count(6 * MAX_FRAMES_IN_FLIGHT as u32 + 1),
         ];
 
         let descriptor_pool = unsafe {
@@ -487,7 +671,6 @@ impl GpuCullResources {
 
         let object_ssbo_set = unsafe { device.allocate_descriptor_sets(&ssbo_set_alloc)?[0] };
 
-        // Write object SSBO to graphics descriptor set
         let ssbo_info = vk::DescriptorBufferInfo::default()
             .buffer(object_ssbo)
             .offset(0)
@@ -504,11 +687,15 @@ impl GpuCullResources {
         // ---- Load and create cull compute pipeline ----
         let pipeline = Self::create_cull_pipeline(device, pipeline_layout)?;
 
+        // ---- Phase 8B: Create mega buffers ----
+        let mega = MegaBuffers::new(allocator)?;
+
         println!(
-            "[GpuCull] Initialized: SSBO={:.2}MB, IndirectCmds={:.2}MB×2, Counts={:.2}KB×2",
+            "[GpuCull] Phase 8B: SSBO={:.2}MB, IndirectCmds={:.2}MB×2, MegaVB={:.0}MB, MegaIB={:.0}MB",
             ssbo_size as f64 / (1024.0 * 1024.0),
             indirect_size as f64 / (1024.0 * 1024.0),
-            counts_size as f64 / 1024.0,
+            MEGA_VB_SIZE as f64 / (1024.0 * 1024.0),
+            MEGA_IB_SIZE as f64 / (1024.0 * 1024.0),
         );
 
         Ok(Self {
@@ -535,7 +722,7 @@ impl GpuCullResources {
             object_ssbo_set_layout,
             object_ssbo_set,
             dirty_objects: Vec::with_capacity(1024),
-            buffer_groups: Vec::with_capacity(MAX_BUFFER_GROUPS as usize),
+            mega,
             total_alive: 0,
             #[cfg(debug_assertions)]
             fence_waited_this_frame: false,
@@ -581,13 +768,11 @@ impl GpuCullResources {
         Ok(pipeline)
     }
 
-    /// Mark that the fence was waited this frame (debug assertion helper).
     #[cfg(debug_assertions)]
     pub fn assert_fence_waited(&mut self) {
         self.fence_waited_this_frame = true;
     }
 
-    /// Reset the fence-waited flag at frame start (debug assertion helper).
     #[cfg(debug_assertions)]
     pub fn reset_fence_flag(&mut self) {
         self.fence_waited_this_frame = false;
@@ -597,7 +782,6 @@ impl GpuCullResources {
     ///
     /// # Safety invariant
     /// MUST be called AFTER `wait_for_fences()` for the current frame slot.
-    /// Calling before fence wait risks writing into a slot still in use by GPU.
     pub fn flush_dirty(&mut self, memory_ctx: &mut MemoryContext) {
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -610,7 +794,6 @@ impl GpuCullResources {
         }
 
         if let Some(base) = self.object_ssbo_mapped {
-            // ReBAR path: direct memcpy, no staging buffer, no transfer queue
             for &(id, ref data) in &self.dirty_objects {
                 let offset = id as usize * 128;
                 unsafe {
@@ -621,11 +804,10 @@ impl GpuCullResources {
                     );
                 }
             }
-            self.needs_host_barrier = true; // signal: use HOST_WRITE barrier pre-cull
+            self.needs_host_barrier = true;
         } else {
-            // Staging path: batch all dirty entries into staging + transfer
             self.flush_dirty_staged(memory_ctx);
-            self.needs_host_barrier = false; // signal: use TRANSFER_WRITE barrier pre-cull
+            self.needs_host_barrier = false;
         }
 
         self.dirty_objects.clear();
@@ -637,11 +819,9 @@ impl GpuCullResources {
             return;
         }
 
-        // Calculate total staging bytes needed
-        let entry_size = 128usize; // size_of::<GpuObjectData>()
+        let entry_size = 128usize;
         let total_bytes = self.dirty_objects.len() * entry_size;
 
-        // Build a contiguous staging payload with per-region copy descriptors
         let mut staging_data = Vec::with_capacity(total_bytes);
         let mut copy_regions = Vec::with_capacity(self.dirty_objects.len());
 
@@ -649,7 +829,6 @@ impl GpuCullResources {
             let src_offset_in_staging = (i * entry_size) as u64;
             let dst_offset_in_ssbo = (id as u64) * (entry_size as u64);
 
-            // Append object data bytes to contiguous staging buffer
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     data as *const GpuObjectData as *const u8,
@@ -665,10 +844,8 @@ impl GpuCullResources {
             });
         }
 
-        // Single transfer submit: write staging, record N-region copy, submit, wait once
         let transfer = &mut memory_ctx.transfer;
 
-        // Ensure staging has space
         assert!(
             staging_data.len() as u64 <= transfer.staging_size,
             "Batched SSBO flush {} B exceeds staging belt {} B",
@@ -676,14 +853,11 @@ impl GpuCullResources {
             transfer.staging_size,
         );
 
-        // Wrap staging offset if needed
         if transfer.staging_offset + staging_data.len() as u64 > transfer.staging_size {
             transfer.staging_offset = 0;
         }
-
         let staging_base = transfer.staging_offset;
 
-        // Copy all data into staging belt
         unsafe {
             std::ptr::copy_nonoverlapping(
                 staging_data.as_ptr(),
@@ -693,12 +867,10 @@ impl GpuCullResources {
         }
         transfer.staging_offset += crate::memory::align_up(staging_data.len() as u64, 64);
 
-        // Adjust copy regions: src_offset is relative to staging_base
         for region in &mut copy_regions {
             region.src_offset += staging_base;
         }
 
-        // Record single command buffer with all copy regions
         let cmd = unsafe {
             let info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(transfer.command_pool)
@@ -722,7 +894,6 @@ impl GpuCullResources {
                 &copy_regions,
             );
 
-            // Queue ownership release if dedicated transfer queue
             if transfer.is_dedicated {
                 let barrier = vk::BufferMemoryBarrier::default()
                     .buffer(self.object_ssbo)
@@ -748,7 +919,6 @@ impl GpuCullResources {
                 .expect("Failed to end transfer cmd buffer");
         }
 
-        // Single submit + single wait
         let timeline_value = transfer.submit_timeline(cmd)
             .expect("Failed to submit batched SSBO transfer");
 
@@ -762,14 +932,12 @@ impl GpuCullResources {
         }
     }
 
-    /// Queue an object for SSBO update. Updates CPU mirror. Called by World::add_object.
+    /// Queue an object for SSBO update. Updates CPU mirror.
     pub fn queue_dirty(&mut self, id: u32, data: GpuObjectData) {
-        // Update CPU-side mirror
         if (id as usize) < self.object_mirror.len() {
             self.object_mirror[id as usize] = data;
         }
 
-        // Check if already queued and update in place
         if let Some(entry) = self.dirty_objects.iter_mut().find(|(oid, _)| *oid == id) {
             entry.1 = data;
         } else {
@@ -777,7 +945,7 @@ impl GpuCullResources {
         }
     }
 
-    /// Get a copy of object data from the CPU mirror (for modification + re-queue).
+    /// Get a copy of object data from the CPU mirror.
     pub fn get_object_data(&self, id: u32) -> GpuObjectData {
         if (id as usize) < self.object_mirror.len() {
             self.object_mirror[id as usize]
@@ -786,80 +954,15 @@ impl GpuCullResources {
         }
     }
 
-    /// Register or update a buffer group. Returns the group index.
-    pub fn register_buffer_group(
-        &mut self,
-        vertex_buffer: vk::Buffer,
-        index_buffer: vk::Buffer,
-    ) -> u32 {
-        // Check if this VB/IB pair already exists
-        for (i, group) in self.buffer_groups.iter_mut().enumerate() {
-            if group.vertex_buffer == vertex_buffer && group.index_buffer == index_buffer {
-                group.active = true;
-                group.group_index = i as u32;
-                return i as u32;
-            }
-        }
-
-        // Find an inactive slot or add new
-        for (i, group) in self.buffer_groups.iter_mut().enumerate() {
-            if !group.active {
-                group.vertex_buffer = vertex_buffer;
-                group.index_buffer = index_buffer;
-                group.active = true;
-                group.group_index = i as u32;
-                return i as u32;
-            }
-        }
-
-        // Add new group
-        let idx = self.buffer_groups.len() as u32;
-        self.buffer_groups.push(BufferGroup {
-            vertex_buffer,
-            index_buffer,
-            cmd_base_offset: 0,
-            group_index: idx,
-            draw_count: 0,
-            active: true,
-        });
-        idx
-    }
-
-    /// Deactivate a buffer group (on sector eviction)
-    pub fn deactivate_buffer_group(&mut self, vertex_buffer: vk::Buffer) {
-        for group in &mut self.buffer_groups {
-            if group.vertex_buffer == vertex_buffer {
-                group.active = false;
-                group.draw_count = 0;
-            }
-        }
-    }
-
-    /// Compute and record inline upload of group base offsets (prefix sum).
-    /// Uses vkCmdUpdateBuffer (max 65536 bytes) — no transfer queue, no CPU stall.
-    /// Call after begin_command_buffer, before cull dispatch.
+    /// Phase 8B: Upload group base offsets inline. group_bases[0] = 0 always.
+    /// Retained for cull shader descriptor layout compatibility.
     pub fn update_group_base_offsets_inline(
         &mut self,
         device: &Device,
         cmd: vk::CommandBuffer,
     ) {
-        let mut base_offsets = [0u32; MAX_BUFFER_GROUPS as usize];
-        let mut running_offset = 0u32;
-        let draws_per_group = MAX_INDIRECT_DRAWS / MAX_BUFFER_GROUPS.max(1);
-
-        for (i, group) in self.buffer_groups.iter_mut().enumerate() {
-            group.cmd_base_offset = running_offset;
-            if i < base_offsets.len() {
-                base_offsets[i] = running_offset;
-            }
-            running_offset += draws_per_group;
-        }
-
-        // Fill remaining slots
-        for i in self.buffer_groups.len()..MAX_BUFFER_GROUPS as usize {
-            base_offsets[i] = running_offset;
-        }
-
+        // Phase 8B: all objects in group 0, base offset is 0
+        let base_offsets = [0u32; MAX_BUFFER_GROUPS as usize];
         let byte_size = (MAX_BUFFER_GROUPS as usize) * 4;
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -868,16 +971,9 @@ impl GpuCullResources {
             )
         };
 
-        // vkCmdUpdateBuffer: inline data transfer within the command buffer.
-        // Covered by the pre-cull TRANSFER barrier already in the pipeline.
         unsafe {
             device.cmd_update_buffer(cmd, self.group_bases, 0, bytes);
         }
-    }
-
-    /// Get active buffer groups for draw dispatch
-    pub fn active_groups(&self) -> impl Iterator<Item = &BufferGroup> {
-        self.buffer_groups.iter().filter(|g| g.active)
     }
 
     pub fn destroy(&mut self, allocator: &mut GpuAllocator) {
@@ -898,5 +994,8 @@ impl GpuCullResources {
             allocator.free_buffer(self.opaque_counts_handles[i]);
             allocator.free_buffer(self.shadow_counts_handles[i]);
         }
+
+        // Phase 8B: destroy mega buffers
+        self.mega.destroy(allocator);
     }
 }

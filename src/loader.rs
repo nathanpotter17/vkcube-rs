@@ -34,15 +34,19 @@ use crate::texture::TextureManager;
 
 /// A single loaded mesh: vertex/index data on the GPU plus draw parameters.
 pub struct LoadedMesh {
+    /// Temporary GPU allocation — freed by renderer after copying to mega buffer
     pub vertex_alloc: BufferAllocation,
+    /// Temporary GPU allocation — freed by renderer after copying to mega buffer
     pub index_alloc: BufferAllocation,
     pub vertex_count: u32,
     pub index_count: u32,
-    /// Material ID in the engine's MaterialLibrary.
     pub material_id: u32,
-    /// World-space AABB (min, max).
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
+    /// Phase 8B: raw vertex bytes for mega buffer upload
+    pub vertices_raw: Vec<u8>,
+    /// Phase 8B: raw index bytes for mega buffer upload
+    pub indices_raw: Vec<u8>,
 }
 
 /// The result of loading a complete glTF asset.
@@ -407,6 +411,21 @@ impl GltfLoader {
                     command_pool, queue,
                 )?;
 
+                // Phase 8B: capture raw bytes for mega buffer upload
+                let vertices_raw = unsafe {
+                    std::slice::from_raw_parts(
+                        vertices.as_ptr() as *const u8,
+                        vertices.len() * std::mem::size_of::<Vertex>(),
+                    )
+                }.to_vec();
+ 
+                let indices_raw = unsafe {
+                    std::slice::from_raw_parts(
+                        indices.as_ptr() as *const u8,
+                        indices.len() * std::mem::size_of::<u32>(),
+                    )
+                }.to_vec();
+
                 meshes.push(LoadedMesh {
                     vertex_alloc,
                     index_alloc,
@@ -415,6 +434,8 @@ impl GltfLoader {
                     material_id,
                     aabb_min,
                     aabb_max,
+                    vertices_raw,  // Phase 8B
+                    indices_raw,   // Phase 8B
                 });
 
                 println!("[GltfLoader]   Mesh '{}' primitive: {} verts, {} indices, mat_id={}",

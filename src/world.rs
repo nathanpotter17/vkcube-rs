@@ -68,17 +68,10 @@ pub struct Sector {
     pub state: SectorState,
     pub objects: Vec<RenderObjectId>,
     pub priority: f32,
-    /// Shared vertex buffer handle for all objects in this sector.
-    pub vertex_handle: Option<BufferHandle>,
-    /// Shared index buffer handle for all objects in this sector.
-    pub index_handle: Option<BufferHandle>,
-    /// Phase 8A: vk::Buffer for deactivating buffer groups on eviction.
-    pub vertex_buffer: Option<vk::Buffer>,
-    /// Phase 8A: vk::Buffer for deactivating buffer groups on eviction.
-    pub index_buffer: Option<vk::Buffer>,
+    /// Phase 8B: mega buffer sub-allocation for this sector's geometry.
+    /// Set when sector upload completes; cleared on eviction.
+    pub mega_alloc: Option<crate::gpu_cull::MegaAlloc>,
     /// Actual world-space AABB of all geometry in this sector (XYZ).
-    /// `None` when sector has no registered objects (Unloaded/Streaming).
-    /// Includes SECTOR_BORDER_PADDING margin for border meshes.
     pub content_bounds: Option<Aabb>,
 }
 
@@ -86,8 +79,8 @@ impl Sector {
     pub fn new(coord: SectorCoord) -> Self {
         Self {
             coord, state: SectorState::Unloaded, objects: Vec::new(),
-            priority: 0.0, vertex_handle: None, index_handle: None,
-            vertex_buffer: None, index_buffer: None,
+            priority: 0.0,
+            mega_alloc: None,
             content_bounds: None,
         }
     }
@@ -201,18 +194,16 @@ impl Sector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RenderObjectId(pub u32);
 
-/// Mesh data for one LOD level.  References the sector's shared buffers
-/// via VkBuffer handles plus per-object offsets.  No per-object
-/// BufferHandle — the sector owns the allocation.
+/// Mesh data for one LOD level.
+/// Phase 8B: VB/IB references removed — all geometry lives in mega buffers.
+/// Offsets are relative to the mega VB and mega IB.
 #[derive(Debug, Clone, Copy)]
 pub struct MeshRange {
-    pub vertex_buffer: vk::Buffer,
-    pub index_buffer: vk::Buffer,
-    /// Index into the shared index buffer (in indices, not bytes).
+    /// Index into the mega index buffer (in indices, not bytes).
     pub first_index: u32,
     /// Number of indices to draw.
     pub index_count: u32,
-    /// Base vertex added to each index value.
+    /// Base vertex added to each index value (offset into mega vertex buffer, in vertices).
     pub vertex_offset: i32,
 }
 
@@ -368,15 +359,11 @@ impl World {
         let ids = if let Some(sec) = self.sectors.get_mut(&coord) {
             let ids = std::mem::take(&mut sec.objects);
             sec.state = SectorState::Unloaded;
-            sec.vertex_handle = None;
-            sec.index_handle = None;
-            sec.vertex_buffer = None;  // Phase 8A
-            sec.index_buffer = None;   // Phase 8A
-            sec.content_bounds = None;  // Reset — will be rebuilt on reload.
+            sec.mega_alloc = None;        // Phase 8B: mega buffer freed by renderer
+            sec.content_bounds = None;
             ids
         } else { Vec::new() };
         for &id in &ids {
-            // Phase 8A: spatial.remove REMOVED - GPU SSBO managed by gpu_cull.rs
             if let Some(o) = self.objects.get_mut(id.0 as usize) { o.alive = false; }
             self.free_ids.push(id.0);
         }
