@@ -15,8 +15,8 @@
 //
 // Phase 8B modification:
 //   - Front-face culling in shadow pass eliminates acne without large bias
-//   - Hardware depth bias (constant + slope + clamp) as safety net
-//   - Normal offset bias preserves shadow contact at object-ground junctions
+//   - Hardware slope-only depth bias as sub-texel safety net
+//   - Decoupled normal offset: offset UV prevents acne, original Z preserves contact
 //   - 3×3 hardware-assisted PCF for soft shadow edges
 
 #version 450
@@ -312,7 +312,7 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
 }
 
 // ====================================================================
-//  Sun Shadow Sampling (Phase 8B: front-face culling + normal offset + PCF)
+//  Sun Shadow Sampling (Phase 8B: front-face culling + decoupled normal offset + PCF)
 // ====================================================================
 
 // Poisson disk samples for soft shadow PCF (16 samples, well-distributed).
@@ -355,13 +355,17 @@ float interleavedGradientNoise(vec2 screenPos) {
 // into the shadow map. Front-facing surfaces compare against deeper back-face
 // depth and cannot self-shadow, eliminating shadow acne.
 //
-// Normal offset bias (instead of depth bias) preserves shadow contact at
-// object-to-ground junctions while preventing acne at grazing angles.
-// The world position is shifted along the surface normal before projecting
-// into shadow space. At contact points the offset is nearly tangential
-// (perpendicular to the light), so the shadow-space depth barely changes
-// and shadows stay attached. At grazing angles the offset is large enough
-// to push the lookup behind the back-face depth stored in the shadow map.
+// Decoupled normal offset: the shadow lookup uses two separate projections:
+//   UV coords: from a position offset along the surface normal (prevents acne
+//              by sampling neighboring shadow map texels at grazing angles).
+//   Z depth:   from the original unbiased world position (preserves contact
+//              shadows — no depth shift toward/away from the light).
+//
+// This decoupling fully solves both acne and contact gaps simultaneously.
+// At contact points (box on ground), the UV shifts slightly sideways but
+// the depth comparison stays exact → shadow connects flush to the caster.
+// At grazing angles, the UV shift reads deeper back-face texels →
+// comparison passes → no acne.
 //
 // N = surface normal (world space).
 // Returns 0.0 in shadow, 1.0 in light.
@@ -379,37 +383,32 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
         }
     }
 
-    // Normal offset bias: shift the lookup position along the surface normal
-    // before projecting into shadow space. The offset scales with sin(angle)
-    // between the surface and the light direction:
-    //   - Surfaces facing the light (NdotL ≈ 1): sinAngle ≈ 0 → zero offset.
-    //   - Grazing surfaces (NdotL ≈ 0): sinAngle ≈ 1 → maximum offset.
-    // This preserves shadow attachment at contact points (ground under objects)
-    // while preventing acne on angled surfaces.
-    // Scale increases with cascade index to match growing texel footprint.
+    // Normal offset: shift position along surface normal for UV lookup.
+    // Scales with sin(angle-to-light) — zero when facing the light, max at grazing.
+    // Increases with cascade index to match growing texel footprint.
     vec3 L = -normalize(csm.csm_light_direction.xyz);
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
     float sinAngle = sqrt(1.0 - NdotL * NdotL);
     float normalOffsetScale = 0.015 * (1.0 + float(cascadeIndex) * 0.75);
     vec3 offsetPos = worldPos + N * sinAngle * normalOffsetScale;
 
-    // Project the offset position into cascade's light space
-    vec4 shadowPos = csm.cascade_matrices[cascadeIndex] * vec4(offsetPos, 1.0);
-    vec3 shadowCoord = shadowPos.xyz / shadowPos.w;
-    shadowCoord.xy = shadowCoord.xy * 0.5 + 0.5;
+    mat4 cascadeMat = csm.cascade_matrices[cascadeIndex];
 
-    // Out-of-bounds → lit
-    if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
-        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
-        shadowCoord.z < 0.0 || shadowCoord.z > 1.0) {
+    // Project offset position → UV lookup (prevents acne via texel shift)
+    vec4 shadowPosUV = cascadeMat * vec4(offsetPos, 1.0);
+    vec3 coordUV = shadowPosUV.xyz / shadowPosUV.w;
+    vec2 shadowUV = coordUV.xy * 0.5 + 0.5;
+
+    // Project original position → depth comparison (preserves contact shadows)
+    vec4 shadowPosZ = cascadeMat * vec4(worldPos, 1.0);
+    float compareRef = (shadowPosZ.xyz / shadowPosZ.w).z;
+
+    // Out-of-bounds → lit (check both UV and Z)
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 ||
+        shadowUV.y < 0.0 || shadowUV.y > 1.0 ||
+        compareRef < 0.0 || compareRef > 1.0) {
         return 1.0;
     }
-
-    // No fragment-side depth bias needed: front-face culling + normal offset
-    // handle both self-shadowing and contact preservation. Hardware depth bias
-    // (constant + slope in the pipeline rasterizer state) covers sub-texel
-    // precision as a safety net.
-    float compareRef = shadowCoord.z;
 
     // 3×3 PCF via hardware comparison sampler
     // sampler2DArrayShadow: texture(sampler, vec4(uv, layer, compareRef)) → [0,1]
@@ -419,7 +418,7 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
         for (int y = -1; y <= 1; y++) {
             vec2 offset = vec2(x, y) * texelSize;
             shadow += texture(cascadeShadowMaps,
-                vec4(shadowCoord.xy + offset, float(cascadeIndex), compareRef));
+                vec4(shadowUV + offset, float(cascadeIndex), compareRef));
         }
     }
     shadow /= 9.0;
