@@ -86,7 +86,8 @@ impl DescriptorLayouts {
         // Binding 8: BRDF LUT               (combined image sampler)    [Phase 3]
         // Binding 9: Irradiance cube map    (combined image sampler)    [Phase 3]
         // Binding 10: Pre-filtered env map  (combined image sampler)    [Phase 3]
-        // Binding 11: Screen-space AO texture (HBAO output) [Phase 6]
+        // Binding 11: Screen-space AO texture (HBAO output)             [Phase 6]
+        // Binding 12: DirectionalShadowData  (dynamic UBO)              [CSM]
         let set0_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -167,6 +168,12 @@ impl DescriptorLayouts {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(11)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // CSM: Cascade shadow data (DirectionalShadowData) — dynamic UBO
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(12)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
@@ -1399,9 +1406,11 @@ impl FrameDescriptors {
         lighting: &FrameLightingBuffers,
         shadow_view: vk::ImageView,
         shadow_sampler: vk::Sampler,
-        // Sun shadow (set 2, binding 1)
-        sun_shadow_view: vk::ImageView,
-        sun_shadow_sampler: vk::Sampler,
+        // CSM: cascade shadow (set 2, binding 1) — sampler2DArrayShadow
+        cascade_shadow_view: vk::ImageView,
+        cascade_shadow_sampler: vk::Sampler,
+        // CSM: cascade shadow UBO (set 0, binding 12)
+        cascade_shadow_ubo_range: u64,
         // Phase 3: GI resources
         probe_ssbo: vk::Buffer,
         probe_ssbo_size: u64,
@@ -1419,12 +1428,12 @@ impl FrameDescriptors {
 
         // Phase 8A: Pool sizes updated — removed per-draw UNIFORM_BUFFER_DYNAMIC
         let pool_sizes = [
-            // Set 0: 3× UNIFORM_BUFFER_DYNAMIC (global + cluster + probe grid)
+            // Set 0: 4× UNIFORM_BUFFER_DYNAMIC (global + cluster + probe grid + cascade shadow)
             //       + 5× STORAGE_BUFFER (light, cluster, index, material, probe)
             //       + 4× COMBINED_IMAGE_SAMPLER (brdf, irradiance, prefiltered, ao) per frame
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                .descriptor_count(n * 3),
+                .descriptor_count(n * 4),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(n * 5),
@@ -1531,6 +1540,12 @@ impl FrameDescriptors {
                 .image_view(ao_screen_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
+            // CSM: cascade shadow UBO info (set 0, binding 12)
+            let cascade_shadow_ubo_info = vk::DescriptorBufferInfo::default()
+                .buffer(ring_buffer)
+                .offset(0)
+                .range(cascade_shadow_ubo_range);
+
             let set0_writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(per_frame_sets[i])
@@ -1593,6 +1608,12 @@ impl FrameDescriptors {
                     .dst_binding(11)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(std::slice::from_ref(&ao_screen_info)),
+                // CSM: cascade shadow data (binding 12, dynamic UBO)
+                vk::WriteDescriptorSet::default()
+                    .dst_set(per_frame_sets[i])
+                    .dst_binding(12)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                    .buffer_info(std::slice::from_ref(&cascade_shadow_ubo_info)),
             ];
             unsafe { device.update_descriptor_sets(&set0_writes, &[]) };
 
@@ -1601,9 +1622,10 @@ impl FrameDescriptors {
                 .sampler(shadow_sampler)
                 .image_view(shadow_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            let sun_shadow_info = vk::DescriptorImageInfo::default()
-                .sampler(sun_shadow_sampler)
-                .image_view(sun_shadow_view)
+            // CSM: 2D array + comparison sampler (sampler2DArrayShadow in shader)
+            let cascade_shadow_img_info = vk::DescriptorImageInfo::default()
+                .sampler(cascade_shadow_sampler)
+                .image_view(cascade_shadow_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
             let shadow_writes = [
@@ -1616,7 +1638,7 @@ impl FrameDescriptors {
                     .dst_set(shadow_map_sets[i])
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&sun_shadow_info)),
+                    .image_info(std::slice::from_ref(&cascade_shadow_img_info)),
             ];
             unsafe { device.update_descriptor_sets(&shadow_writes, &[]) };
 

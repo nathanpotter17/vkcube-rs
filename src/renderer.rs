@@ -20,7 +20,8 @@ use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
                        MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightCategory, LightManager, LightType,
-    ShadowAtlas, ShadowBudgetManager, ShadowLod, ShadowPushConstants, SunShadow,
+    ShadowAtlas, ShadowBudgetManager, ShadowLod, ShadowPushConstants,
+    CascadeShadowMap, CascadeBuilder, DirectionalShadowData, CASCADE_COUNT,
     compute_sun_shadow_matrices,
     CLUSTER_X, CLUSTER_Y, CLUSTER_Z, MAX_SHADOW_SLOTS, SHADOW_MAP_SIZE,
     SUN_SHADOW_SIZE, TOTAL_CLUSTERS, SUN_COLOR, SUN_INTENSITY, SUN_DIR,
@@ -143,7 +144,8 @@ pub struct Renderer {
     shadow_atlas: ShadowAtlas,
     lighting_buffers: FrameLightingBuffers,
     shadow_assignments: HashMap<usize, u32>,
-    sun_shadow: SunShadow,
+    cascade_shadow: CascadeShadowMap,
+    cascade_builder: CascadeBuilder,
     sun_direction: [f32; 3],
 
     dynamic_light_indices: Vec<usize>,
@@ -235,7 +237,8 @@ impl Renderer {
         let descriptor_layouts = DescriptorLayouts::new(&device, texture_manager.descriptor_set_layout)?;
         let render_passes = RenderPasses::new(&device, device_ctx.surface_format.format)?;
         let shadow_atlas = ShadowAtlas::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
-        let sun_shadow = SunShadow::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
+        let cascade_shadow = CascadeShadowMap::new(&device, &mut memory_ctx.allocator, render_passes.shadow, device_ctx.command_pool, device_ctx.queue)?;
+        let cascade_builder = CascadeBuilder::default();
         let lighting_buffers = FrameLightingBuffers::new(&mut memory_ctx.allocator)?;
 
         let probe_grid = ProbeGrid::new(&mut memory_ctx.allocator, [0.0, 0.0])?;
@@ -431,13 +434,15 @@ impl Renderer {
         // Phase 8A: per_draw_ubo_size removed — SSBO replaces per-draw UBO
         let material_ssbo_size = (material_library.count() * std::mem::size_of::<MaterialData>()) as u64;
         let probe_grid_params_size = std::mem::size_of::<GpuProbeGridParams>() as u64;
+        let cascade_shadow_ubo_size = std::mem::size_of::<DirectionalShadowData>() as u64;
 
         // Phase 8A: per_draw_ubo_range parameter removed from FrameDescriptors::new()
         let frame_descriptors = FrameDescriptors::new(&device, &descriptor_layouts, memory_ctx.ring.buffer,
             global_ubo_size, cluster_params_size,
             material_ssbo.buffer, material_ssbo_size.max(128),
             &lighting_buffers, shadow_atlas.sampling_view, shadow_atlas.shadow_sampler,
-            sun_shadow.sampling_view, sun_shadow.sampler,
+            cascade_shadow.sampling_view, cascade_shadow.sampler,
+            cascade_shadow_ubo_size,
             probe_grid.ssbo_buffer(), probe_grid.ssbo_size(),
             probe_grid_params_size,
             gi_resources.brdf_lut_view, gi_resources.brdf_lut_sampler,
@@ -493,7 +498,8 @@ impl Renderer {
             material_library, material_ssbo, texture_manager,
             light_manager, shadow_budget, shadow_atlas, lighting_buffers,
             shadow_assignments: HashMap::new(),
-            sun_shadow,
+            cascade_shadow,
+            cascade_builder,
             sun_direction: sun_dir,
             dynamic_light_indices,
             dynamic_light_time: 0.0,
@@ -876,6 +882,17 @@ impl Renderer {
             let (sun_view, sun_proj) = compute_sun_shadow_matrices(self.sun_direction, camera_pos);
             let sun_vp = crate::scene::multiply_matrices(sun_view, sun_proj);
 
+            // CSM: Build cascade data for this frame
+            let cascade_render = self.cascade_builder.build(
+                &view_mat,
+                self.scene.camera.near,
+                self.scene.camera.far,
+                self.scene.camera.fov.to_radians(),
+                self.scene.camera.aspect,
+                self.sun_direction,
+            );
+            let cascade_data = &cascade_render.shadow_data;
+
             let global_ubo = GlobalUbo {
                 view: view_mat, proj: proj_mat,
                 camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
@@ -892,7 +909,10 @@ impl Renderer {
             let probe_params = self.probe_grid.gpu_params();
             let p_off = self.memory_ctx.ring.push_data(&probe_params).expect("Ring: ProbeGridParams").offset as u32;
 
-            let dyn_off = [g_off, c_off, p_off];
+            // CSM: Push DirectionalShadowData as dynamic UBO (binding 12)
+            let csm_off = self.memory_ctx.ring.push_data(cascade_data).expect("Ring: DirectionalShadowData").offset as u32;
+
+            let dyn_off = [g_off, c_off, p_off, csm_off];
 
             let (image_index, _) = device_ctx.swapchain_loader.acquire_next_image(
                 device_ctx.swapchain, u64::MAX, self.image_available[self.current_frame], vk::Fence::null())?;
@@ -1049,7 +1069,7 @@ impl Renderer {
             // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
-            // ---- Sun directional shadow ----
+            // ---- Cascaded sun directional shadow (CASCADE_COUNT passes) ----
             {
                 let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
                     width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
@@ -1059,50 +1079,60 @@ impl Renderer {
                     extent: vk::Extent2D { width: SUN_SHADOW_SIZE, height: SUN_SHADOW_SIZE },
                 };
                 let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } }];
-                let rp = vk::RenderPassBeginInfo::default()
-                    .render_pass(self.render_passes.shadow)
-                    .framebuffer(self.sun_shadow.framebuffer)
-                    .render_area(sun_ss)
-                    .clear_values(&clear);
-                self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
-                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sun_shadow);
-                self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
-                self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
 
-                let sun_global = GlobalUbo {
-                    view: sun_view, proj: sun_proj,
-                    camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
-                    sun_light_vp: sun_vp,
-                    sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
-                };
-                let sun_g_off = self.memory_ctx.ring.push_data(&sun_global).expect("Ring: sun shadow GlobalUbo").offset as u32;
-                let sun_dyn_off = [sun_g_off, c_off, p_off];
-                self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.layout, 0,
-                    &[self.frame_descriptors.per_frame_sets[f]], &sun_dyn_off);
+                for cascade in 0..CASCADE_COUNT {
+                    // Each cascade gets its own light-space view + proj pushed
+                    // into frame.view / frame.proj (sun_shadow.vert reads these).
+                    let cascade_global = GlobalUbo {
+                        view: cascade_render.cascade_views[cascade],
+                        proj: cascade_render.cascade_projs[cascade],
+                        camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
+                        sun_light_vp: sun_vp,
+                        sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                    };
+                    let cascade_g_off = self.memory_ctx.ring
+                        .push_data(&cascade_global)
+                        .expect("Ring: cascade GlobalUbo")
+                        .offset as u32;
+                    let cascade_dyn_off = [cascade_g_off, c_off, p_off, csm_off];
 
-                // Phase 8A: Bind object SSBO (set 3) once for all draws
-                self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.layout, 3,
-                    &[self.gpu_cull.object_ssbo_set], &[]);
+                    let rp = vk::RenderPassBeginInfo::default()
+                        .render_pass(self.render_passes.shadow)
+                        .framebuffer(self.cascade_shadow.framebuffers[cascade])
+                        .render_area(sun_ss)
+                        .clear_values(&clear);
+                    self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sun_shadow);
+                    self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
+                    self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
 
-                // Phase 8B: single mega VB/IB bind
-                self.device.cmd_bind_vertex_buffers(cmd, 0,
-                    &[self.gpu_cull.mega.vertex_buffer], &[0]);
-                self.device.cmd_bind_index_buffer(cmd,
-                    self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
- 
-                // Phase 8B: single indirect_count call (group 0, offset 0)
-                self.device.cmd_draw_indexed_indirect_count(
-                    cmd,
-                    self.gpu_cull.shadow_cmds[f],
-                    0, // cmd buffer offset: start of group 0
-                    self.gpu_cull.shadow_counts[f],
-                    0, // count buffer offset: index 0
-                    MAX_INDIRECT_DRAWS,
-                    INDIRECT_COMMAND_STRIDE,
-                );
-                self.device.cmd_end_render_pass(cmd);
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.layout, 0,
+                        &[self.frame_descriptors.per_frame_sets[f]], &cascade_dyn_off);
+
+                    // Phase 8A: Bind object SSBO (set 3) once for all draws
+                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.layout, 3,
+                        &[self.gpu_cull.object_ssbo_set], &[]);
+
+                    // Phase 8B: single mega VB/IB bind
+                    self.device.cmd_bind_vertex_buffers(cmd, 0,
+                        &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                    self.device.cmd_bind_index_buffer(cmd,
+                        self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+
+                    // All shadow geometry rendered into every cascade (no per-cascade culling yet).
+                    self.device.cmd_draw_indexed_indirect_count(
+                        cmd,
+                        self.gpu_cull.shadow_cmds[f],
+                        0,
+                        self.gpu_cull.shadow_counts[f],
+                        0,
+                        MAX_INDIRECT_DRAWS,
+                        INDIRECT_COMMAND_STRIDE,
+                    );
+                    self.device.cmd_end_render_pass(cmd);
+                }
             }
 
             // ---- Point light cube map shadows (Phase 8D.1: LOD cadence gating) ----
@@ -1148,7 +1178,7 @@ impl Renderer {
                         sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
                     };
                     let face_g_off = self.memory_ctx.ring.push_data(&face_global).expect("Ring: shadow face GlobalUbo").offset as u32;
-                    let face_dyn_off = [face_g_off, c_off, p_off];
+                    let face_dyn_off = [face_g_off, c_off, p_off, csm_off];
 
                     let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue{depth:1.0,stencil:0} }];
                     let rp = vk::RenderPassBeginInfo::default()
@@ -1232,7 +1262,7 @@ impl Renderer {
                             sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
                         };
                         let probe_g_off = self.memory_ctx.ring.push_data(&probe_global).expect("Ring: probe GlobalUbo").offset as u32;
-                        let probe_dyn_off = [probe_g_off, c_off, p_off];
+                        let probe_dyn_off = [probe_g_off, c_off, p_off, csm_off];
 
                         let clear = [
                             vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } },
@@ -1777,7 +1807,7 @@ impl Drop for Renderer {
         self.render_passes.destroy(&self.device);
         self.descriptor_layouts.destroy(&self.device);
         self.shadow_atlas.destroy(&self.device);
-        self.sun_shadow.destroy(&self.device);
+        self.cascade_shadow.destroy(&self.device);
         self.gi_resources.destroy(&self.device);
         self.device.destroy_image_view(self.normal_view, None);
         self.device.destroy_image(self.normal_image, None);

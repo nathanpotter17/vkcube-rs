@@ -92,7 +92,17 @@ layout(set = 1, binding = 0) uniform sampler2D textures[];
 
 // ---- Descriptor Set 2: Shadow maps ----
 layout(set = 2, binding = 0) uniform samplerCubeArray shadowCubeMaps;
-layout(set = 2, binding = 1) uniform sampler2D sunShadowMap;
+// CSM: 2D array + comparison sampler
+layout(set = 2, binding = 1) uniform sampler2DArrayShadow cascadeShadowMaps;
+
+// CSM: cascade shadow data (set 0, binding 12)
+const uint CASCADE_COUNT = 4;
+layout(set = 0, binding = 12, std140) uniform CascadeShadowUBO {
+    mat4  cascade_matrices[CASCADE_COUNT];
+    vec4  split_distances;
+    vec4  csm_light_direction;
+    vec4  shadow_params;
+} csm;
 
 // ---- Constants ----
 const float PI = 3.14159265358979;
@@ -177,15 +187,18 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
 }
 
 float sampleSunShadow(vec3 worldPos) {
-    if (frame.sun_direction.w < 0.5) return 1.0;
-    vec4 lightClip = frame.sun_light_vp * vec4(worldPos, 1.0);
-    vec3 ndc = lightClip.xyz / lightClip.w;
-    vec2 shadowUV = ndc.xy * 0.5 + 0.5;
-    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0)
+    if (csm.csm_light_direction.w < 0.5) return 1.0;
+    // Probes use broadest cascade for widest coverage
+    uint ci = CASCADE_COUNT - 1u;
+    vec4 shadowPos = csm.cascade_matrices[ci] * vec4(worldPos, 1.0);
+    vec3 shadowCoord = shadowPos.xyz / shadowPos.w;
+    shadowCoord.xy = shadowCoord.xy * 0.5 + 0.5;
+    if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
+        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
+        shadowCoord.z < 0.0 || shadowCoord.z > 1.0)
         return 1.0;
-    float currentDepth = ndc.z;
-    float closestDepth = texture(sunShadowMap, shadowUV).r;
-    return currentDepth - 0.002 > closestDepth ? 0.0 : 1.0;
+    float bias = 0.002;
+    return texture(cascadeShadowMaps, vec4(shadowCoord.xy, float(ci), shadowCoord.z - bias));
 }
 
 // ====================================================================

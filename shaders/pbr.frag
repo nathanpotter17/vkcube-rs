@@ -152,7 +152,20 @@ layout(set = 1, binding = 0) uniform sampler2D textures[];
 // ---- Descriptor Set 2: Shadow maps ----
 
 layout(set = 2, binding = 0) uniform samplerCubeArray shadowCubeMaps;
-layout(set = 2, binding = 1) uniform sampler2D sunShadowMap;
+// CSM: 2D array + comparison sampler for hardware PCF
+layout(set = 2, binding = 1) uniform sampler2DArrayShadow cascadeShadowMaps;
+
+// ---- CSM: Cascade shadow data (set 0, binding 12) ----
+// IMPORTANT: CASCADE_COUNT must match light.rs CASCADE_COUNT.
+
+const uint CASCADE_COUNT = 4;
+
+layout(set = 0, binding = 12, std140) uniform CascadeShadowUBO {
+    mat4  cascade_matrices[CASCADE_COUNT];
+    vec4  split_distances;      // .x/.y/.z/.w = far boundary of cascade 0/1/2/3
+    vec4  csm_light_direction;  // xyz = direction, w = shadow_enabled
+    vec4  shadow_params;        // x = bias, y = strength, z = fade_start, w = fade_range
+} csm;
 
 // ---- Constants ----
 
@@ -327,92 +340,75 @@ float interleavedGradientNoise(vec2 screenPos) {
     return fract(magic.z * fract(dot(screenPos, magic.xy)));
 }
 
-// Sample the sun's 2D shadow map with slope-scaled bias and normal offset.
-// N = surface normal (world space), used for bias calculation.
-// Returns 0.0 in shadow, 1.0 in light.
-float sampleSunShadow(vec3 worldPos, vec3 N) {
-    if (frame.sun_direction.w < 0.5) return 1.0; // shadow disabled
+// ====================================================================
+//  Cascaded Sun Shadow Sampling (replaces sampleSunShadow / sampleSunShadowPCF)
+// ====================================================================
 
-    vec3 L = -frame.sun_direction.xyz; // direction TO the sun
-    float NdotL = clamp(dot(N, L), 0.0, 1.0);
-
-    // Normal offset: push sample position along normal to reduce self-shadowing.
-    // Larger offset for surfaces facing away from light (grazing angles).
-    // This is the key technique to eliminate peter-panning.
-    float normalOffsetScale = 0.4; // world units
-    float offsetBias = normalOffsetScale * (1.0 - NdotL);
-    vec3 offsetPos = worldPos + N * offsetBias;
-
-    // Transform to sun light-space clip coordinates.
-    vec4 lightClip = frame.sun_light_vp * vec4(offsetPos, 1.0);
-    vec3 ndc = lightClip.xyz / lightClip.w;
-    vec2 shadowUV = ndc.xy * 0.5 + 0.5;
-
-    // Out-of-bounds → lit.
-    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0)
-        return 1.0;
-
-    float currentDepth = ndc.z;
-    float closestDepth = texture(sunShadowMap, shadowUV).r;
-
-    // Slope-scaled depth bias: larger for grazing angles.
-    float baseBias = 0.0005;
-    float slopeBias = 0.002 * sqrt(1.0 - NdotL * NdotL); // sin(angle)
-    float bias = baseBias + slopeBias;
-
-    return currentDepth - bias > closestDepth ? 0.0 : 1.0;
-}
-
-// PCF with Poisson disk sampling for soft sun shadows.
+// Cascade shadow sampling with 3×3 hardware-assisted PCF.
+//
+// Uses sampler2DArrayShadow for hardware depth comparison.
+// LINEAR filter + compareOp gives 2×2 bilinear PCF per tap;
+// 3×3 grid = 36 effective samples for smooth penumbra.
+//
 // N = surface normal (world space).
-// Uses 16 rotated Poisson samples for smooth penumbra.
-float sampleSunShadowPCF(vec3 worldPos, vec3 N) {
-    if (frame.sun_direction.w < 0.5) return 1.0; // shadow disabled
+// Returns 0.0 in shadow, 1.0 in light.
+float calculateCascadeShadow(vec3 worldPos, vec3 N) {
+    if (csm.csm_light_direction.w < 0.5) return 1.0; // shadow disabled
 
-    vec3 L = -frame.sun_direction.xyz;
-    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    // Determine cascade from view-space depth (same view matrix as cluster assignment)
+    float viewZ = -(cluster.view_mat * vec4(worldPos, 1.0)).z;
 
-    // Normal offset bias (critical for eliminating peter-panning).
-    // Pushes sample point "into" the surface from the light's perspective.
-    float normalOffsetScale = 0.4;
-    float offsetBias = normalOffsetScale * (1.0 - NdotL);
-    vec3 offsetPos = worldPos + N * offsetBias;
-
-    vec4 lightClip = frame.sun_light_vp * vec4(offsetPos, 1.0);
-    vec3 ndc = lightClip.xyz / lightClip.w;
-    vec2 shadowUV = ndc.xy * 0.5 + 0.5;
-
-    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0)
-        return 1.0;
-
-    float currentDepth = ndc.z;
-
-    // Slope-scaled bias.
-    float baseBias = 0.0003;
-    float slopeBias = 0.0015 * sqrt(1.0 - NdotL * NdotL);
-    float bias = baseBias + slopeBias;
-
-    // Texel size and PCF spread.
-    // 2048 shadow map, 300m extent → ~0.146m per texel.
-    // Use 3-texel radius for ~0.9m soft shadow edge.
-    vec2 texelSize = vec2(1.0 / 2048.0);
-    float spreadRadius = 3.0; // in texels
-
-    // Rotate samples per-pixel using interleaved gradient noise.
-    // This breaks up banding artifacts into imperceptible noise.
-    float rotation = interleavedGradientNoise(gl_FragCoord.xy) * 6.283185;
-    float cosR = cos(rotation);
-    float sinR = sin(rotation);
-    mat2 rotationMatrix = mat2(cosR, sinR, -sinR, cosR);
-
-    float shadow = 0.0;
-    for (int i = 0; i < 16; i++) {
-        vec2 offset = rotationMatrix * poissonDisk[i] * spreadRadius * texelSize;
-        float closestDepth = texture(sunShadowMap, shadowUV + offset).r;
-        shadow += currentDepth - bias > closestDepth ? 0.0 : 1.0;
+    uint cascadeIndex = CASCADE_COUNT - 1u;
+    for (uint i = 0u; i < CASCADE_COUNT - 1u; i++) {
+        if (viewZ < csm.split_distances[i]) {
+            cascadeIndex = i;
+            break;
+        }
     }
 
-    return shadow / 16.0;
+    // Project into cascade's light space
+    vec4 shadowPos = csm.cascade_matrices[cascadeIndex] * vec4(worldPos, 1.0);
+    vec3 shadowCoord = shadowPos.xyz / shadowPos.w;
+    shadowCoord.xy = shadowCoord.xy * 0.5 + 0.5;
+
+    // Out-of-bounds → lit
+    if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
+        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
+        shadowCoord.z < 0.0 || shadowCoord.z > 1.0) {
+        return 1.0;
+    }
+
+    // Slope-scaled bias, increasing with cascade index (farther cascades need more)
+    vec3 L = -normalize(csm.csm_light_direction.xyz);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    float baseBias = 0.001;
+    float maxBias = 0.005;
+    float bias = mix(maxBias, baseBias, NdotL);
+    bias *= (1.0 + float(cascadeIndex) * 0.5);
+
+    // Derivative-based slope bias for sub-texel accuracy
+    float slopeBias = length(dFdx(worldPos)) + length(dFdy(worldPos));
+    bias += slopeBias * 0.01;
+
+    float compareRef = shadowCoord.z - bias;
+
+    // 3×3 PCF via hardware comparison sampler
+    // sampler2DArrayShadow: texture(sampler, vec4(uv, layer, compareRef)) → [0,1]
+    float shadow = 0.0;
+    vec2 texelSize = 1.0 / vec2(textureSize(cascadeShadowMaps, 0).xy);
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            vec2 offset = vec2(x, y) * texelSize;
+            shadow += texture(cascadeShadowMaps,
+                vec4(shadowCoord.xy + offset, float(cascadeIndex), compareRef));
+        }
+    }
+    shadow /= 9.0;
+
+    // Strength modulation
+    shadow = mix(1.0, shadow, csm.shadow_params.y);
+
+    return shadow;
 }
 
 // ====================================================================
@@ -552,7 +548,7 @@ vec3 evaluateLight(
         // Directional (sun) shadow — handled separately in main() for ambient effect.
         // Here we still apply it to the sun's direct contribution.
         if (lightType == 2u) {
-            shadow = sampleSunShadowPCF(fragWorldPos, N);
+            shadow = calculateCascadeShadow(fragWorldPos, N);
         }
     }
 
@@ -603,9 +599,9 @@ void main() {
     float NdotV = max(dot(N, V), 0.0);
 
     // ════════════════════════════════════════════════════════════════════════
-    // Phase 8A: Sample sun shadow ONCE, use for both direct and ambient
+    // CSM: Sample cascade shadow ONCE, use for both direct and ambient
     // ════════════════════════════════════════════════════════════════════════
-    float sunShadow = sampleSunShadowPCF(fragWorldPos, N);
+    float sunShadow = calculateCascadeShadow(fragWorldPos, N);
 
     // Compute ambient shadow factor: in full shadow, reduce ambient to SUN_SHADOW_AMBIENT_MIN.
     // This simulates reduced sky visibility in shadowed areas.

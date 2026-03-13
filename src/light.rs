@@ -125,6 +125,214 @@ pub const SUN_SHADOW_FAR: f32 = 600.0;
 /// Near plane.
 pub const SUN_SHADOW_NEAR: f32 = 1.0;
 
+/// Number of cascaded shadow map splits.
+/// Tweakable: 2 for low-end, 4 for high quality.
+/// IMPORTANT: Must match `CASCADE_COUNT` in pbr.frag.
+pub const CASCADE_COUNT: usize = 4;
+
+/// Blend factor between logarithmic and uniform split schemes.
+/// 0.0 = pure uniform, 1.0 = pure logarithmic. 0.95 gives tight near coverage.
+pub const CASCADE_SPLIT_LAMBDA: f32 = 0.95;
+
+// ====================================================================
+//  Cascaded Shadow Map — GPU data
+// ====================================================================
+
+/// GPU-side cascade shadow data, uploaded as a dynamic UBO.
+///
+/// Layout (std140-compatible):
+///   cascade_matrices: CASCADE_COUNT × mat4  (CASCADE_COUNT × 64 bytes)
+///   split_distances:  vec4                  (16 bytes, only first CASCADE_COUNT used)
+///   light_direction:  vec4                  (16 bytes, xyz = dir, w = shadow_enabled)
+///   shadow_params:    vec4                  (16 bytes, x = bias, y = strength, z = fade_start, w = fade_range)
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct DirectionalShadowData {
+    /// Light-space VP matrices, one per cascade.
+    pub cascade_matrices: [[[f32; 4]; 4]; CASCADE_COUNT],
+    /// View-space far boundary of each cascade (vec4, unused slots = 0.0).
+    pub split_distances: [f32; 4],
+    /// Normalized sun direction (xyz), w = shadow_enabled flag.
+    pub light_direction: [f32; 4],
+    /// x: bias, y: strength, z: fade_start, w: fade_range.
+    pub shadow_params: [f32; 4],
+}
+
+/// Per-cascade rendering data returned alongside the GPU UBO struct.
+pub struct CascadeRenderData {
+    /// GPU UBO data (cascade matrices + split distances + params).
+    pub shadow_data: DirectionalShadowData,
+    /// Per-cascade view matrices for shadow pass GlobalUbo.
+    pub cascade_views: [[[f32; 4]; 4]; CASCADE_COUNT],
+    /// Per-cascade projection matrices for shadow pass GlobalUbo.
+    pub cascade_projs: [[[f32; 4]; 4]; CASCADE_COUNT],
+}
+
+// ====================================================================
+//  CascadeBuilder — computes CSM splits and matrices per frame
+// ====================================================================
+
+/// Computes CSM cascade splits and light-space matrices each frame.
+///
+/// Uses the practical split scheme (GPU Gems 3, Ch. 10):
+///   split[i] = λ * log_split + (1−λ) * uniform_split
+///
+/// Texel-grid snapping eliminates shadow edge shimmer on camera movement.
+#[derive(Debug, Clone)]
+pub struct CascadeBuilder {
+    pub split_lambda: f32,
+    pub shadow_map_size: u32,
+    pub z_extent_scale: f32,
+}
+
+impl Default for CascadeBuilder {
+    fn default() -> Self {
+        Self {
+            split_lambda: CASCADE_SPLIT_LAMBDA,
+            shadow_map_size: SUN_SHADOW_SIZE,
+            z_extent_scale: 10.0,
+        }
+    }
+}
+
+impl CascadeBuilder {
+    /// Build cascade data for the current frame.
+    ///
+    /// `camera_view`: camera view matrix (this codebase's row-major convention).
+    /// `camera_near`, `camera_far`: camera frustum depths.
+    /// `camera_fov_rad`: vertical FOV in radians.
+    /// `camera_aspect`: width / height.
+    /// `sun_direction`: normalized world-space direction the sun shines (toward ground).
+    pub fn build(
+        &self,
+        camera_view: &[[f32; 4]; 4],
+        camera_near: f32,
+        camera_far: f32,
+        camera_fov_rad: f32,
+        camera_aspect: f32,
+        sun_direction: [f32; 3],
+    ) -> CascadeRenderData {
+        let near = camera_near;
+        let far = camera_far;
+        let lambda = self.split_lambda;
+
+        // Practical split scheme: λ * log + (1−λ) * uniform
+        let mut splits = [0.0f32; CASCADE_COUNT + 1];
+        splits[0] = near;
+        for i in 1..CASCADE_COUNT {
+            let t = i as f32 / CASCADE_COUNT as f32;
+            let uniform = near + t * (far - near);
+            let log = near * (far / near).powf(t);
+            splits[i] = lambda * log + (1.0 - lambda) * uniform;
+        }
+        splits[CASCADE_COUNT] = far;
+
+        let inv_view = invert_view(camera_view);
+        let light_dir = normalize3(sun_direction);
+        let up = if light_dir[1].abs() > 0.99 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+
+        let tan_half_fov = (camera_fov_rad / 2.0).tan();
+
+        let mut cascade_matrices = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
+        let mut cascade_views = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
+        let mut cascade_projs = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
+        let mut split_distances = [0.0f32; 4]; // always vec4 for GPU alignment
+
+        for cascade in 0..CASCADE_COUNT {
+            let near_split = splits[cascade];
+            let far_split = splits[cascade + 1];
+            split_distances[cascade] = far_split;
+
+            // Frustum corners in camera view space (RH: camera looks down -Z)
+            let hn = near_split * tan_half_fov;
+            let wn = hn * camera_aspect;
+            let hf = far_split * tan_half_fov;
+            let wf = hf * camera_aspect;
+
+            let view_corners: [[f32; 3]; 8] = [
+                [-wn, -hn, -near_split], [ wn, -hn, -near_split],
+                [-wn,  hn, -near_split], [ wn,  hn, -near_split],
+                [-wf, -hf, -far_split],  [ wf, -hf, -far_split],
+                [-wf,  hf, -far_split],  [ wf,  hf, -far_split],
+            ];
+
+            // Transform to world space
+            let mut world_corners = [[0.0f32; 3]; 8];
+            let mut center = [0.0f32; 3];
+            for i in 0..8 {
+                let w = mat4_transform_point3(&inv_view, view_corners[i]);
+                world_corners[i] = w;
+                center[0] += w[0];
+                center[1] += w[1];
+                center[2] += w[2];
+            }
+            center[0] /= 8.0;
+            center[1] /= 8.0;
+            center[2] /= 8.0;
+
+            // Light view matrix: look from center offset along -lightDir toward center
+            let light_eye = [
+                center[0] - light_dir[0] * 100.0,
+                center[1] - light_dir[1] * 100.0,
+                center[2] - light_dir[2] * 100.0,
+            ];
+            let light_view = look_at(light_eye, center, up);
+
+            // Compute AABB of frustum corners in light-view space
+            let mut ls_min = [f32::MAX; 3];
+            let mut ls_max = [f32::MIN; 3];
+            for wc in &world_corners {
+                let ls = mat4_transform_point3(&light_view, *wc);
+                for k in 0..3 {
+                    ls_min[k] = ls_min[k].min(ls[k]);
+                    ls_max[k] = ls_max[k].max(ls[k]);
+                }
+            }
+
+            // Texel-snap XY to prevent shadow shimmer on camera movement
+            let texel_x = (ls_max[0] - ls_min[0]) / self.shadow_map_size as f32;
+            let texel_y = (ls_max[1] - ls_min[1]) / self.shadow_map_size as f32;
+            if texel_x > 1e-8 {
+                ls_min[0] = (ls_min[0] / texel_x).floor() * texel_x;
+                ls_max[0] = (ls_max[0] / texel_x).ceil() * texel_x;
+            }
+            if texel_y > 1e-8 {
+                ls_min[1] = (ls_min[1] / texel_y).floor() * texel_y;
+                ls_max[1] = (ls_max[1] / texel_y).ceil() * texel_y;
+            }
+
+            // Extend Z to catch shadow casters behind the view frustum
+            let z_ext = self.z_extent_scale;
+            let light_proj = ortho_vulkan(
+                ls_min[0], ls_max[0],
+                ls_min[1], ls_max[1],
+                -ls_max[2] - z_ext,  // near plane (RH looks down -Z)
+                -ls_min[2] + z_ext,  // far plane
+            );
+
+            cascade_views[cascade] = light_view;
+            cascade_projs[cascade] = light_proj;
+            cascade_matrices[cascade] =
+                crate::scene::multiply_matrices(light_view, light_proj);
+        }
+
+        CascadeRenderData {
+            shadow_data: DirectionalShadowData {
+                cascade_matrices,
+                split_distances,
+                light_direction: [sun_direction[0], sun_direction[1], sun_direction[2], 1.0],
+                shadow_params: [0.001, 1.0, 0.9, 0.1], // bias, strength, fade_start, fade_range
+            },
+            cascade_views,
+            cascade_projs,
+        }
+    }
+}
+
 // ====================================================================
 //  Light Types
 // ====================================================================
@@ -1289,27 +1497,29 @@ impl ShadowAtlas {
 }
 
 // ====================================================================
-//  SunShadow — 2D depth map for directional light
+//  CascadeShadowMap — 2D array depth map for cascaded directional shadows
 // ====================================================================
 
-/// Manages a single 2D depth texture for directional (sun) shadows.
+/// Manages a 2D array depth texture for cascaded directional (sun) shadows.
 ///
-/// The sun shadow uses the same depth-only render pass as the point
-/// light cube maps, but writes standard hardware depth (no linear distance).
-/// Uses an orthographic projection centered on the camera, covering
-/// `SUN_SHADOW_EXTENT` meters in each direction.
-pub struct SunShadow {
+/// Each array layer corresponds to one cascade split.
+/// Created as VK_IMAGE_VIEW_TYPE_2D_ARRAY for shader sampling and
+/// individual TYPE_2D layer views for per-cascade framebuffers.
+pub struct CascadeShadowMap {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
-    pub depth_view: vk::ImageView,
-    /// View for shader sampling (TYPE_2D).
+    /// Per-layer 2D views for framebuffer attachment (one per cascade).
+    pub layer_views: Vec<vk::ImageView>,
+    /// 2D_ARRAY view for shader sampling (all cascades).
     pub sampling_view: vk::ImageView,
-    pub framebuffer: vk::Framebuffer,
+    /// Per-cascade framebuffers.
+    pub framebuffers: Vec<vk::Framebuffer>,
+    /// Comparison sampler for hardware PCF (sampler2DArrayShadow).
     pub sampler: vk::Sampler,
 }
 
-impl SunShadow {
-    /// Create the sun shadow map resources.
+impl CascadeShadowMap {
+    /// Create cascade shadow map resources.
     ///
     /// Reuses the provided shadow render pass (depth-only,
     /// SHADER_READ_ONLY → SHADER_READ_ONLY).
@@ -1321,14 +1531,15 @@ impl SunShadow {
         queue: vk::Queue,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let size = SUN_SHADOW_SIZE;
+        let layer_count = CASCADE_COUNT as u32;
 
-        // ---- Create 2D depth image ----
+        // ---- Create 2D array depth image (CASCADE_COUNT layers) ----
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::D32_SFLOAT)
             .extent(vk::Extent3D { width: size, height: size, depth: 1 })
             .mip_levels(1)
-            .array_layers(1)
+            .array_layers(layer_count)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
@@ -1348,7 +1559,7 @@ impl SunShadow {
         let memory = unsafe { device.allocate_memory(&alloc_info, None)? };
         unsafe { device.bind_image_memory(image, memory, 0)? };
 
-        // ---- Initial layout transition: UNDEFINED → SHADER_READ_ONLY_OPTIMAL ----
+        // ---- Initial layout transition: UNDEFINED → SHADER_READ_ONLY_OPTIMAL (all layers) ----
         unsafe {
             let cmd_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
@@ -1370,7 +1581,7 @@ impl SunShadow {
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::DEPTH,
                     base_mip_level: 0, level_count: 1,
-                    base_array_layer: 0, layer_count: 1,
+                    base_array_layer: 0, layer_count,
                 });
             device.cmd_pipeline_barrier(cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1385,31 +1596,49 @@ impl SunShadow {
             device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
         }
 
-        // ---- Depth view (framebuffer attachment) ----
-        let depth_view = unsafe { device.create_image_view(
+        // ---- Per-layer 2D views (framebuffer attachments) ----
+        let mut layer_views = Vec::with_capacity(CASCADE_COUNT);
+        for i in 0..CASCADE_COUNT {
+            let view = unsafe { device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::DEPTH,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: i as u32, layer_count: 1,
+                    }), None)? };
+            layer_views.push(view);
+        }
+
+        // ---- 2D_ARRAY view for shader sampling (all cascades) ----
+        let sampling_view = unsafe { device.create_image_view(
             &vk::ImageViewCreateInfo::default()
                 .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
+                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
                 .format(vk::Format::D32_SFLOAT)
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::DEPTH,
                     base_mip_level: 0, level_count: 1,
-                    base_array_layer: 0, layer_count: 1,
+                    base_array_layer: 0, layer_count,
                 }), None)? };
 
-        // ---- Sampling view (same as depth_view for 2D) ----
-        let sampling_view = depth_view;
+        // ---- Per-cascade framebuffers ----
+        let mut framebuffers = Vec::with_capacity(CASCADE_COUNT);
+        for i in 0..CASCADE_COUNT {
+            let fb = unsafe { device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(shadow_render_pass)
+                    .attachments(std::slice::from_ref(&layer_views[i]))
+                    .width(size)
+                    .height(size)
+                    .layers(1), None)? };
+            framebuffers.push(fb);
+        }
 
-        // ---- Framebuffer ----
-        let fb = unsafe { device.create_framebuffer(
-            &vk::FramebufferCreateInfo::default()
-                .render_pass(shadow_render_pass)
-                .attachments(std::slice::from_ref(&depth_view))
-                .width(size)
-                .height(size)
-                .layers(1), None)? };
-
-        // ---- Shadow sampler (linear, clamp-to-border white) ----
+        // ---- Shadow comparison sampler (for sampler2DArrayShadow) ----
+        // LINEAR filter + compare gives hardware 2×2 bilinear PCF.
         let sampler = unsafe { device.create_sampler(
             &vk::SamplerCreateInfo::default()
                 .mag_filter(vk::Filter::LINEAR)
@@ -1418,24 +1647,32 @@ impl SunShadow {
                 .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
                 .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
-                .compare_enable(false)
+                .compare_enable(true)
+                .compare_op(vk::CompareOp::LESS_OR_EQUAL)
                 .min_lod(0.0)
                 .max_lod(1.0)
                 .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE), None)? };
 
         let mb = (mem_req.size + 1024 * 1024 - 1) / (1024 * 1024);
-        println!("[SunShadow] {}×{} D32_SFLOAT, ~{} MB", size, size, mb);
+        println!(
+            "[CascadeShadowMap] {}×{} × {} layers D32_SFLOAT, ~{} MB",
+            size, size, CASCADE_COUNT, mb,
+        );
 
         Ok(Self {
-            image, memory, depth_view, sampling_view, framebuffer: fb, sampler,
+            image, memory, layer_views, sampling_view, framebuffers, sampler,
         })
     }
 
     pub fn destroy(&self, device: &Device) {
         unsafe {
-            device.destroy_framebuffer(self.framebuffer, None);
-            // depth_view == sampling_view, destroy once.
-            device.destroy_image_view(self.depth_view, None);
+            for &fb in &self.framebuffers {
+                device.destroy_framebuffer(fb, None);
+            }
+            for &view in &self.layer_views {
+                device.destroy_image_view(view, None);
+            }
+            device.destroy_image_view(self.sampling_view, None);
             device.destroy_sampler(self.sampler, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
@@ -1443,15 +1680,13 @@ impl SunShadow {
     }
 }
 
-/// Compute the sun's orthographic view + projection matrices for shadow rendering.
-///
-/// The orthographic frustum is centered on `camera_pos` projected along the
-/// sun direction, covering `SUN_SHADOW_EXTENT` meters in each direction.
+/// Legacy single-map sun shadow computation.
+/// Retained for non-CSM code paths (e.g. probe baking).
+/// For the main render loop, use `CascadeBuilder::build()` instead.
 pub fn compute_sun_shadow_matrices(
     sun_direction: [f32; 3],
     camera_pos: [f32; 3],
 ) -> ([[f32; 4]; 4], [[f32; 4]; 4]) {
-    // Light "eye" = camera center offset far along opposite of sun direction.
     let eye = [
         camera_pos[0] - sun_direction[0] * SUN_SHADOW_FAR * 0.5,
         camera_pos[1] - sun_direction[1] * SUN_SHADOW_FAR * 0.5,
@@ -1462,16 +1697,15 @@ pub fn compute_sun_shadow_matrices(
 
     let view = look_at(eye, target, up);
 
-    // Orthographic projection (Vulkan convention: Y-flip, Z=[0,1]).
     let half = SUN_SHADOW_EXTENT;
     let near = SUN_SHADOW_NEAR;
     let far = SUN_SHADOW_FAR;
 
     let proj = [
         [1.0 / half, 0.0, 0.0, 0.0],
-        [0.0, -1.0 / half, 0.0, 0.0],                  // Y-flip for Vulkan
-        [0.0, 0.0, -1.0 / (far - near), 0.0],          // NEGATIVE Z-scale
-        [0.0, 0.0, -near / (far - near), 1.0],         // Z-offset in row 3
+        [0.0, -1.0 / half, 0.0, 0.0],
+        [0.0, 0.0, -1.0 / (far - near), 0.0],
+        [0.0, 0.0, -near / (far - near), 1.0],
     ];
 
     (view, proj)
@@ -1594,5 +1828,70 @@ fn invert_projection(p: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
         [0.0, ib, 0.0, 0.0],
         [0.0, 0.0, 0.0, -1.0],
         [0.0, 0.0, ie, c * ie],
+    ]
+}
+
+// ====================================================================
+//  Cascade shadow math helpers
+// ====================================================================
+
+/// Invert a rigid-body view matrix (rotation + translation, no scale).
+///
+/// For this codebase's row-major convention where look_at produces:
+///   row 0: [s.x,  u.x, -f.x, 0]
+///   row 1: [s.y,  u.y, -f.y, 0]
+///   row 2: [s.z,  u.z, -f.z, 0]
+///   row 3: [-s·e, -u·e, f·e, 1]
+///
+/// The inverse transposes the 3×3 block and recomputes the translation.
+fn invert_view(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let tx = m[3][0];
+    let ty = m[3][1];
+    let tz = m[3][2];
+    // eye = -R * t  (where R is the transposed 3×3 block)
+    let ex = -(m[0][0] * tx + m[1][0] * ty + m[2][0] * tz);
+    let ey = -(m[0][1] * tx + m[1][1] * ty + m[2][1] * tz);
+    let ez = -(m[0][2] * tx + m[1][2] * ty + m[2][2] * tz);
+    [
+        [m[0][0], m[1][0], m[2][0], 0.0],
+        [m[0][1], m[1][1], m[2][1], 0.0],
+        [m[0][2], m[1][2], m[2][2], 0.0],
+        [ex,      ey,      ez,      1.0],
+    ]
+}
+
+/// Transform a 3D point by a 4×4 matrix (with perspective divide).
+///
+/// Performs the equivalent of the GPU's column-major `M * vec4(p, 1.0)`,
+/// accounting for this codebase's row-major storage convention where the
+/// GPU interprets the matrix as transposed.
+///
+/// Accesses: column `j` of the matrix across all rows to compute component `j`.
+fn mat4_transform_point3(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
+    let x = m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0];
+    let y = m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1];
+    let z = m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2];
+    let w = m[0][3] * p[0] + m[1][3] * p[1] + m[2][3] * p[2] + m[3][3];
+    let iw = if w.abs() > 1e-10 { 1.0 / w } else { 1.0 };
+    [x * iw, y * iw, z * iw]
+}
+
+/// Orthographic projection matrix (Vulkan convention: Y-flip, Z∈[0,1], RH).
+///
+/// Parameters match glam's `orthographic_rh`: left/right/bottom/top define
+/// the X/Y clip boundaries, near/far are positive distances along -Z.
+fn ortho_vulkan(
+    left: f32, right: f32,
+    bottom: f32, top: f32,
+    near: f32, far: f32,
+) -> [[f32; 4]; 4] {
+    let rml = right - left;
+    let tmb = top - bottom;
+    let nmf = near - far; // negative of (far - near)
+    [
+        [ 2.0 / rml,              0.0,                   0.0,          0.0],
+        [ 0.0,                   -2.0 / tmb,             0.0,          0.0],  // Y-flip
+        [ 0.0,                    0.0,                   1.0 / nmf,    0.0],  // Z∈[0,1]
+        [-(right + left) / rml,   (top + bottom) / tmb,  near / nmf,  1.0],
     ]
 }
