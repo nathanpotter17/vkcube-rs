@@ -632,10 +632,12 @@ impl Pipelines {
             vert_spv, probe_capture_frag_spv,
         )?;
 
-        // ---- Sun shadow pipeline (depth-only with hardware z, ortho) ----
+        // ---- Sun shadow pipeline (Phase 8B fix: front-face culling + hardware bias) ----
         // Uses dedicated sun_shadow shaders - no color output, no validation warning.
-        // Orthographic projection naturally produces linear depth ideal for shadow comparison.
-        let sun_shadow = Self::create_depth_pipeline(
+        // Front-face culling renders only back faces into shadow map, eliminating
+        // self-shadowing (acne) without needing a large fragment-side bias.
+        // This prevents peter-panning (shadow detachment from casters).
+        let sun_shadow = Self::create_sun_shadow_pipeline(
             device, cache, layout, passes.shadow,
             sun_shadow_vert_spv, sun_shadow_frag_spv,
         )?;
@@ -662,7 +664,17 @@ impl Pipelines {
 
     // ---- Pipeline builders ----
 
-    fn create_depth_pipeline(
+    /// Sun shadow (CSM) pipeline: depth-only, front-face culling + hardware depth bias.
+    ///
+    /// Front-face culling renders only back faces into the shadow map. When the
+    /// PBR fragment shader compares a front-facing surface against the shadow map,
+    /// the stored depth is from the back face (always deeper). Front faces cannot
+    /// self-shadow, eliminating acne without a large fragment-side bias, which in
+    /// turn eliminates peter-panning (shadow detachment).
+    ///
+    /// A small hardware depth bias is applied as a safety net for edge cases
+    /// (near-coplanar surfaces, grazing angles on thin geometry).
+    fn create_sun_shadow_pipeline(
         device: &Device,
         cache: vk::PipelineCache,
         layout: vk::PipelineLayout,
@@ -695,17 +707,25 @@ impl Pipelines {
             let viewport_state = vk::PipelineViewportStateCreateInfo::default()
                 .viewport_count(1)
                 .scissor_count(1);
+            // Front-face culling: render back faces only into the shadow map.
+            // Back-face depth is always behind front-face depth, so front-facing
+            // lit surfaces never self-shadow. This eliminates shadow acne without
+            // needing a large depth bias, which prevents peter-panning.
             let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
                 .line_width(1.0)
-                .cull_mode(vk::CullModeFlags::BACK)
-                .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
+                .cull_mode(vk::CullModeFlags::FRONT)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .depth_bias_enable(true)
+                .depth_bias_constant_factor(2.0)
+                .depth_bias_clamp(0.01)
+                .depth_bias_slope_factor(2.0);
             let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(true)
                 .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::LESS);
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
             let color_blending = vk::PipelineColorBlendStateCreateInfo::default();
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()

@@ -159,13 +159,15 @@ pub struct DirectionalShadowData {
 }
 
 /// Per-cascade rendering data returned alongside the GPU UBO struct.
+///
+/// The combined VP matrices in `shadow_data.cascade_matrices` are used
+/// directly by both the shadow vertex shader (via GlobalUbo.view with
+/// identity proj) and the PBR fragment shader (via CascadeShadowUBO).
+/// This ensures bit-exact depth values between writer and reader,
+/// eliminating floating-point precision mismatches that cause peter-panning.
 pub struct CascadeRenderData {
     /// GPU UBO data (cascade matrices + split distances + params).
     pub shadow_data: DirectionalShadowData,
-    /// Per-cascade view matrices for shadow pass GlobalUbo.
-    pub cascade_views: [[[f32; 4]; 4]; CASCADE_COUNT],
-    /// Per-cascade projection matrices for shadow pass GlobalUbo.
-    pub cascade_projs: [[[f32; 4]; 4]; CASCADE_COUNT],
 }
 
 // ====================================================================
@@ -190,7 +192,11 @@ impl Default for CascadeBuilder {
         Self {
             split_lambda: CASCADE_SPLIT_LAMBDA,
             shadow_map_size: SUN_SHADOW_SIZE,
-            z_extent_scale: 10.0,
+            // Z-range extension beyond the frustum AABB (in world units).
+            // Must be large enough to capture shadow casters between the sun and the
+            // cascade frustum that sit outside the tight AABB. 100.0 covers typical
+            // outdoor scenes with camera far ≈ 200m. Increase for very large worlds.
+            z_extent_scale: 100.0,
         }
     }
 }
@@ -238,8 +244,6 @@ impl CascadeBuilder {
         let tan_half_fov = (camera_fov_rad / 2.0).tan();
 
         let mut cascade_matrices = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
-        let mut cascade_views = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
-        let mut cascade_projs = [[[0.0f32; 4]; 4]; CASCADE_COUNT];
         let mut split_distances = [0.0f32; 4]; // always vec4 for GPU alignment
 
         for cascade in 0..CASCADE_COUNT {
@@ -274,7 +278,10 @@ impl CascadeBuilder {
             center[1] /= 8.0;
             center[2] /= 8.0;
 
-            // Light view matrix: look from center offset along -lightDir toward center
+            // Light view matrix: look from center offset along -lightDir toward center.
+            // The 100-unit offset is arbitrary for directional lights — the ortho projection
+            // controls what gets captured, not the eye distance. The offset just needs to
+            // place the eye behind all shadow casters relative to the light direction.
             let light_eye = [
                 center[0] - light_dir[0] * 100.0,
                 center[1] - light_dir[1] * 100.0,
@@ -305,17 +312,18 @@ impl CascadeBuilder {
                 ls_max[1] = (ls_max[1] / texel_y).ceil() * texel_y;
             }
 
-            // Extend Z to catch shadow casters behind the view frustum
+            // Extend Z bounds to catch shadow casters behind/beyond the frustum.
+            // In RH the light looks down -Z, so frustum corners have negative Z in light space.
+            // -max.z = near boundary (closest to light), -min.z = far boundary.
+            // z_extent_scale extends both sides to capture off-frustum casters/receivers.
             let z_ext = self.z_extent_scale;
             let light_proj = ortho_vulkan(
                 ls_min[0], ls_max[0],
                 ls_min[1], ls_max[1],
-                -ls_max[2] - z_ext,  // near plane (RH looks down -Z)
-                -ls_min[2] + z_ext,  // far plane
+                -ls_max[2] - z_ext,  // near plane (toward light)
+                -ls_min[2] + z_ext,  // far plane (away from light)
             );
 
-            cascade_views[cascade] = light_view;
-            cascade_projs[cascade] = light_proj;
             cascade_matrices[cascade] =
                 crate::scene::multiply_matrices(light_view, light_proj);
         }
@@ -327,8 +335,6 @@ impl CascadeBuilder {
                 light_direction: [sun_direction[0], sun_direction[1], sun_direction[2], 1.0],
                 shadow_params: [0.001, 1.0, 0.9, 0.1], // bias, strength, fade_start, fade_range
             },
-            cascade_views,
-            cascade_projs,
         }
     }
 }
@@ -1837,21 +1843,26 @@ fn invert_projection(p: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
 /// Invert a rigid-body view matrix (rotation + translation, no scale).
 ///
-/// For this codebase's row-major convention where look_at produces:
-///   row 0: [s.x,  u.x, -f.x, 0]
-///   row 1: [s.y,  u.y, -f.y, 0]
-///   row 2: [s.z,  u.z, -f.z, 0]
+/// The 3×3 block is transposed (swaps rows↔cols), and the translation
+/// is recomputed as -R^T * t to recover the original eye position.
+///
+/// For this codebase's look_at convention:
+///   row 0: [s.x, u.x, -f.x, 0]
+///   row 1: [s.y, u.y, -f.y, 0]
+///   row 2: [s.z, u.z, -f.z, 0]
 ///   row 3: [-s·e, -u·e, f·e, 1]
 ///
-/// The inverse transposes the 3×3 block and recomputes the translation.
+/// The inverse must produce row 3 = [eye.x, eye.y, eye.z, 1].
 fn invert_view(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let tx = m[3][0];
     let ty = m[3][1];
     let tz = m[3][2];
-    // eye = -R * t  (where R is the transposed 3×3 block)
-    let ex = -(m[0][0] * tx + m[1][0] * ty + m[2][0] * tz);
-    let ey = -(m[0][1] * tx + m[1][1] * ty + m[2][1] * tz);
-    let ez = -(m[0][2] * tx + m[1][2] * ty + m[2][2] * tz);
+    // Compute eye = -R_inv * t using ROW access (m[row][col]):
+    // Each row of the original 3×3 block dotted with the translation vector.
+    let ex = -(m[0][0] * tx + m[0][1] * ty + m[0][2] * tz);
+    let ey = -(m[1][0] * tx + m[1][1] * ty + m[1][2] * tz);
+    let ez = -(m[2][0] * tx + m[2][1] * ty + m[2][2] * tz);
+    // Transpose the 3×3 rotation block (swap rows↔cols)
     [
         [m[0][0], m[1][0], m[2][0], 0.0],
         [m[0][1], m[1][1], m[2][1], 0.0],

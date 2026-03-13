@@ -1081,11 +1081,15 @@ impl Renderer {
                 let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } }];
 
                 for cascade in 0..CASCADE_COUNT {
-                    // Each cascade gets its own light-space view + proj pushed
-                    // into frame.view / frame.proj (sun_shadow.vert reads these).
+                    // Combined VP in frame.view, identity in frame.proj.
+                    // sun_shadow.vert computes: gl_Position = frame.proj * frame.view * worldPos
+                    // With identity proj this becomes: combined_VP * worldPos
+                    // which is bit-exact with the fragment shader's:
+                    //   csm.cascade_matrices[i] * worldPos
+                    // Eliminates float precision mismatch → less bias needed → no peter-panning.
                     let cascade_global = GlobalUbo {
-                        view: cascade_render.cascade_views[cascade],
-                        proj: cascade_render.cascade_projs[cascade],
+                        view: cascade_render.shadow_data.cascade_matrices[cascade],
+                        proj: crate::scene::identity_matrix(),
                         camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
                         sun_light_vp: sun_vp,
                         sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],

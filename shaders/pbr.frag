@@ -14,9 +14,10 @@
 //   - Shadowed areas receive reduced IBL/probe contribution for visible shadows
 //
 // Phase 8B modification:
-//   - Normal offset bias eliminates peter-panning (shadow detachment)
-//   - Slope-scaled depth bias adapts to surface angle
-//   - 16-sample rotated Poisson disk PCF for soft shadow edges
+//   - Front-face culling in shadow pass eliminates acne without large bias
+//   - Hardware depth bias (constant + slope + clamp) as safety net
+//   - Minimal fragment-side epsilon prevents peter-panning (shadow detachment)
+//   - 3×3 hardware-assisted PCF for soft shadow edges
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -311,7 +312,7 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
 }
 
 // ====================================================================
-//  Sun Shadow Sampling (Phase 8B: improved bias + PCF)
+//  Sun Shadow Sampling (Phase 8B: front-face culling + minimal bias + PCF)
 // ====================================================================
 
 // Poisson disk samples for soft shadow PCF (16 samples, well-distributed).
@@ -350,6 +351,11 @@ float interleavedGradientNoise(vec2 screenPos) {
 // LINEAR filter + compareOp gives 2×2 bilinear PCF per tap;
 // 3×3 grid = 36 effective samples for smooth penumbra.
 //
+// Phase 8B fix: Front-face culling in the shadow pass renders only back faces
+// into the shadow map. Front-facing surfaces compare against deeper back-face
+// depth and cannot self-shadow. This eliminates shadow acne without needing a
+// large fragment-side bias, which in turn eliminates peter-panning.
+//
 // N = surface normal (world space).
 // Returns 0.0 in shadow, 1.0 in light.
 float calculateCascadeShadow(vec3 worldPos, vec3 N) {
@@ -378,17 +384,13 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
         return 1.0;
     }
 
-    // Slope-scaled bias, increasing with cascade index (farther cascades need more)
+    // Minimal fragment-side bias: front-face culling in the shadow pass renders
+    // only back faces, so front-facing surfaces compare against deeper back-face
+    // depth and cannot self-shadow.  Hardware depth bias handles slope-dependent
+    // precision issues.  This tiny epsilon covers residual float rounding only.
     vec3 L = -normalize(csm.csm_light_direction.xyz);
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
-    float baseBias = 0.001;
-    float maxBias = 0.005;
-    float bias = mix(maxBias, baseBias, NdotL);
-    bias *= (1.0 + float(cascadeIndex) * 0.5);
-
-    // Derivative-based slope bias for sub-texel accuracy
-    float slopeBias = length(dFdx(worldPos)) + length(dFdy(worldPos));
-    bias += slopeBias * 0.01;
+    float bias = mix(0.0003, 0.0001, NdotL);
 
     float compareRef = shadowCoord.z - bias;
 
@@ -603,9 +605,14 @@ void main() {
     // ════════════════════════════════════════════════════════════════════════
     float sunShadow = calculateCascadeShadow(fragWorldPos, N);
 
-    // Compute ambient shadow factor: in full shadow, reduce ambient to SUN_SHADOW_AMBIENT_MIN.
-    // This simulates reduced sky visibility in shadowed areas.
-    float ambientShadowFactor = mix(SUN_SHADOW_AMBIENT_MIN, 1.0, sunShadow);
+    // Gate ambient shadow by sun-facing angle.
+    // Back-facing surfaces (NdotL ≈ 0) produce unreliable shadow map lookups,
+    // so we smoothly blend out the ambient darkening as surfaces turn away.
+    // Direct lighting handles itself (NdotL=0 → contribution=0, shadow irrelevant).
+    vec3 sunL = -normalize(csm.csm_light_direction.xyz);
+    float sunFacing = smoothstep(0.0, 0.1, max(dot(N, sunL), 0.0));
+    float gatedShadow = mix(1.0, sunShadow, sunFacing);
+    float ambientShadowFactor = mix(SUN_SHADOW_AMBIENT_MIN, 1.0, gatedShadow);
 
     // ---- Clustered direct lighting (Phase 8C.4: with luminance early exit) ----
     uint clusterIdx = getClusterIndex();
