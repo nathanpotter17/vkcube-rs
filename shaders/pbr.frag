@@ -16,7 +16,7 @@
 // Phase 8B modification:
 //   - Front-face culling in shadow pass eliminates acne without large bias
 //   - Hardware depth bias (constant + slope + clamp) as safety net
-//   - Minimal fragment-side epsilon prevents peter-panning (shadow detachment)
+//   - Normal offset bias preserves shadow contact at object-ground junctions
 //   - 3×3 hardware-assisted PCF for soft shadow edges
 
 #version 450
@@ -312,7 +312,7 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
 }
 
 // ====================================================================
-//  Sun Shadow Sampling (Phase 8B: front-face culling + minimal bias + PCF)
+//  Sun Shadow Sampling (Phase 8B: front-face culling + normal offset + PCF)
 // ====================================================================
 
 // Poisson disk samples for soft shadow PCF (16 samples, well-distributed).
@@ -353,8 +353,15 @@ float interleavedGradientNoise(vec2 screenPos) {
 //
 // Phase 8B fix: Front-face culling in the shadow pass renders only back faces
 // into the shadow map. Front-facing surfaces compare against deeper back-face
-// depth and cannot self-shadow. This eliminates shadow acne without needing a
-// large fragment-side bias, which in turn eliminates peter-panning.
+// depth and cannot self-shadow, eliminating shadow acne.
+//
+// Normal offset bias (instead of depth bias) preserves shadow contact at
+// object-to-ground junctions while preventing acne at grazing angles.
+// The world position is shifted along the surface normal before projecting
+// into shadow space. At contact points the offset is nearly tangential
+// (perpendicular to the light), so the shadow-space depth barely changes
+// and shadows stay attached. At grazing angles the offset is large enough
+// to push the lookup behind the back-face depth stored in the shadow map.
 //
 // N = surface normal (world space).
 // Returns 0.0 in shadow, 1.0 in light.
@@ -372,8 +379,22 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
         }
     }
 
-    // Project into cascade's light space
-    vec4 shadowPos = csm.cascade_matrices[cascadeIndex] * vec4(worldPos, 1.0);
+    // Normal offset bias: shift the lookup position along the surface normal
+    // before projecting into shadow space. The offset scales with sin(angle)
+    // between the surface and the light direction:
+    //   - Surfaces facing the light (NdotL ≈ 1): sinAngle ≈ 0 → zero offset.
+    //   - Grazing surfaces (NdotL ≈ 0): sinAngle ≈ 1 → maximum offset.
+    // This preserves shadow attachment at contact points (ground under objects)
+    // while preventing acne on angled surfaces.
+    // Scale increases with cascade index to match growing texel footprint.
+    vec3 L = -normalize(csm.csm_light_direction.xyz);
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    float sinAngle = sqrt(1.0 - NdotL * NdotL);
+    float normalOffsetScale = 0.015 * (1.0 + float(cascadeIndex) * 0.75);
+    vec3 offsetPos = worldPos + N * sinAngle * normalOffsetScale;
+
+    // Project the offset position into cascade's light space
+    vec4 shadowPos = csm.cascade_matrices[cascadeIndex] * vec4(offsetPos, 1.0);
     vec3 shadowCoord = shadowPos.xyz / shadowPos.w;
     shadowCoord.xy = shadowCoord.xy * 0.5 + 0.5;
 
@@ -384,15 +405,11 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
         return 1.0;
     }
 
-    // Minimal fragment-side bias: front-face culling in the shadow pass renders
-    // only back faces, so front-facing surfaces compare against deeper back-face
-    // depth and cannot self-shadow.  Hardware depth bias handles slope-dependent
-    // precision issues.  This tiny epsilon covers residual float rounding only.
-    vec3 L = -normalize(csm.csm_light_direction.xyz);
-    float NdotL = clamp(dot(N, L), 0.0, 1.0);
-    float bias = mix(0.0003, 0.0001, NdotL);
-
-    float compareRef = shadowCoord.z - bias;
+    // No fragment-side depth bias needed: front-face culling + normal offset
+    // handle both self-shadowing and contact preservation. Hardware depth bias
+    // (constant + slope in the pipeline rasterizer state) covers sub-texel
+    // precision as a safety net.
+    float compareRef = shadowCoord.z;
 
     // 3×3 PCF via hardware comparison sampler
     // sampler2DArrayShadow: texture(sampler, vec4(uv, layer, compareRef)) → [0,1]

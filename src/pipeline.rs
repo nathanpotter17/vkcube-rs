@@ -711,15 +711,17 @@ impl Pipelines {
             // Back-face depth is always behind front-face depth, so front-facing
             // lit surfaces never self-shadow. This eliminates shadow acne without
             // needing a large depth bias, which prevents peter-panning.
+            // Hardware bias is a minimal safety net; normal offset bias in the
+            // fragment shader handles slope-dependent precision.
             let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
                 .line_width(1.0)
                 .cull_mode(vk::CullModeFlags::FRONT)
                 .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                 .depth_bias_enable(true)
-                .depth_bias_constant_factor(2.0)
-                .depth_bias_clamp(0.01)
-                .depth_bias_slope_factor(2.0);
+                .depth_bias_constant_factor(1.0)
+                .depth_bias_clamp(0.005)
+                .depth_bias_slope_factor(1.5);
             let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
