@@ -18,6 +18,11 @@
 //   - Hardware slope-only depth bias as sub-texel safety net
 //   - Decoupled normal offset: offset UV prevents acne, original Z preserves contact
 //   - 3×3 hardware-assisted PCF for soft shadow edges
+//
+// Phase 9A modification:
+//   - ACES tonemapping + gamma correction removed from main()
+//   - Fragment shader now outputs raw linear HDR to R16G16B16A16_SFLOAT target
+//   - Tonemapping handled by tonemap.comp fullscreen compute pass
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -684,10 +689,7 @@ void main() {
     // ---- DEBUG: Uncomment to visualize sun shadow ----
     // outColor = vec4(vec3(sunShadow), 1.0); return;
 
-    // ---- Phase 4: ACES Filmic Tone Mapping (replaces Reinhard) ----
-    color = acesFilm(color);
-    // Gamma correction.
-    color = pow(color, vec3(1.0 / 2.2));
-
+    // Phase 9A: Output raw linear HDR to R16G16B16A16_SFLOAT target.
+    // Tonemapping + gamma correction moved to tonemap.comp compute pass.
     outColor = vec4(color, baseColor.a);
 }

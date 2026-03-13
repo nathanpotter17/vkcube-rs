@@ -1,0 +1,77 @@
+// Phase 9A: Fullscreen tonemap compute shader
+// Reads HDR input via sampler2D, writes LDR output via imageStore to swapchain.
+// Applies: exposure adjustment, ACES filmic tonemapping, sRGB gamma correction.
+// Dispatch: ceil(width/16) × ceil(height/16) workgroups.
+//
+// Compile: glslc tonemap.comp -o compiled/tonemap.comp.spv --target-env=vulkan1.1 --target-spv=spv1.3
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// binding 0: HDR input (R16G16B16A16_SFLOAT, SHADER_READ_ONLY_OPTIMAL)
+layout(set = 0, binding = 0) uniform sampler2D hdrInput;
+
+// binding 1: LDR output (swapchain image, GENERAL layout for imageStore)
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D ldrOutput;
+
+// Push constants: exposure + output dimensions
+layout(push_constant) uniform TonemapParams {
+    float exposure;
+    float _pad0;
+    uint  width;
+    uint  height;
+} params;
+
+// ====================================================================
+//  ACES Filmic Tone Mapping (moved from pbr.frag)
+// ====================================================================
+//
+// sRGB → ACEScg (approximate AP1 working space).
+// Fitted RRT+ODT from Stephen Hill's ACES reference implementation.
+
+vec3 acesFilm(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// ====================================================================
+//  Linear → sRGB gamma approximation
+// ====================================================================
+
+vec3 linearToSrgb(vec3 linear) {
+    return pow(linear, vec3(1.0 / 2.2));
+}
+
+// ====================================================================
+//  Main
+// ====================================================================
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    // Out-of-bounds guard — dispatch may overshoot image dimensions.
+    if (pixel.x >= params.width || pixel.y >= params.height) {
+        return;
+    }
+
+    // Sample HDR input at texel center.
+    // Use texelFetch for exact 1:1 mapping (no filtering needed at same resolution).
+    vec4 hdr = texelFetch(hdrInput, ivec2(pixel), 0);
+
+    // Apply exposure.
+    vec3 color = hdr.rgb * params.exposure;
+
+    // ACES filmic tonemapping.
+    color = acesFilm(color);
+
+    // sRGB gamma correction.
+    color = linearToSrgb(color);
+
+    // Write LDR result to swapchain image.
+    imageStore(ldrOutput, ivec2(pixel), vec4(color, hdr.a));
+}

@@ -1,10 +1,11 @@
-//! Pipeline Management (Phase 1 + Phase 2 + Phase 3 + Phase 8A)
+//! Pipeline Management (Phase 1 + Phase 2 + Phase 3 + Phase 8A + Phase 9A)
 //!
-//! Pass structure (Phase 2):
+//! Pass structure (Phase 9A):
 //!   1. Shadow pass     (per shadow-casting light × 6 cube faces)
 //!   2. Depth pre-pass  (depth-only, enables early-Z)
 //!   3. Cluster compute (light → cluster assignment)
-//!   4. Lighting pass   (PBR + clustered shading + shadows + GI)
+//!   4. Lighting pass   (PBR + clustered shading → HDR R16G16B16A16_SFLOAT target)
+//!   5. Tonemap compute (HDR → LDR via ACES filmic, writes to swapchain)
 //!
 //! Descriptor Set 0 (per-frame globals):
 //!   binding 0:  GlobalUbo            (UNIFORM_BUFFER_DYNAMIC)
@@ -269,6 +270,9 @@ pub struct RenderPasses {
     pub shadow: vk::RenderPass,
     /// Probe capture pass: HDR color + depth into a cubemap face (Phase 3).
     pub probe_capture: vk::RenderPass,
+    /// Phase 9A: Overlay pass — renders debug HUD onto swapchain AFTER tonemap.
+    /// loadOp=LOAD preserves tonemapped content. finalLayout=PRESENT_SRC_KHR.
+    pub overlay: vk::RenderPass,
 }
 
 impl RenderPasses {
@@ -280,12 +284,14 @@ impl RenderPasses {
         let lighting = Self::create_lighting_pass(device, color_format)?;
         let shadow = Self::create_shadow_pass(device)?;
         let probe_capture = Self::create_probe_capture_pass(device)?;
+        let overlay = Self::create_overlay_pass(device, color_format)?;
 
         Ok(Self {
             depth_prepass,
             lighting,
             shadow,
             probe_capture,
+            overlay,
         })
     }
 
@@ -360,18 +366,21 @@ impl RenderPasses {
 
     fn create_lighting_pass(
         device: &Device,
-        color_format: vk::Format,
+        _color_format: vk::Format,
     ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
+        // Phase 9A: Lighting pass now renders to R16G16B16A16_SFLOAT HDR target.
+        // Tonemapping is handled by a separate compute pass that reads from this
+        // HDR image and writes LDR into the swapchain.
         let attachments = [
             vk::AttachmentDescription::default()
-                .format(color_format)
+                .format(vk::Format::R16G16B16A16_SFLOAT)    // Phase 9A: HDR format
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),  // Phase 9A: tonemap handles present transition
             vk::AttachmentDescription::default()
                 .format(vk::Format::D32_SFLOAT)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -524,7 +533,49 @@ impl RenderPasses {
             device.destroy_render_pass(self.lighting, None);
             device.destroy_render_pass(self.shadow, None);
             device.destroy_render_pass(self.probe_capture, None);
+            device.destroy_render_pass(self.overlay, None);
         }
+    }
+
+    /// Phase 9A: Overlay render pass — draws debug HUD onto swapchain
+    /// AFTER tonemap compute.  loadOp=LOAD preserves tonemapped content.
+    /// initialLayout=COLOR_ATTACHMENT_OPTIMAL (transitioned from GENERAL after tonemap).
+    /// finalLayout=PRESENT_SRC_KHR (ready for presentation).
+    fn create_overlay_pass(
+        device: &Device,
+        color_format: vk::Format,
+    ) -> Result<vk::RenderPass, Box<dyn std::error::Error>> {
+        let attachment = vk::AttachmentDescription::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)          // preserve tonemapped content
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);   // present transition
+
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref));
+
+        let dependency = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COMPUTE_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+        let info = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(std::slice::from_ref(&dependency));
+        Ok(unsafe { device.create_render_pass(&info, None)? })
     }
 }
 
@@ -1190,6 +1241,8 @@ impl Pipelines {
 pub struct PassFramebuffers {
     pub depth_prepass: Vec<vk::Framebuffer>,
     pub lighting: Vec<vk::Framebuffer>,
+    /// Phase 9A: Per-swapchain overlay framebuffers (after tonemap, before present).
+    pub overlay: Vec<vk::Framebuffer>,
 }
 
 impl PassFramebuffers {
@@ -1199,10 +1252,12 @@ impl PassFramebuffers {
         swapchain_image_views: &[vk::ImageView],
         depth_view: vk::ImageView,
         normal_view: vk::ImageView,
+        hdr_view: vk::ImageView,   // Phase 9A: HDR render target view
         extent: vk::Extent2D,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut depth_prepass = Vec::new();
         let mut lighting = Vec::new();
+        let mut overlay = Vec::new();
 
         for &color_view in swapchain_image_views {
             // Depth pre-pass: attachment 0 = normal (R16G16_SFLOAT),
@@ -1216,7 +1271,9 @@ impl PassFramebuffers {
                 .layers(1);
             depth_prepass.push(unsafe { device.create_framebuffer(&fb_info, None)? });
 
-            let light_attach = [color_view, depth_view];
+            // Phase 9A: Lighting framebuffers use the single shared HDR target
+            // as color attachment 0 instead of per-swapchain-image views.
+            let light_attach = [hdr_view, depth_view];
             let fb_info = vk::FramebufferCreateInfo::default()
                 .render_pass(passes.lighting)
                 .attachments(&light_attach)
@@ -1224,9 +1281,19 @@ impl PassFramebuffers {
                 .height(extent.height)
                 .layers(1);
             lighting.push(unsafe { device.create_framebuffer(&fb_info, None)? });
+
+            // Phase 9A: Overlay framebuffer — per-swapchain (each targets its own image).
+            let overlay_attach = [color_view];
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(passes.overlay)
+                .attachments(&overlay_attach)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+            overlay.push(unsafe { device.create_framebuffer(&fb_info, None)? });
         }
 
-        Ok(Self { depth_prepass, lighting })
+        Ok(Self { depth_prepass, lighting, overlay })
     }
 
     pub fn destroy(&self, device: &Device) {
@@ -1235,6 +1302,9 @@ impl PassFramebuffers {
                 device.destroy_framebuffer(fb, None);
             }
             for &fb in &self.lighting {
+                device.destroy_framebuffer(fb, None);
+            }
+            for &fb in &self.overlay {
                 device.destroy_framebuffer(fb, None);
             }
         }

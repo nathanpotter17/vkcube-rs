@@ -335,7 +335,8 @@ impl DeviceContext {
                     .image_color_space(surface_format.color_space)
                     .image_format(surface_format.format)
                     .image_extent(caps.current_extent)
-                    .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    // Phase 9A: STORAGE usage required for tonemap compute imageStore
+                    .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE)
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -497,7 +498,8 @@ impl DeviceContext {
                         .image_color_space(self.surface_format.color_space)
                         .image_format(self.surface_format.format)
                         .image_extent(extent)
-                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        // Phase 9A: STORAGE usage required for tonemap compute imageStore
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE)
                         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)

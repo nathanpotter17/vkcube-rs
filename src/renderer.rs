@@ -1,7 +1,12 @@
 //! Phase 8A: GPU-Driven Rendering
+//! Phase 9A: HDR Intermediate + Tonemap Pass
 //!
 //! This module replaces CPU frustum culling (~8000 per-frame ring buffer pushes)
 //! with GPU compute-based culling and indirect draw commands.
+//!
+//! Phase 9A: Lighting pass now outputs to R16G16B16A16_SFLOAT HDR target.
+//! A fullscreen tonemap compute pass reads HDR, applies ACES + sRGB gamma,
+//! and writes LDR to the swapchain via imageStore.
 //!
 //! Key changes from pre-8A:
 //! - PerDrawUbo removed (set 3 now binds object SSBO)
@@ -44,7 +49,7 @@ use crate::world::{
     demo_transform, make_cube, make_pyramid, make_column,
 };
 use crate::loader::GltfLoader;
-use crate::postprocess::HbaoPass;
+use crate::postprocess::{HbaoPass, TonemapPass};
 use crate::profiler::{GpuProfiler, PassId};
 use crate::overlay::DebugOverlay;
 
@@ -186,6 +191,7 @@ pub struct Renderer {
     normal_view: vk::ImageView,
 
     hbao_pass: HbaoPass,
+    tonemap_pass: TonemapPass,  // Phase 9A: HDR tonemap compute pass
     has_hdr_skybox: bool,
     profiler: GpuProfiler,
     overlay: DebugOverlay,
@@ -379,6 +385,7 @@ impl Renderer {
         let overlay_frag_spv: &[u8] = include_bytes!("../shaders/compiled/overlay.frag.spv");
         let sun_shadow_vert_spv: &[u8] = include_bytes!("../shaders/compiled/sun_shadow.vert.spv");
         let sun_shadow_frag_spv: &[u8] = include_bytes!("../shaders/compiled/sun_shadow.frag.spv");
+        let tonemap_comp_spv: &[u8] = include_bytes!("../shaders/compiled/tonemap.comp.spv"); // Phase 9A
 
         let probe_bake_target = ProbeBakeTarget::new(
             &device, &memory_ctx.allocator, render_passes.probe_capture,
@@ -397,8 +404,21 @@ impl Renderer {
             device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height,
         )?;
 
+        // Phase 9A: Create tonemap pass (HDR target) before framebuffers —
+        // framebuffers need hdr_view as color attachment 0.
+        let tonemap_pass = TonemapPass::new(
+            &device,
+            &memory_ctx.allocator,
+            &device_ctx.swapchain_images,
+            device_ctx.surface_format.format,
+            device_ctx.swapchain_extent,
+            tonemap_comp_spv,
+        )?;
+
         let framebuffers = PassFramebuffers::new(&device, &render_passes, &device_ctx.swapchain_image_views,
-            device_ctx.depth_image_view, normal_view, device_ctx.swapchain_extent)?;
+            device_ctx.depth_image_view, normal_view,
+            tonemap_pass.hdr_view,   // Phase 9A: HDR target for lighting framebuffers
+            device_ctx.swapchain_extent)?;
 
         let inv_proj = crate::scene::invert_projection(scene.camera.get_projection_matrix());
         let mut hbao_pass = HbaoPass::new(
@@ -422,7 +442,7 @@ impl Renderer {
         let overlay = DebugOverlay::new(
             &device,
             &memory_ctx.allocator,
-            render_passes.lighting,
+            render_passes.overlay,  // Phase 9A: overlay pass (after tonemap, on swapchain)
             device_ctx.command_pool,
             device_ctx.queue,
             overlay_vert_spv,
@@ -517,6 +537,7 @@ impl Renderer {
             next_dynamic_sector: 0,
             normal_image, normal_memory, normal_view,
             hbao_pass,
+            tonemap_pass,  // Phase 9A
             has_hdr_skybox: hdr_path.is_some(),
             profiler,
             overlay,
@@ -1515,20 +1536,84 @@ impl Renderer {
                 self.device.cmd_draw(cmd, 36, 1, 0, 0);
             }
 
-            // Debug overlay
-            self.overlay.record_commands(
-                &self.device, cmd, &mut self.memory_ctx.ring,
-                device_ctx.swapchain_extent.width as f32,
-                device_ctx.swapchain_extent.height as f32,
-            );
+            // Phase 9A: Overlay moved to after tonemap — no longer rendered in lighting pass.
 
             self.device.cmd_end_render_pass(cmd);
 
             self.profiler.end_pass(&self.device, cmd, PassId::Lighting, self.current_frame);
 
-            // Post pass placeholder
+            // ============================================================
+            //  PASS 4: Tonemap — Phase 9A HDR → LDR compute pass
+            // ============================================================
             self.profiler.begin_pass(&self.device, cmd, PassId::Post, self.current_frame);
+
+            // Phase 9A: HDR → SHADER_READ_ONLY_OPTIMAL for tonemap sampling
+            self.tonemap_pass.barrier_hdr_to_read(&self.device, cmd);
+
+            // Phase 9A: Swapchain → GENERAL for compute imageStore
+            TonemapPass::barrier_swapchain_to_general(
+                &self.device, cmd,
+                device_ctx.swapchain_images[image_index as usize],
+            );
+
+            // Phase 9A: Tonemap dispatch (HDR → LDR via ACES filmic)
+            self.tonemap_pass.dispatch(&self.device, cmd, image_index as usize);
+
+            // Phase 9A: Swapchain GENERAL → COLOR_ATTACHMENT_OPTIMAL for overlay pass.
+            // The overlay render pass handles the final transition to PRESENT_SRC_KHR.
+            {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .image(device_ctx.swapchain_images[image_index as usize])
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0, level_count: 1,
+                        base_array_layer: 0, layer_count: 1,
+                    });
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], std::slice::from_ref(&barrier),
+                );
+            }
+
             self.profiler.end_pass(&self.device, cmd, PassId::Post, self.current_frame);
+
+            // ============================================================
+            //  PASS 5: Overlay — Phase 9A debug HUD on swapchain (post-tonemap)
+            // ============================================================
+            // Overlay render pass: loadOp=LOAD preserves tonemapped content,
+            // finalLayout=PRESENT_SRC_KHR handles the present transition.
+            // Always begin/end the render pass even when overlay is hidden —
+            // the render pass handles the PRESENT layout transition.
+            {
+                let orp = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.render_passes.overlay)
+                    .framebuffer(self.framebuffers.overlay[image_index as usize])
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: device_ctx.swapchain_extent,
+                    });
+                self.device.cmd_begin_render_pass(cmd, &orp, vk::SubpassContents::INLINE);
+                self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+                self.device.cmd_set_scissor(cmd, 0, &[scissor]);
+
+                // Debug overlay — rendered in LDR directly on swapchain, bypasses tonemap.
+                self.overlay.record_commands(
+                    &self.device, cmd, &mut self.memory_ctx.ring,
+                    device_ctx.swapchain_extent.width as f32,
+                    device_ctx.swapchain_extent.height as f32,
+                );
+
+                self.device.cmd_end_render_pass(cmd);
+            }
 
             self.device.end_command_buffer(cmd)?;
 
@@ -1714,9 +1799,21 @@ impl Renderer {
         self.normal_memory = nm;
         self.normal_view = nv;
 
+        // Phase 9A: Resize tonemap pass (HDR target + swapchain storage views)
+        // before framebuffers — framebuffers need the new hdr_view.
+        self.tonemap_pass.resize(
+            &self.device,
+            &self.memory_ctx.allocator,
+            &device_ctx.swapchain_images,
+            device_ctx.surface_format.format,
+            device_ctx.swapchain_extent,
+        )?;
+
         self.framebuffers = PassFramebuffers::new(&self.device, &self.render_passes,
             &device_ctx.swapchain_image_views, device_ctx.depth_image_view,
-            self.normal_view, device_ctx.swapchain_extent)?;
+            self.normal_view,
+            self.tonemap_pass.hdr_view,   // Phase 9A: HDR target for lighting FBs
+            device_ctx.swapchain_extent)?;
         self.scene.camera.update_aspect(device_ctx.swapchain_extent.width, device_ctx.swapchain_extent.height);
         let inv_proj = crate::scene::invert_projection(self.scene.camera.get_projection_matrix());
         self.hbao_pass.resize(
@@ -1817,6 +1914,7 @@ impl Drop for Renderer {
         self.device.destroy_image(self.normal_image, None);
         self.device.free_memory(self.normal_memory, None);
         self.hbao_pass.destroy(&self.device, &mut self.memory_ctx.allocator);
+        self.tonemap_pass.destroy(&self.device);  // Phase 9A
         self.probe_bake_target.destroy(&self.device);
         self.profiler.destroy(&self.device);
         self.overlay.destroy(&self.device);

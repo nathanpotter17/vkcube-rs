@@ -32,6 +32,7 @@ shaders=(
     "cull.comp:cull.comp.spv"
     "sun_shadow.frag:sun_shadow.frag.spv"
     "sun_shadow.vert:sun_shadow.vert.spv"
+    "tonemap.comp:tonemap.comp.spv"
 )
 
 set_avx2() {
