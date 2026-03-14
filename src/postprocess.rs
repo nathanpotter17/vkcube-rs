@@ -36,10 +36,10 @@ use crate::pipeline::create_shader_module;
 // ====================================================================
 
 /// HBAO default parameters.
-const HBAO_RADIUS: f32 = 0.5;       // World-space sampling radius (metres)
+const HBAO_RADIUS: f32 = 1.0;       // World-space sampling radius (metres)
 const HBAO_BIAS: f32 = 0.1;         // Angle bias to reduce self-occlusion
-const HBAO_INTENSITY: f32 = 1.0;    // AO strength multiplier (was 1.5)
-const HBAO_MAX_DISTANCE: f32 = 1.5; // Maximum influence distance (was 2.0)
+const HBAO_INTENSITY: f32 = 1.4;    // AO strength multiplier
+const HBAO_MAX_DISTANCE: f32 = 2.0; // Maximum influence distance
 
 /// Bilateral blur sharpness (depth-weight exponent).
 const BLUR_SHARPNESS: f32 = 300.0;  // was 1000.0 — softer edge transitions

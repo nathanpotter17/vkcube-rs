@@ -28,12 +28,5 @@ void main() {
     vec3 dir = normalize(localPos);
     vec3 envColor = textureLod(prefilteredEnvMap, dir, 0.0).rgb;
 
-    // Exposure-adjusted tone map.
-    const float exposure = 1.0;
-    vec3 mapped = acesFilm(envColor * exposure);
-
-    // Gamma correction.
-    mapped = pow(mapped, vec3(1.0 / 2.2));
-
-    fragColor = vec4(mapped, 1.0);
+    fragColor = vec4(envColor, 1.0);
 }

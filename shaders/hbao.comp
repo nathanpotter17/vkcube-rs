@@ -80,8 +80,9 @@ vec3 octDecode(vec2 e) {
 
 // ---- Main AO kernel ----
 
+// hbao.comp — replace computeAO (lines 83-175), FINAL version
+
 float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
-    // Two independent noise channels to decorrelate rotation and offset
     float noise1 = interleavedGradientNoise(pixelCoord);
     float noise2 = hash12(pixelCoord);
 
@@ -113,27 +114,56 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
                              max(abs(dT - centerDepth), abs(dB - centerDepth)));
     float edgeAttenuation = 1.0 - smoothstep(0.02, 0.08, maxDepthDiff);
 
+    // ---- Border fade ----
+    float borderDist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    float borderPixels = borderDist * max(hbao.resolution.x, hbao.resolution.y);
+    float borderFade = smoothstep(0.0, radiusPixels * 0.75, borderPixels);
+
+    // ================================================================
+    // Direction-INDEPENDENT surface slope (replaces per-direction tangent)
+    // ================================================================
+    // length(N.xy) / N.z = tan(angle between surface normal and view axis).
+    // This is the MAXIMUM tangent slope the surface can produce in ANY
+    // screen-space direction. Using it as the universal starting horizon:
+    //
+    //   - Flat ground at grazing angle: N ≈ (0, 0.5, 0.87)
+    //     surfaceSlope = 0.57 → horizon starts at ~30°
+    //     Ground's perspective depth gradient is ~30° → no false occlusion
+    //
+    //   - Wall face-on: N ≈ (0, 0, 1)
+    //     surfaceSlope = 0 → behaves like the original constant bias
+    //
+    //   - Same value for ALL pixels with the same normal, regardless of
+    //     noise rotation → no per-pixel variation → no speckling on flats
+    //
+    // Trade-off: slightly conservative (over-biases directions along the
+    // surface contour where true slope is less than max). This means
+    // ~10-15% less AO in shallow concavities at steep view angles.
+    // Acceptable vs the speckling it eliminates.
+    //
+    float surfaceSlope = length(N.xy) / max(abs(N.z), 0.01);
+
     float ao = 0.0;
+    float validDirs = 0.0;
 
     for (int dir = 0; dir < NUM_DIRECTIONS; ++dir) {
         vec2 direction = rotMat * BASE_DIRS[dir];
 
-        // Per-direction micro-rotation using second noise channel.
-        // Golden-ratio spacing ensures each direction gets a decorrelated
-        // angular offset, breaking the N-fold symmetry that causes
-        // cross-hatch patterns.
         float dirNoise = fract(noise2 + float(dir) * 0.618034);
         float microAngle = (dirNoise - 0.5) * (TWO_PI / float(NUM_DIRECTIONS));
         float mc = cos(microAngle);
         float ms = sin(microAngle);
         direction = mat2(mc, -ms, ms, mc) * direction;
 
-        float tanHorizon = bias;
+        // Start horizon at the surface's maximum tangent slope + bias.
+        // Direction-independent: every pixel with the same normal gets
+        // the same starting horizon, eliminating noise-rotation speckling.
+        float tanHorizon = surfaceSlope + bias;
         float sinHorizon = tanHorizon / sqrt(1.0 + tanHorizon * tanHorizon);
 
+        bool hadValidSample = false;
+
         for (int step = 1; step <= NUM_STEPS; ++step) {
-            // Per-step jitter from second noise channel, golden-ratio offset
-            // per step ensures decorrelation between steps within a direction.
             float stepNoise = fract(noise2 + float(step) * 0.381966);
             float t = float(step) + stepNoise - 0.5;
 
@@ -143,7 +173,6 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
                 any(greaterThan(sampleUV, vec2(1.0))))
                 continue;
 
-            // Hardware bilinear-filtered depth read — no quantization artifacts
             float sampleDepth = texture(depthTexture, sampleUV).r;
             if (sampleDepth >= 1.0 - EPSILON) continue;
 
@@ -152,6 +181,8 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
             float dist = length(V);
 
             if (dist > maxDist) continue;
+
+            hadValidSample = true;
 
             float tanS = V.z / max(length(V.xy), EPSILON);
             float sinS = tanS / sqrt(1.0 + tanS * tanS);
@@ -166,10 +197,17 @@ float computeAO(vec3 P, vec3 N, vec2 uv, vec2 pixelCoord) {
                 tanHorizon = tanS;
             }
         }
+
+        if (hadValidSample) {
+            validDirs += 1.0;
+        }
     }
 
-    ao = ao / float(NUM_DIRECTIONS) * intensity;
+    if (validDirs > 0.0) {
+        ao = ao / validDirs * intensity;
+    }
     ao *= edgeAttenuation;
+    ao *= borderFade;
 
     return 1.0 - clamp(ao, 0.0, 1.0);
 }

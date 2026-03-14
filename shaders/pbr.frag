@@ -428,6 +428,15 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
     }
     shadow /= 9.0;
 
+    // Fade out at the last cascade's far boundary
+    if (cascadeIndex == CASCADE_COUNT - 1u) {
+        float maxZ = csm.split_distances[CASCADE_COUNT - 1u];
+        float fadeStart = maxZ * csm.shadow_params.z;
+        float fadeRange = maxZ * csm.shadow_params.w;
+        float fadeFactor = 1.0 - smoothstep(fadeStart, fadeStart + fadeRange, viewZ);
+        shadow = mix(1.0, shadow, fadeFactor);
+    }
+
     // Strength modulation
     shadow = mix(1.0, shadow, csm.shadow_params.y);
 
@@ -674,17 +683,19 @@ void main() {
     vec2 screenUV = gl_FragCoord.xy / vec2(cluster.screen_size);
     float ao_screen = texture(aoScreen, screenUV).r;
 
-    // Phase 8A: Apply sun shadow to ambient (IBL + probes).
-    // This makes shadows clearly visible even with strong ambient lighting.
+    // Multi-bounce AO approximation: apply partial occlusion to direct lighting.
+    // Full AO on ambient, sqrt-attenuated on direct. Prevents AO from being
+    // invisible when direct lighting dominates.
+    float ao_direct = mix(1.0, ao_screen, 0.35);  // 35% direct influence
+
     vec3 ambient = (diffuseGI + indirectSpecular) * ao * ao_screen * ambientShadowFactor;
 
-    // ---- Phase 4: Emissive texture multiplication ----
     vec3 emissive = mat.emissive.rgb * mat.emissive.a;
     if (mat.emissive_tex > 0u) {
         emissive *= texture(textures[nonuniformEXT(mat.emissive_tex)], fragUV).rgb;
     }
 
-    vec3 color = ambient + Lo + emissive;
+    vec3 color = ambient + Lo * ao_direct + emissive;
 
     // ---- DEBUG: Uncomment to visualize sun shadow ----
     // outColor = vec4(vec3(sunShadow), 1.0); return;

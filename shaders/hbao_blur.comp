@@ -31,14 +31,12 @@ layout(push_constant) uniform BlurParams {
 const int   KERNEL_RADIUS = 4;
 const float SIGMA_SPATIAL = 2.0;
 
-// Pre-computed Gaussian weights for sigma=2, offsets 0..4.
-// w(i) = exp(-0.5 * i*i / sigma^2)
 const float WEIGHTS[5] = float[5](
-    1.0,            // offset 0
-    0.8824969,      // offset 1
-    0.6065307,      // offset 2
-    0.3246525,      // offset 3
-    0.1353353       // offset 4
+    1.0,
+    0.8824969,
+    0.6065307,
+    0.3246525,
+    0.1353353
 );
 
 // ---- Entry point ----
