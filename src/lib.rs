@@ -14,3 +14,4 @@ pub mod postprocess;
 pub mod profiler;
 pub mod overlay;
 pub mod gpu_cull;
+pub mod simd_math;
