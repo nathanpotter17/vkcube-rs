@@ -938,7 +938,8 @@ impl Renderer {
             // Phase 8C.5: Adaptive budget — adjust effective_max_slots before assignment.
             self.shadow_budget.adapt_budget();
 
-            self.shadow_assignments = self.shadow_budget.assign(&self.light_manager, camera_pos);
+            // Phase 10A: assign() populates shadow_assignments in place (no alloc).
+            self.shadow_budget.assign(&self.light_manager, camera_pos, &mut self.shadow_assignments);
 
             // Phase 8C.2: Update shadow cache state after slot assignment.
             self.shadow_budget.update_cache(&self.light_manager, self.global_frame);

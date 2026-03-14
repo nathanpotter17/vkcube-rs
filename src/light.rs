@@ -711,6 +711,11 @@ pub struct LightManager {
     gpu_lights: Vec<GpuLight>,
     /// Active count after cull.
     active_count: u32,
+    /// Phase 10A: Persistent scratch buffers for cull_and_sort.
+    /// Reused via .clear() each frame — zero heap allocations in the hot path.
+    cull_positions: Vec<[f32; 3]>,
+    cull_radii: Vec<f32>,
+    cull_visible: Vec<bool>,
 }
 
 impl LightManager {
@@ -721,6 +726,9 @@ impl LightManager {
             active_indices: Vec::with_capacity(MAX_LIGHTS),
             gpu_lights: Vec::with_capacity(MAX_LIGHTS),
             active_count: 0,
+            cull_positions: Vec::with_capacity(1024),
+            cull_radii: Vec::with_capacity(1024),
+            cull_visible: Vec::with_capacity(1024),
         }
     }
 
@@ -790,9 +798,10 @@ impl LightManager {
     /// treats radius==0 spheres as always-visible, matching the previous
     /// "directional always passes" behavior without a separate branch.
     ///
-    /// Trade-off: allocates 3 temp Vecs per frame (~49 KB for 4096 lights).
-    /// If allocation pressure is measured, promote positions/radii/visible
-    /// to persistent fields in LightManager and reuse via `.clear()`.
+    /// Phase 10A: Scratch buffers (positions, radii, visible) promoted to
+    /// persistent LightManager fields. Reused via .clear() each frame,
+    /// eliminating 3 heap alloc/free cycles per frame (~2.8KB at 168 lights).
+    /// The backing memory stays hot in L1/L2 cache across frames.
     pub fn cull_and_sort(
         &mut self,
         camera_pos: [f32; 3],
@@ -806,11 +815,13 @@ impl LightManager {
         //    Build SoA arrays: directional lights get radius 0.0 → always pass.
         let n = self.lights.len();
 
-        let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n);
-        let mut radii: Vec<f32> = Vec::with_capacity(n);
+        self.cull_positions.clear();
+        self.cull_radii.clear();
+        self.cull_visible.clear();
+
         for light in &self.lights {
-            positions.push(light.position);
-            radii.push(
+            self.cull_positions.push(light.position);
+            self.cull_radii.push(
                 if light.light_type == LightType::Directional { 0.0 }
                 // Phase 10A Fix F: Use effective_radius() for frustum cull.
                 // Ensures the AVX2 sphere-frustum test uses the same tighter
@@ -819,12 +830,12 @@ impl LightManager {
             );
         }
 
-        let mut visible = vec![false; n];
+        self.cull_visible.resize(n, false);
         crate::simd_math::batch_sphere_frustum_cull(
-            frustum_planes, &positions, &radii, &mut visible,
+            frustum_planes, &self.cull_positions, &self.cull_radii, &mut self.cull_visible,
         );
 
-        for (i, &vis) in visible.iter().enumerate() {
+        for (i, &vis) in self.cull_visible.iter().enumerate() {
             if vis {
                 self.active_indices.push(i);
             }
@@ -963,6 +974,12 @@ pub struct ShadowBudgetManager {
     pub last_shadow_time_ms: f32,
     /// Phase 8C.5: Current effective max slots (may be less than MAX_SHADOW_SLOTS).
     effective_max_slots: usize,
+    /// Phase 10A: Persistent scratch buffer for assign() candidates.
+    /// Reused via .clear() each frame — zero heap allocation.
+    assign_candidates: Vec<(usize, f32, f32)>,
+    /// Phase 10A: Persistent scratch for previous frame's light_to_slot.
+    /// Swapped in assign() instead of creating a new HashMap.
+    prev_light_to_slot: HashMap<usize, u32>,
 }
 
 /// Phase 8C.2: Per-slot shadow cache state.
@@ -1022,6 +1039,8 @@ impl ShadowBudgetManager {
             time_budget_ms: 4.0,
             last_shadow_time_ms: 0.0,
             effective_max_slots: MAX_SHADOW_SLOTS,
+            assign_candidates: Vec::with_capacity(MAX_SHADOW_SLOTS),
+            prev_light_to_slot: HashMap::new(),
         }
     }
 
@@ -1055,14 +1074,17 @@ impl ShadowBudgetManager {
     /// Tier 3 (Distant, >100m) lights are excluded — they receive no slot
     /// and the shader sees `shadow_index == 0xFFFFFFFF` → `shadow = 1.0`.
     ///
-    /// Returns a map: global light index → shadow slot.
+    /// Phase 10A: Populates `out` in place (cleared first) instead of
+    /// returning a new HashMap. Scratch buffers are persistent fields,
+    /// eliminating all per-frame heap allocations from the assignment path.
     pub fn assign(
         &mut self,
         light_manager: &LightManager,
         camera_pos: [f32; 3],
-    ) -> HashMap<usize, u32> {
-        // (light_idx, score, distance_sq)
-        let mut candidates: Vec<(usize, f32, f32)> = Vec::new();
+        out: &mut HashMap<usize, u32>,
+    ) {
+        out.clear();
+        self.assign_candidates.clear();
 
         for &idx in light_manager.active_indices() {
             let Some(light) = light_manager.get(idx) else { continue };
@@ -1091,22 +1113,22 @@ impl ShadowBudgetManager {
                 score += SHADOW_HYSTERESIS_BONUS;
             }
 
-            candidates.push((idx, score, d2));
+            self.assign_candidates.push((idx, score, d2));
         }
 
         // Sort descending by score.
-        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        self.assign_candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        // Clear previous assignments.
-        let prev_light_to_slot = std::mem::take(&mut self.light_to_slot);
+        // Swap light_to_slot into prev for hysteresis lookup without allocating.
+        std::mem::swap(&mut self.light_to_slot, &mut self.prev_light_to_slot);
+        self.light_to_slot.clear();
         self.slot_to_light = [None; MAX_SHADOW_SLOTS];
         self.slot_lod = [ShadowLod::Near; MAX_SHADOW_SLOTS];
 
         // Assign top N candidates.
         let mut next_slot: u32 = 0;
-        let mut assignments = HashMap::new();
 
-        for (light_idx, _score, d2) in candidates {
+        for &(light_idx, _score, d2) in &self.assign_candidates {
             // Phase 8C.5: use adaptive effective_max_slots instead of MAX_SHADOW_SLOTS.
             if next_slot as usize >= self.effective_max_slots {
                 break;
@@ -1116,7 +1138,7 @@ impl ShadowBudgetManager {
 
             // Prefer re-using the light's previous slot (reduces shadow
             // flicker from re-rendering a different atlas slice).
-            let slot = if let Some(&prev) = prev_light_to_slot.get(&light_idx) {
+            let slot = if let Some(&prev) = self.prev_light_to_slot.get(&light_idx) {
                 if (prev as usize) < self.effective_max_slots
                     && self.slot_to_light[prev as usize].is_none()
                 {
@@ -1148,10 +1170,8 @@ impl ShadowBudgetManager {
             self.slot_to_light[slot as usize] = Some(light_idx);
             self.slot_lod[slot as usize] = lod;
             self.light_to_slot.insert(light_idx, slot);
-            assignments.insert(light_idx, slot);
+            out.insert(light_idx, slot);
         }
-
-        assignments
     }
 
     /// Iterate (slot, global_light_index) for all assigned lights.
