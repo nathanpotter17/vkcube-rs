@@ -1074,6 +1074,10 @@ pub struct TransferQueue {
     pub graphics_family_index: u32,
     /// Whether transfer and graphics are on separate families.
     pub is_dedicated: bool,
+    /// Phase 10A: Command buffers awaiting reclaim after GPU completion.
+    /// Each entry is (timeline_value_when_signalled, command_buffer).
+    /// Freed once the timeline semaphore advances past their value.
+    in_flight_cmds: Vec<(u64, vk::CommandBuffer)>,
 }
 
 unsafe impl Send for TransferQueue {}
@@ -1173,6 +1177,7 @@ impl TransferQueue {
             queue_family_index: transfer_family,
             graphics_family_index: graphics_family,
             is_dedicated,
+            in_flight_cmds: Vec::with_capacity(64),
         })
     }
     
@@ -1670,10 +1675,19 @@ impl TransferQueue {
 
     /// Submit a recorded command buffer with timeline signal.
     /// Returns the timeline value.
+    ///
+    /// Phase 10A: Also tracks the command buffer for deferred reclamation
+    /// and opportunistically reclaims any previously completed buffers.
     pub fn submit_timeline(
         &mut self,
         cmd: vk::CommandBuffer,
     ) -> Result<u64, Box<dyn std::error::Error>> {
+        // Opportunistic reclaim: free cmd buffers from prior completed transfers.
+        // Amortizes reclaim cost across submissions rather than needing a
+        // separate per-frame call (though reclaim_completed_cmds() is also
+        // available for explicit use).
+        self.reclaim_completed_cmds();
+
         let timeline_value = self.next_timeline;
         self.next_timeline += 1;
 
@@ -1697,7 +1711,53 @@ impl TransferQueue {
             )?;
         }
 
+        // Phase 10A: Track for deferred reclamation.
+        self.in_flight_cmds.push((timeline_value, cmd));
+
         Ok(timeline_value)
+    }
+
+    /// Phase 10A: Free all command buffers whose transfers have completed.
+    ///
+    /// Queries the timeline semaphore's current value and frees every
+    /// tracked command buffer whose signal value has been reached.
+    /// Called opportunistically inside `submit_timeline()` and should
+    /// also be called once per frame from the renderer to catch the
+    /// tail end of in-flight transfers after streaming stops.
+    ///
+    /// Without this, every async upload leaks a VkCommandBuffer — each
+    /// consuming 4-64KB of driver-internal host memory depending on vendor.
+    /// At 2 transfers/sector × 33 sectors + continuous streaming, this
+    /// accumulates to hundreds of MB over a session.
+    pub fn reclaim_completed_cmds(&mut self) {
+        if self.in_flight_cmds.is_empty() {
+            return;
+        }
+
+        let current = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.timeline_semaphore)
+                .unwrap_or(0)
+        };
+
+        let mut i = 0;
+        while i < self.in_flight_cmds.len() {
+            if self.in_flight_cmds[i].0 <= current {
+                let (_, cmd) = self.in_flight_cmds.swap_remove(i);
+                unsafe {
+                    self.device
+                        .free_command_buffers(self.command_pool, &[cmd]);
+                }
+                // Don't increment i — swap_remove moved the last element here.
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Number of command buffers currently awaiting reclaim (for diagnostics).
+    pub fn in_flight_cmd_count(&self) -> usize {
+        self.in_flight_cmds.len()
     }
 
     /// Check whether a particular transfer has finished on the GPU.
@@ -1726,16 +1786,6 @@ impl TransferQueue {
         self.timeline_semaphore
     }
 
-    /// Drain the command pool.
-    pub fn reset_pool(&self) {
-        unsafe {
-            let _ = self.device.reset_command_pool(
-                self.command_pool,
-                vk::CommandPoolResetFlags::RELEASE_RESOURCES,
-            );
-        }
-    }
-
     /// Current staging ring fill ratio (0.0 – 1.0).
     pub fn staging_fill_ratio(&self) -> f32 {
         self.staging_offset as f32 / self.staging_size as f32
@@ -1746,6 +1796,11 @@ impl Drop for TransferQueue {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.queue_wait_idle(self.queue);
+            // Phase 10A: Free all tracked in-flight command buffers.
+            for (_, cmd) in self.in_flight_cmds.drain(..) {
+                self.device
+                    .free_command_buffers(self.command_pool, &[cmd]);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_semaphore(self.timeline_semaphore, None);
             self.device.unmap_memory(self.staging_memory);
@@ -1774,6 +1829,10 @@ pub struct MemoryBudget {
     #[allow(dead_code)]
     device_local_heap: u32,
     usage: HashMap<BufferHandle, UsageRecord>,
+    /// Phase 10A: Aggregate VRAM bytes tracked for streaming sub-allocations
+    /// (mega buffer regions) that don't have individual BufferHandles.
+    /// Incremented on sector upload completion, decremented on eviction.
+    tracked_streaming_bytes: u64,
 }
 
 impl MemoryBudget {
@@ -1803,6 +1862,7 @@ impl MemoryBudget {
             budget_bytes,
             device_local_heap: heap_idx,
             usage: HashMap::new(),
+            tracked_streaming_bytes: 0,
         }
     }
 
@@ -1872,7 +1932,20 @@ impl MemoryBudget {
     }
 
     pub fn tracked_bytes(&self) -> u64 {
-        self.usage.values().map(|r| r.size).sum()
+        self.usage.values().map(|r| r.size).sum::<u64>() + self.tracked_streaming_bytes
+    }
+
+    /// Phase 10A: Track VRAM consumed by a mega buffer sub-allocation
+    /// (sector geometry upload). These don't have individual BufferHandles
+    /// so they use aggregate tracking instead of the per-handle LRU system.
+    pub fn track_streaming(&mut self, bytes: u64) {
+        self.tracked_streaming_bytes += bytes;
+    }
+
+    /// Phase 10A: Untrack VRAM freed by evicting a sector's mega buffer
+    /// sub-allocation.
+    pub fn untrack_streaming(&mut self, bytes: u64) {
+        self.tracked_streaming_bytes = self.tracked_streaming_bytes.saturating_sub(bytes);
     }
 
     /// The configured VRAM budget in bytes.

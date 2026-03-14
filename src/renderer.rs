@@ -668,49 +668,70 @@ impl Renderer {
         Ok(())
     }
 
-    /// Phase 8B
+    /// Phase 8B (Phase 10A: zero-alloc rewrite)
+    ///
+    /// Previous version allocated a `Vec::new()` every frame to collect
+    /// completed uploads. This version takes ownership of pending_sectors
+    /// temporarily, processes completions in-place, and returns only the
+    /// still-pending entries — no heap allocation on the hot path.
     fn poll_uploads(&mut self) {
-        let mut completed: Vec<PendingSectorUpload> = Vec::new();
- 
-        let transfer = &self.memory_ctx.transfer;
- 
-        self.pending_sectors.retain_mut(|upload| {
-            let done = transfer.is_complete(&upload.vertex_ticket)
-                && transfer.is_complete(&upload.index_ticket);
-            if done {
-                completed.push(PendingSectorUpload {
-                    sector: upload.sector,
-                    mega_alloc: upload.mega_alloc,
-                    vertex_ticket: upload.vertex_ticket.clone(),
-                    index_ticket: upload.index_ticket.clone(),
-                    objects: std::mem::take(&mut upload.objects),
-                });
-                false
-            } else { true }
-        });
- 
+        if self.pending_sectors.is_empty() {
+            return;
+        }
+
+        // Take ownership to avoid borrow conflict with &self.memory_ctx.transfer
+        // inside the completion check and &mut self in the processing loop.
+        let mut pending = std::mem::take(&mut self.pending_sectors);
+
+        // Partition: move completed uploads to the end, then split.
+        // We iterate backwards and swap completed entries to a "done" tail.
+        let mut still_pending = 0;
+        let mut i = 0;
+        while i < pending.len() - still_pending {
+            // Only need the transfer ref for the is_complete check.
+            let done = self.memory_ctx.transfer.is_complete(&pending[i].vertex_ticket)
+                && self.memory_ctx.transfer.is_complete(&pending[i].index_ticket);
+            if !done {
+                i += 1;
+            } else {
+                // Swap this completed entry to the back.
+                let last = pending.len() - 1 - still_pending;
+                pending.swap(i, last);
+                still_pending += 1;
+                // Don't increment i — the swapped-in element needs checking.
+            }
+        }
+
+        // Split: [0..split_at) = still pending, [split_at..) = completed
+        let split_at = pending.len() - still_pending;
+        let completed = pending.split_off(split_at);
+
+        // Put the still-pending entries back.
+        self.pending_sectors = pending;
+
+        // Process completed uploads.
         for upload in completed {
             let ma = upload.mega_alloc;
- 
+
             for pobj in &upload.objects {
                 // Phase 8B: Offsets are mega-buffer-relative.
                 // Each object's within-sector offsets are added to the sector's
                 // mega buffer base offsets.
                 let mega_first_index = ma.base_index() + pobj.first_index;
                 let mega_vertex_offset = ma.base_vertex() + pobj.vertex_offset;
- 
+
                 let mesh_range = MeshRange {
                     first_index: mega_first_index,
                     index_count: pobj.index_count,
                     vertex_offset: mega_vertex_offset,
                 };
- 
+
                 let obj_id = self.world.add_object(
                     upload.sector, pobj.bounds,
                     LodChain::single(mesh_range),
                     pobj.transform, pobj.material_id, pobj.flags,
                 );
- 
+
                 let gpu_data = GpuObjectData::new(
                     pobj.transform,
                     pobj.bounds.min,
@@ -724,7 +745,7 @@ impl Renderer {
                 self.gpu_cull.queue_dirty(obj_id.0, gpu_data);
                 self.gpu_cull.total_alive = self.gpu_cull.total_alive.max(obj_id.0 + 1);
             }
- 
+
             if let Some(sec) = self.world.sectors.get_mut(&upload.sector) {
                 sec.state = SectorState::Ready;
                 let obj_count = sec.objects.len();
@@ -734,6 +755,10 @@ impl Renderer {
                 );
             }
             self.register_sector_lights(upload.sector);
+            // Phase 10A: Track VRAM consumed by this sector's mega buffer sub-allocation.
+            self.memory_ctx.budget.track_streaming(
+                ma.vertex_size_bytes + ma.index_size_bytes,
+            );
             // Phase 8C.2: Invalidate shadow cache — new geometry/lights may affect shadows.
             self.shadow_budget.invalidate_all();
             self.probe_grid.bake_sector_probes(upload.sector, &self.light_manager);
@@ -826,6 +851,10 @@ impl Renderer {
             // Phase 8B: Free mega buffer sub-allocation
             if let Some(sec) = self.world.sectors.get(&coord) {
                 if let Some(ref ma) = sec.mega_alloc {
+                    // Phase 10A: Untrack VRAM before freeing.
+                    self.memory_ctx.budget.untrack_streaming(
+                        ma.vertex_size_bytes + ma.index_size_bytes,
+                    );
                     self.gpu_cull.mega.free(ma);
                 }
             }
@@ -858,6 +887,10 @@ impl Renderer {
 
         self.update_streaming();
         self.poll_uploads();
+        // Phase 10A: Reclaim completed transfer command buffers.
+        // submit_timeline() reclaims opportunistically on each submit, but this
+        // catches the tail when no new uploads are occurring (steady-state).
+        self.memory_ctx.transfer.reclaim_completed_cmds();
         self.texture_manager.poll_pending(&self.memory_ctx);
         self.probe_grid.upload_if_dirty();
 

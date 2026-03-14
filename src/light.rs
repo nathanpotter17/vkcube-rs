@@ -500,6 +500,39 @@ impl Light {
             source_sector: (0, 0),
         }
     }
+
+    /// Phase 10A Fix F: Compute the effective radius where light intensity
+    /// drops below the perceptual visibility threshold.
+    ///
+    /// Uses inverse-square falloff: I / (d² + ε) < threshold → d > sqrt(I / threshold).
+    /// Returns the minimum of the artist-set radius and the intensity-derived
+    /// cutoff. This shrinks light influence volumes to match actual visible
+    /// contribution, reducing cluster occupancy without perceptible quality loss.
+    ///
+    /// Directional lights (radius == 0.0) pass through unchanged.
+    ///
+    /// The threshold 0.01 (~1% visible intensity) is conservative — at typical
+    /// sRGB display contrast ratios, contributions below this are imperceptible
+    /// against any non-black background.
+    #[inline]
+    pub fn effective_radius(&self) -> f32 {
+        /// Minimum visible intensity threshold for radius clamping.
+        /// Below this, the light contribution is imperceptible.
+        const MIN_VISIBLE_INTENSITY: f32 = 0.01;
+
+        if self.light_type == LightType::Directional || self.radius <= 0.0 {
+            return self.radius;
+        }
+        let luminance = self.color[0] * 0.2126
+            + self.color[1] * 0.7152
+            + self.color[2] * 0.0722;
+        let power = luminance * self.intensity;
+        if power <= 0.0 {
+            return 0.0;
+        }
+        let intensity_radius = (power / MIN_VISIBLE_INTENSITY).sqrt();
+        self.radius.min(intensity_radius)
+    }
 }
 
 // ====================================================================
@@ -540,12 +573,16 @@ impl GpuLight {
             | if light.shadow_capable { 1 << 2 } else { 0 }
             | if light.category == LightCategory::Baked { 1 << 3 } else { 0 };
 
+        // Phase 10A Fix F: Use effective_radius() to clamp GPU-side radius to
+        // the intensity-derived cutoff. This ensures the fragment shader's
+        // early-out (dist > radius) matches the cluster assignment's sphere test,
+        // and both use the tighter radius.
         Self {
             position_radius: [
                 light.position[0],
                 light.position[1],
                 light.position[2],
-                light.radius,
+                light.effective_radius(),
             ],
             direction_cos_outer: [
                 light.direction[0],
@@ -775,7 +812,10 @@ impl LightManager {
             positions.push(light.position);
             radii.push(
                 if light.light_type == LightType::Directional { 0.0 }
-                else { light.radius }
+                // Phase 10A Fix F: Use effective_radius() for frustum cull.
+                // Ensures the AVX2 sphere-frustum test uses the same tighter
+                // radius as the GPU-side cluster assignment and fragment shader.
+                else { light.effective_radius() }
             );
         }
 

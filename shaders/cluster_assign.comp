@@ -5,8 +5,21 @@
 // all lights against the cluster AABB and build a per-cluster light
 // list using shared memory + global atomic allocation.
 //
-// Fast path: when light_count < 50, skips spatial culling and assigns
+// Fast path: when light_count < 8, skips spatial culling and assigns
 // all lights to all clusters (avoiding cluster bounds overhead).
+//
+// Phase 10A Fix D: 3-way type-sorted output.
+//   Lights are classified into 3 bins in shared memory:
+//     1. Directional lights (always affect all clusters)
+//     2. Shadowed local lights (point/spot with active shadow map)
+//     3. Unshadowed local lights (point/spot without shadow, or baked)
+//   Output index order: directional first, then shadowed, then unshadowed.
+//   GpuCluster.count is bit-packed:
+//     bits  0-7:  total light count
+//     bits  8-15: directional count (at start of index list)
+//     bits 16-23: shadowed local count (after directional section)
+//   This lets the fragment shader run 3 branch-free sub-loops, eliminating
+//   warp divergence from mixed light types and shadow/no-shadow branching.
 
 #version 450
 
@@ -21,6 +34,10 @@ layout(local_size_x = 64) in;
 #define CLUSTER_Y 9
 #define CLUSTER_Z 32
 
+// Maximum directional lights per cluster. Practically 1-2 (sun + maybe moon).
+// Kept small to minimize shared memory; excess directionals are dropped.
+#define MAX_DIR_LIGHTS 8
+
 // --------------------------------------------------------------------
 //  GPU types
 // --------------------------------------------------------------------
@@ -29,15 +46,15 @@ struct GpuLight {
     vec4  position_radius;
     vec4  direction_cos_outer;
     vec4  color_intensity;
-    uint  type_flags;
-    uint  shadow_index;
+    uint  type_flags;       // bits 0-1: type (0=point,1=spot,2=dir), bit 2: shadow_capable, bit 3: baked
+    uint  shadow_index;     // 0xFFFFFFFF = no shadow slot
     float falloff;
     float cos_inner_angle;
 };
 
 struct GpuCluster {
     uint offset;
-    uint count;
+    uint count;     // Phase 10A packed: [7:0]=total, [15:8]=dir_count, [23:16]=shadow_local_count
 };
 
 // --------------------------------------------------------------------
@@ -80,12 +97,71 @@ layout(set = 0, binding = 4, std140) uniform ClusterParams {
 } params;
 
 // --------------------------------------------------------------------
-//  Shared memory
+//  Shared memory — 3 bins for type-sorted output
 // --------------------------------------------------------------------
 
-shared uint s_light_count;
-shared uint s_light_indices[MAX_LIGHTS_PER_CLUSTER];
+// Bin 1: Directional lights (always pass, no spatial test)
+shared uint s_dir_count;
+shared uint s_dir_indices[MAX_DIR_LIGHTS];
+
+// Bin 2: Shadowed local lights (point/spot with active shadow map, not baked)
+shared uint s_shadow_count;
+shared uint s_shadow_indices[MAX_LIGHTS_PER_CLUSTER];
+
+// Bin 3: Unshadowed local lights (point/spot without shadow, or baked)
+shared uint s_noshadow_count;
+shared uint s_noshadow_indices[MAX_LIGHTS_PER_CLUSTER];
+
+// Global allocation offset
 shared uint s_global_offset;
+
+// --------------------------------------------------------------------
+//  Light classification helper
+// --------------------------------------------------------------------
+
+// Classify a light into one of 3 bins and atomically append it.
+// Returns true if the light was added (not dropped due to capacity).
+bool classifyAndBin(uint lightIndex) {
+    GpuLight light = lightBuf.lights[lightIndex];
+    uint lightType = light.type_flags & 3u;
+
+    if (lightType == 2u) {
+        // Directional: always assigned to all clusters.
+        uint idx = atomicAdd(s_dir_count, 1);
+        if (idx < MAX_DIR_LIGHTS) {
+            s_dir_indices[idx] = lightIndex;
+            return true;
+        }
+        return false;
+    }
+
+    // Point/spot: classify by shadow state.
+    // Shadowed: has an active shadow slot AND is not baked.
+    bool is_baked = (light.type_flags & 8u) != 0u;
+    bool has_shadow = (light.shadow_index != 0xFFFFFFFFu) && !is_baked;
+
+    if (has_shadow) {
+        uint idx = atomicAdd(s_shadow_count, 1);
+        if (idx < MAX_LIGHTS_PER_CLUSTER) {
+            s_shadow_indices[idx] = lightIndex;
+            return true;
+        }
+    } else {
+        uint idx = atomicAdd(s_noshadow_count, 1);
+        if (idx < MAX_LIGHTS_PER_CLUSTER) {
+            s_noshadow_indices[idx] = lightIndex;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Pack the 3 counts into a single uint for GpuCluster.count.
+uint packCount(uint total, uint dirCount, uint shadowLocalCount) {
+    return (total & 0xFFu)
+        | ((dirCount & 0xFFu) << 8u)
+        | ((shadowLocalCount & 0xFFu) << 16u);
+}
 
 // --------------------------------------------------------------------
 //  Cluster bounds computation
@@ -114,14 +190,9 @@ void clusterBounds(uint cx, uint cy, uint cz, out vec3 aabb_min, out vec3 aabb_m
     float ndc_y_max = -(float(cy)     * tile_h / float(params.screen_size.y) * 2.0 - 1.0);
 
     // Unproject NDC corners to view space at z_near and z_far.
-    // For a standard perspective projection, view-space XY at depth z:
-    //   x_view = ndc_x * (-z) / proj[0][0]
-    //   y_view = ndc_y * (-z) / proj[1][1]
     float inv_px = 1.0 / params.proj[0][0];
     float inv_py = 1.0 / abs(params.proj[1][1]); // abs because Vulkan Y flip
 
-    // View-space Z is negative (looking down -Z).
-    // But we work with positive Z for AABB.
     vec3 corners[8];
     corners[0] = vec3(ndc_x_min * z_near * inv_px, ndc_y_min * z_near * inv_py, -z_near);
     corners[1] = vec3(ndc_x_max * z_near * inv_px, ndc_y_min * z_near * inv_py, -z_near);
@@ -162,7 +233,9 @@ void main() {
 
     // Initialize shared state.
     if (gl_LocalInvocationID.x == 0) {
-        s_light_count = 0;
+        s_dir_count = 0;
+        s_shadow_count = 0;
+        s_noshadow_count = 0;
         // NOTE: global_count reset is now handled CPU-side via vkCmdFillBuffer.
         // No GPU-side reset needed — eliminates cross-workgroup race condition.
     }
@@ -172,27 +245,48 @@ void main() {
     // ---- Fast path: <8 lights → assign all to all clusters ----
     // Phase 8C: Lowered from 50. With tight radii (8-30m), spatial culling
     // rejects most lights from most clusters even at modest counts.
-    // At 44 lights with 30m radii, brute-force assigns all 44 to every
-    // fragment — spatial culling reduces this to ~3-8 per cluster.
+    // Phase 10A: Fast path still classifies lights into 3 bins for
+    // consistent packed-count format — the fragment shader always
+    // unpacks the same way regardless of which path produced the data.
     if (numLights < 8) {
-        uint count = min(numLights, MAX_LIGHTS_PER_CLUSTER);
-
+        // Thread 0 classifies all lights into the 3 bins.
         if (gl_LocalInvocationID.x == 0) {
-            // Allocate space in the global index buffer.
-            s_global_offset = atomicAdd(indexBuf.global_count, count);
-            clusterBuf.clusters[clusterIndex].offset = s_global_offset;
-            clusterBuf.clusters[clusterIndex].count  = count;
+            for (uint i = 0; i < numLights; i++) {
+                classifyAndBin(i);
+            }
         }
         barrier();
 
-        // Each thread writes a subset of indices.
-        for (uint i = gl_LocalInvocationID.x; i < count; i += 64) {
-            indexBuf.indices[s_global_offset + i] = i;
+        // Compute final counts (clamped to capacity).
+        uint dirCount      = min(s_dir_count, MAX_DIR_LIGHTS);
+        uint shadowCount   = min(s_shadow_count, MAX_LIGHTS_PER_CLUSTER - dirCount);
+        uint noshadowCount = min(s_noshadow_count, MAX_LIGHTS_PER_CLUSTER - dirCount - shadowCount);
+        uint total         = dirCount + shadowCount + noshadowCount;
+
+        if (gl_LocalInvocationID.x == 0) {
+            s_global_offset = atomicAdd(indexBuf.global_count, total);
+            clusterBuf.clusters[clusterIndex].offset = s_global_offset;
+            clusterBuf.clusters[clusterIndex].count  = packCount(total, dirCount, shadowCount);
+        }
+        barrier();
+
+        // Write sorted indices: directional, then shadowed, then unshadowed.
+        uint base = s_global_offset;
+        for (uint i = gl_LocalInvocationID.x; i < dirCount; i += 64) {
+            indexBuf.indices[base + i] = s_dir_indices[i];
+        }
+        base += dirCount;
+        for (uint i = gl_LocalInvocationID.x; i < shadowCount; i += 64) {
+            indexBuf.indices[base + i] = s_shadow_indices[i];
+        }
+        base += shadowCount;
+        for (uint i = gl_LocalInvocationID.x; i < noshadowCount; i += 64) {
+            indexBuf.indices[base + i] = s_noshadow_indices[i];
         }
         return;
     }
 
-    // ---- Standard path: spatial culling per cluster ----
+    // ---- Standard path: spatial culling per cluster, 3-way sorted output ----
 
     // Decompose cluster index to 3D coordinates.
     uint cz = clusterIndex / (params.grid_size.x * params.grid_size.y);
@@ -211,14 +305,13 @@ void main() {
 
     for (uint i = startLight; i < endLight; i++) {
         GpuLight light = lightBuf.lights[i];
-
         uint lightType = light.type_flags & 3u;
 
         if (lightType == 2u) {
-            // Directional light: always affects all clusters.
-            uint idx = atomicAdd(s_light_count, 1);
-            if (idx < MAX_LIGHTS_PER_CLUSTER) {
-                s_light_indices[idx] = i;
+            // Directional: always assigned, classify into dir bin.
+            uint idx = atomicAdd(s_dir_count, 1);
+            if (idx < MAX_DIR_LIGHTS) {
+                s_dir_indices[idx] = i;
             }
             continue;
         }
@@ -232,27 +325,51 @@ void main() {
         vec3 lightViewPos = lightPosView.xyz;
 
         if (sphereIntersectsAABB(lightViewPos, radius, aabb_min, aabb_max)) {
-            uint idx = atomicAdd(s_light_count, 1);
-            if (idx < MAX_LIGHTS_PER_CLUSTER) {
-                s_light_indices[idx] = i;
+            // Classify into shadowed or unshadowed bin.
+            bool is_baked = (light.type_flags & 8u) != 0u;
+            bool has_shadow = (light.shadow_index != 0xFFFFFFFFu) && !is_baked;
+
+            if (has_shadow) {
+                uint idx = atomicAdd(s_shadow_count, 1);
+                if (idx < MAX_LIGHTS_PER_CLUSTER) {
+                    s_shadow_indices[idx] = i;
+                }
+            } else {
+                uint idx = atomicAdd(s_noshadow_count, 1);
+                if (idx < MAX_LIGHTS_PER_CLUSTER) {
+                    s_noshadow_indices[idx] = i;
+                }
             }
         }
     }
 
     barrier();
 
-    // Allocate in global index buffer and write cluster entry.
-    uint count = min(s_light_count, MAX_LIGHTS_PER_CLUSTER);
+    // Compute final counts (clamped to capacity, respecting total budget).
+    uint dirCount      = min(s_dir_count, MAX_DIR_LIGHTS);
+    uint shadowCount   = min(s_shadow_count, MAX_LIGHTS_PER_CLUSTER - dirCount);
+    uint noshadowCount = min(s_noshadow_count, MAX_LIGHTS_PER_CLUSTER - dirCount - shadowCount);
+    uint total         = dirCount + shadowCount + noshadowCount;
 
+    // Allocate in global index buffer and write packed cluster entry.
     if (gl_LocalInvocationID.x == 0) {
-        s_global_offset = atomicAdd(indexBuf.global_count, count);
+        s_global_offset = atomicAdd(indexBuf.global_count, total);
         clusterBuf.clusters[clusterIndex].offset = s_global_offset;
-        clusterBuf.clusters[clusterIndex].count  = count;
+        clusterBuf.clusters[clusterIndex].count  = packCount(total, dirCount, shadowCount);
     }
     barrier();
 
-    // Copy shared indices to global buffer.
-    for (uint i = gl_LocalInvocationID.x; i < count; i += 64) {
-        indexBuf.indices[s_global_offset + i] = s_light_indices[i];
+    // Write sorted indices to global buffer: directional → shadowed → unshadowed.
+    uint base = s_global_offset;
+    for (uint i = gl_LocalInvocationID.x; i < dirCount; i += 64) {
+        indexBuf.indices[base + i] = s_dir_indices[i];
+    }
+    base += dirCount;
+    for (uint i = gl_LocalInvocationID.x; i < shadowCount; i += 64) {
+        indexBuf.indices[base + i] = s_shadow_indices[i];
+    }
+    base += shadowCount;
+    for (uint i = gl_LocalInvocationID.x; i < noshadowCount; i += 64) {
+        indexBuf.indices[base + i] = s_noshadow_indices[i];
     }
 }

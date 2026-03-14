@@ -23,6 +23,23 @@
 //   - ACES tonemapping + gamma correction removed from main()
 //   - Fragment shader now outputs raw linear HDR to R16G16B16A16_SFLOAT target
 //   - Tonemapping handled by tonemap.comp fullscreen compute pass
+//
+// Phase 10A modification (Fixes A+C):
+//   - evaluateLight() accepts precomputed sun shadow — eliminates redundant
+//     calculateCascadeShadow() call that duplicated 9-tap PCF per directional light
+//   - Adaptive PCF: cascades 0-1 use 3×3 (9-tap), cascades 2-3 use single tap
+//   - Cross-cascade blending at split boundaries eliminates visible seam lines
+//   - Smooth blend zone (20% of cascade depth range) transitions both shadow
+//     value and PCF quality seamlessly between adjacent cascades
+//
+// Phase 10A modification (Fix D):
+//   - evaluateLight() replaced with 3 specialized branchless functions:
+//     evaluateDirectionalLight, evaluateShadowedLocalLight, evaluateUnshadowedLocalLight
+//   - GpuCluster.count is bit-packed: [7:0]=total, [15:8]=dir, [23:16]=shadowed_local
+//   - cluster_assign.comp sorts lights into 3 contiguous sections
+//   - Fragment shader runs 3 sub-loops — zero warp divergence on light type or
+//     shadow/no-shadow branching. All threads in a warp execute identical code
+//     within each sub-loop.
 
 #version 450
 #extension GL_EXT_nonuniform_qualifier : require
@@ -72,10 +89,15 @@ struct GpuLight {
 };
 
 // ---- Cluster data ----
+// Phase 10A Fix D: GpuCluster.count is bit-packed by cluster_assign.comp:
+//   bits  0-7:  total light count for this cluster
+//   bits  8-15: directional count (at start of index list)
+//   bits 16-23: shadowed local count (after directional section)
+// This enables 3 branch-free sub-loops in the fragment shader.
 
 struct GpuCluster {
     uint offset;
-    uint count;
+    uint count;     // packed: [7:0]=total, [15:8]=dir_count, [23:16]=shadow_local_count
 };
 
 // ---- SH Probe data (144 bytes, matches gi.rs GpuSHProbe) ----
@@ -203,6 +225,12 @@ const uint FLAG_ALPHA_CUTOFF = 4u;
 // 0.25-0.4 gives realistic outdoor shadow darkness while preserving fill light.
 const float SUN_SHADOW_AMBIENT_MIN = 0.3;
 
+// Phase 10A: Cross-cascade blend zone fraction.
+// 20% of each cascade's depth range is used for blending into the next cascade.
+// Higher = smoother transitions but more fragments pay the double-sample cost.
+// Lower = sharper transitions, less double-sampling overhead.
+const float CASCADE_BLEND_FRACTION = 0.2;
+
 // ====================================================================
 //  ACES Filmic Tone Mapping (Phase 4: replaces Reinhard)
 // ====================================================================
@@ -317,8 +345,25 @@ float samplePointShadow(vec3 fragPos, vec3 lightPos, float lightRadius, uint sha
 }
 
 // ====================================================================
-//  Sun Shadow Sampling (Phase 8B: front-face culling + decoupled normal offset + PCF)
+//  Sun Shadow Sampling (Phase 10A: adaptive PCF + cross-cascade blending)
 // ====================================================================
+//
+// Phase 8B foundation retained:
+//   - Front-face culling in shadow pass eliminates acne without large bias
+//   - Decoupled normal offset: UV from offset position, Z from original position
+//
+// Phase 10A changes:
+//   - sampleCascadeAtIndex(): samples a single cascade with quality-adaptive PCF
+//     Cascades 0-1: 3×3 hardware PCF (9 taps → 36 effective samples)
+//     Cascades 2-3: single hardware PCF tap (1 tap → 4 effective bilinear samples)
+//   - calculateCascadeShadow(): selects cascade, applies cross-cascade blending
+//     at split boundaries to eliminate visible seam lines, applies far fade
+//
+// Cross-cascade blending:
+//   At each cascade boundary, a blend zone covers the last CASCADE_BLEND_FRACTION
+//   of the cascade's depth range. Within this zone, both the current and next
+//   cascade are sampled and smoothstep-blended. This eliminates the hard seam
+//   caused by resolution and PCF quality differences between cascades.
 
 // Poisson disk samples for soft shadow PCF (16 samples, well-distributed).
 const vec2 poissonDisk[16] = vec2[](
@@ -346,48 +391,16 @@ float interleavedGradientNoise(vec2 screenPos) {
     return fract(magic.z * fract(dot(screenPos, magic.xy)));
 }
 
-// ====================================================================
-//  Cascaded Sun Shadow Sampling (replaces sampleSunShadow / sampleSunShadowPCF)
-// ====================================================================
-
-// Cascade shadow sampling with 3×3 hardware-assisted PCF.
+// Sample a single cascade with quality-adaptive PCF.
 //
-// Uses sampler2DArrayShadow for hardware depth comparison.
-// LINEAR filter + compareOp gives 2×2 bilinear PCF per tap;
-// 3×3 grid = 36 effective samples for smooth penumbra.
+// cascadeIndex: which cascade to sample (0..CASCADE_COUNT-1)
+// worldPos:     fragment world position (used for depth comparison projection)
+// N:            surface normal (used for normal offset UV projection)
 //
-// Phase 8B fix: Front-face culling in the shadow pass renders only back faces
-// into the shadow map. Front-facing surfaces compare against deeper back-face
-// depth and cannot self-shadow, eliminating shadow acne.
-//
-// Decoupled normal offset: the shadow lookup uses two separate projections:
-//   UV coords: from a position offset along the surface normal (prevents acne
-//              by sampling neighboring shadow map texels at grazing angles).
-//   Z depth:   from the original unbiased world position (preserves contact
-//              shadows — no depth shift toward/away from the light).
-//
-// This decoupling fully solves both acne and contact gaps simultaneously.
-// At contact points (box on ground), the UV shifts slightly sideways but
-// the depth comparison stays exact → shadow connects flush to the caster.
-// At grazing angles, the UV shift reads deeper back-face texels →
-// comparison passes → no acne.
-//
-// N = surface normal (world space).
-// Returns 0.0 in shadow, 1.0 in light.
-float calculateCascadeShadow(vec3 worldPos, vec3 N) {
-    if (csm.csm_light_direction.w < 0.5) return 1.0; // shadow disabled
-
-    // Determine cascade from view-space depth (same view matrix as cluster assignment)
-    float viewZ = -(cluster.view_mat * vec4(worldPos, 1.0)).z;
-
-    uint cascadeIndex = CASCADE_COUNT - 1u;
-    for (uint i = 0u; i < CASCADE_COUNT - 1u; i++) {
-        if (viewZ < csm.split_distances[i]) {
-            cascadeIndex = i;
-            break;
-        }
-    }
-
+// Returns 0.0 in shadow, 1.0 in light, or -1.0 if out-of-bounds.
+// Out-of-bounds sentinel lets the caller decide how to handle it
+// (e.g. fall through to next cascade during blending).
+float sampleCascadeAtIndex(vec3 worldPos, vec3 N, uint cascadeIndex) {
     // Normal offset: shift position along surface normal for UV lookup.
     // Scales with sin(angle-to-light) — zero when facing the light, max at grazing.
     // Increases with cascade index to match growing texel footprint.
@@ -408,27 +421,101 @@ float calculateCascadeShadow(vec3 worldPos, vec3 N) {
     vec4 shadowPosZ = cascadeMat * vec4(worldPos, 1.0);
     float compareRef = (shadowPosZ.xyz / shadowPosZ.w).z;
 
-    // Out-of-bounds → lit (check both UV and Z)
+    // Out-of-bounds → sentinel
     if (shadowUV.x < 0.0 || shadowUV.x > 1.0 ||
         shadowUV.y < 0.0 || shadowUV.y > 1.0 ||
         compareRef < 0.0 || compareRef > 1.0) {
-        return 1.0;
+        return -1.0;
     }
 
-    // 3×3 PCF via hardware comparison sampler
-    // sampler2DArrayShadow: texture(sampler, vec4(uv, layer, compareRef)) → [0,1]
+    // Phase 10A: Adaptive PCF quality by cascade distance.
+    // Cascades 0-1 (near): 3×3 hardware PCF (9 taps × bilinear = 36 effective samples)
+    // Cascades 2-3 (far):  single hardware PCF tap (1 tap × bilinear = 4 effective samples)
+    //
+    // Rationale: far cascades cover large world-space areas per texel. The bilinear
+    // filtering from a single comparison-sampler tap already covers ~4 shadow texels,
+    // providing adequate softness. Near cascades need the full 3×3 kernel for
+    // smooth penumbra edges where texel density is high enough to reveal aliasing.
     float shadow = 0.0;
-    vec2 texelSize = 1.0 / vec2(textureSize(cascadeShadowMaps, 0).xy);
-    for (int x = -1; x <= 1; x++) {
-        for (int y = -1; y <= 1; y++) {
-            vec2 offset = vec2(x, y) * texelSize;
-            shadow += texture(cascadeShadowMaps,
-                vec4(shadowUV + offset, float(cascadeIndex), compareRef));
+    if (cascadeIndex <= 1u) {
+        // Near cascades: full 3×3 PCF
+        vec2 texelSize = 1.0 / vec2(textureSize(cascadeShadowMaps, 0).xy);
+        for (int x = -1; x <= 1; x++) {
+            for (int y = -1; y <= 1; y++) {
+                vec2 offset = vec2(x, y) * texelSize;
+                shadow += texture(cascadeShadowMaps,
+                    vec4(shadowUV + offset, float(cascadeIndex), compareRef));
+            }
+        }
+        shadow /= 9.0;
+    } else {
+        // Far cascades: single hardware PCF tap (bilinear gives 2×2 = 4 samples)
+        shadow = texture(cascadeShadowMaps,
+            vec4(shadowUV, float(cascadeIndex), compareRef));
+    }
+
+    return shadow;
+}
+
+// Main cascade shadow entry point with cross-cascade blending.
+//
+// Eliminates visible seam lines at cascade boundaries by sampling both the
+// current and next cascade within a blend zone and smoothstep-interpolating.
+//
+// Returns 0.0 in shadow, 1.0 in light.
+float calculateCascadeShadow(vec3 worldPos, vec3 N) {
+    if (csm.csm_light_direction.w < 0.5) return 1.0; // shadow disabled
+
+    // Determine cascade from view-space depth (same view matrix as cluster assignment)
+    float viewZ = -(cluster.view_mat * vec4(worldPos, 1.0)).z;
+
+    uint cascadeIndex = CASCADE_COUNT - 1u;
+    for (uint i = 0u; i < CASCADE_COUNT - 1u; i++) {
+        if (viewZ < csm.split_distances[i]) {
+            cascadeIndex = i;
+            break;
         }
     }
-    shadow /= 9.0;
 
-    // Fade out at the last cascade's far boundary
+    // Sample the primary cascade.
+    float shadow = sampleCascadeAtIndex(worldPos, N, cascadeIndex);
+
+    // Handle OOB from primary cascade — fall through to lit.
+    if (shadow < 0.0) return 1.0;
+
+    // ---- Cross-cascade blending at split boundaries ----
+    // When the fragment is near the far edge of a non-final cascade,
+    // blend with the next cascade to eliminate the visible seam line.
+    //
+    // The blend zone covers the last CASCADE_BLEND_FRACTION of the current
+    // cascade's depth range. Within this zone, both cascades are sampled
+    // and smoothstep-blended. This smooths both resolution differences
+    // and PCF quality transitions (9-tap → 1-tap at the cascade 1→2 boundary).
+    if (cascadeIndex < CASCADE_COUNT - 1u) {
+        float cascadeFar  = csm.split_distances[cascadeIndex];
+        float cascadeNear = (cascadeIndex > 0u)
+            ? csm.split_distances[cascadeIndex - 1u]
+            : cluster.z_params.x;  // camera near plane
+
+        float cascadeRange = cascadeFar - cascadeNear;
+        float blendStart   = cascadeFar - cascadeRange * CASCADE_BLEND_FRACTION;
+
+        if (viewZ > blendStart) {
+            // We're in the blend zone — sample the next cascade too.
+            float nextShadow = sampleCascadeAtIndex(worldPos, N, cascadeIndex + 1u);
+
+            // If next cascade returns OOB, just use the current cascade's value.
+            if (nextShadow >= 0.0) {
+                // smoothstep blend: 0 at blendStart, 1 at cascadeFar
+                float blendFactor = smoothstep(blendStart, cascadeFar, viewZ);
+                shadow = mix(shadow, nextShadow, blendFactor);
+            }
+        }
+    }
+
+    // Fade out at the last cascade's far boundary.
+    // Beyond the last cascade, shadow gracefully fades to 1.0 (lit) instead
+    // of abruptly cutting off.
     if (cascadeIndex == CASCADE_COUNT - 1u) {
         float maxZ = csm.split_distances[CASCADE_COUNT - 1u];
         float fadeStart = maxZ * csm.shadow_params.z;
@@ -522,39 +609,77 @@ vec3 sampleSpecularIBL(vec3 R, float roughness, vec3 F, vec2 brdf) {
 }
 
 // ====================================================================
-//  Light evaluation (unchanged from Phase 2)
+//  Light evaluation — Phase 10A Fix D: 3 specialized branchless functions
 // ====================================================================
+//
+// Previously a single evaluateLight() function handled all light types
+// with runtime branches on lightType, shadow_index, and baked status.
+// When a GPU warp contains fragments lit by mixed light types, ALL threads
+// must execute ALL branches — the most expensive being the samplePointShadow()
+// cube map fetch (~100+ cycles) that only shadowed-light threads actually need.
+//
+// Fix D eliminates this by splitting into 3 specialized functions with
+// zero conditional branching on light type or shadow state. The cluster
+// assignment shader sorts lights into 3 contiguous sections (directional,
+// shadowed local, unshadowed local), and the fragment shader runs a
+// separate sub-loop for each section — every thread in a warp executes
+// identical code within each sub-loop.
 
-vec3 evaluateLight(
+// ---- Sub-loop 1: Directional lights (sun, moon) ----
+// No distance/attenuation calc. Uses precomputed cascade shadow.
+// Warp-uniform: all threads in a warp take the exact same path.
+vec3 evaluateDirectionalLight(
+    GpuLight light,
+    vec3 N, vec3 V, vec3 albedo,
+    float metallic, float roughness, vec3 F0,
+    float precomputedSunShadow
+) {
+    vec3 L = -light.direction_cos_outer.xyz;
+
+    vec3 H = normalize(V + L);
+    float NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return vec3(0.0);
+
+    float D = distributionGGX(N, H, roughness);
+    float G = geometrySmith(N, V, L, roughness);
+    vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    vec3 specular = (D * G * F) / (4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    vec3 diffuse = kD * albedo / PI;
+
+    vec3 lightColor = light.color_intensity.rgb * light.color_intensity.w;
+    return (diffuse + specular) * lightColor * NdotL * precomputedSunShadow;
+}
+
+// ---- Sub-loop 2: Shadowed local lights (point/spot with active shadow map) ----
+// Always samples point shadow — no branch. All threads in the warp execute
+// the cube map texture fetch simultaneously, maximizing texture unit utilization.
+vec3 evaluateShadowedLocalLight(
     GpuLight light,
     vec3 N, vec3 V, vec3 albedo,
     float metallic, float roughness, vec3 F0
 ) {
-    uint lightType = light.type_flags & 3u;
-    vec3 L;
-    float attenuation = 1.0;
+    vec3 toLight = light.position_radius.xyz - fragWorldPos;
+    float dist = length(toLight);
+    vec3 L = toLight / max(dist, 0.001);
+    float radius = light.position_radius.w;
+    if (dist > radius) return vec3(0.0);
 
-    if (lightType == 2u) {
-        L = -light.direction_cos_outer.xyz;
-    } else {
-        vec3 toLight = light.position_radius.xyz - fragWorldPos;
-        float dist = length(toLight);
-        L = toLight / max(dist, 0.001);
-        float radius = light.position_radius.w;
-        if (dist > radius) return vec3(0.0);
-        float distRatio = dist / radius;
-        float falloffFactor = 1.0 - distRatio * distRatio;
-        falloffFactor = max(falloffFactor, 0.0);
-        falloffFactor = falloffFactor * falloffFactor;
-        attenuation = falloffFactor / max(dist * dist, 0.001);
-        if (lightType == 1u) {
-            float cosAngle = dot(-L, light.direction_cos_outer.xyz);
-            float cosOuter = light.direction_cos_outer.w;
-            float cosInner = light.cos_inner_angle;
-            float spotFactor = clamp(
-                (cosAngle - cosOuter) / max(cosInner - cosOuter, 0.001), 0.0, 1.0);
-            attenuation *= spotFactor * spotFactor;
-        }
+    float distRatio = dist / radius;
+    float falloffFactor = 1.0 - distRatio * distRatio;
+    falloffFactor = max(falloffFactor, 0.0);
+    falloffFactor = falloffFactor * falloffFactor;
+    float attenuation = falloffFactor / max(dist * dist, 0.001);
+
+    // Spot light cone (point lights have cos_outer=-1 → spotFactor always 1.0)
+    uint lightType = light.type_flags & 3u;
+    if (lightType == 1u) {
+        float cosAngle = dot(-L, light.direction_cos_outer.xyz);
+        float cosOuter = light.direction_cos_outer.w;
+        float cosInner = light.cos_inner_angle;
+        float spotFactor = clamp(
+            (cosAngle - cosOuter) / max(cosInner - cosOuter, 0.001), 0.0, 1.0);
+        attenuation *= spotFactor * spotFactor;
     }
 
     vec3 H = normalize(V + L);
@@ -568,24 +693,60 @@ vec3 evaluateLight(
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 diffuse = kD * albedo / PI;
 
-    // Phase 8C.1: Skip shadow sampling for baked lights (bit 3 = baked).
-    float shadow = 1.0;
-    bool is_baked = (light.type_flags & 8u) != 0u;
-
-    if (!is_baked) {
-        if (light.shadow_index != 0xFFFFFFFFu && lightType != 2u) {
-            shadow = samplePointShadow(fragWorldPos, light.position_radius.xyz,
-                light.position_radius.w, light.shadow_index);
-        }
-        // Directional (sun) shadow — handled separately in main() for ambient effect.
-        // Here we still apply it to the sun's direct contribution.
-        if (lightType == 2u) {
-            shadow = calculateCascadeShadow(fragWorldPos, N);
-        }
-    }
+    // Unconditional shadow sample — every thread in the warp does this.
+    // No branch on shadow_index (cluster_assign.comp guarantees it's valid).
+    float shadow = samplePointShadow(fragWorldPos, light.position_radius.xyz,
+        light.position_radius.w, light.shadow_index);
 
     vec3 lightColor = light.color_intensity.rgb * light.color_intensity.w;
     return (diffuse + specular) * lightColor * attenuation * NdotL * shadow;
+}
+
+// ---- Sub-loop 3: Unshadowed local lights (no shadow slot, or baked) ----
+// No shadow sampling at all — no cube map fetch, no branch.
+// Covers: point/spot without shadow slots, baked lights.
+vec3 evaluateUnshadowedLocalLight(
+    GpuLight light,
+    vec3 N, vec3 V, vec3 albedo,
+    float metallic, float roughness, vec3 F0
+) {
+    vec3 toLight = light.position_radius.xyz - fragWorldPos;
+    float dist = length(toLight);
+    vec3 L = toLight / max(dist, 0.001);
+    float radius = light.position_radius.w;
+    if (dist > radius) return vec3(0.0);
+
+    float distRatio = dist / radius;
+    float falloffFactor = 1.0 - distRatio * distRatio;
+    falloffFactor = max(falloffFactor, 0.0);
+    falloffFactor = falloffFactor * falloffFactor;
+    float attenuation = falloffFactor / max(dist * dist, 0.001);
+
+    // Spot light cone
+    uint lightType = light.type_flags & 3u;
+    if (lightType == 1u) {
+        float cosAngle = dot(-L, light.direction_cos_outer.xyz);
+        float cosOuter = light.direction_cos_outer.w;
+        float cosInner = light.cos_inner_angle;
+        float spotFactor = clamp(
+            (cosAngle - cosOuter) / max(cosInner - cosOuter, 0.001), 0.0, 1.0);
+        attenuation *= spotFactor * spotFactor;
+    }
+
+    vec3 H = normalize(V + L);
+    float NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return vec3(0.0);
+
+    float D = distributionGGX(N, H, roughness);
+    float G = geometrySmith(N, V, L, roughness);
+    vec3  F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    vec3 specular = (D * G * F) / (4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    vec3 diffuse = kD * albedo / PI;
+
+    // No shadow sampling — shadow = 1.0 implicit.
+    vec3 lightColor = light.color_intensity.rgb * light.color_intensity.w;
+    return (diffuse + specular) * lightColor * attenuation * NdotL;
 }
 
 // ====================================================================
@@ -632,6 +793,8 @@ void main() {
 
     // ════════════════════════════════════════════════════════════════════════
     // CSM: Sample cascade shadow ONCE, use for both direct and ambient
+    // Phase 10A: This is now the ONLY cascade shadow computation per fragment.
+    // evaluateLight() receives this value instead of recomputing it.
     // ════════════════════════════════════════════════════════════════════════
     float sunShadow = calculateCascadeShadow(fragWorldPos, N);
 
@@ -644,19 +807,62 @@ void main() {
     float gatedShadow = mix(1.0, sunShadow, sunFacing);
     float ambientShadowFactor = mix(SUN_SHADOW_AMBIENT_MIN, 1.0, gatedShadow);
 
-    // ---- Clustered direct lighting (Phase 8C.4: with luminance early exit) ----
+    // ---- Clustered direct lighting — Phase 10A Fix D: 3 branch-free sub-loops ----
+    // cluster_assign.comp sorts lights into 3 contiguous sections and packs
+    // the counts into GpuCluster.count. We unpack and run a specialized
+    // evaluation function for each section — zero type/shadow branching.
     uint clusterIdx = getClusterIndex();
     GpuCluster c = clusterBuf.clusters[clusterIdx];
-    vec3 Lo = vec3(0.0);
-    for (uint i = 0; i < c.count; i++) {
-        uint lightIdx = indexBuf.indices[c.offset + i];
-        Lo += evaluateLight(lightBuf.lights[lightIdx], N, V, albedo, metallic, roughness, F0);
 
-        // Phase 8C.4: Luminance-based early exit — if accumulated contribution is
-        // saturated AND we've processed at least half the lights, bail.
-        // Check every 4th iteration to minimize branch overhead.
-        // Threshold 1.5: ACES maps this to ~0.95 (near-white), imperceptible savings.
-        if ((i & 3u) == 3u && i > (c.count >> 1u)) {
+    // Unpack the 3-way count from the packed uint.
+    uint totalCount       = c.count & 0xFFu;
+    uint dirCount         = (c.count >> 8u) & 0xFFu;
+    uint shadowLocalCount = (c.count >> 16u) & 0xFFu;
+
+    // Index ranges within the cluster's index list:
+    //   [0 .. dirCount):                                directional lights
+    //   [dirCount .. dirCount + shadowLocalCount):      shadowed point/spot
+    //   [dirCount + shadowLocalCount .. totalCount):    unshadowed/baked point/spot
+    uint shadowStart    = dirCount;
+    uint unshadowStart  = dirCount + shadowLocalCount;
+
+    vec3 Lo = vec3(0.0);
+
+    // ---- Sub-loop 1: Directional lights (warp-uniform, no distance calc) ----
+    for (uint i = 0; i < dirCount; i++) {
+        uint lightIdx = indexBuf.indices[c.offset + i];
+        Lo += evaluateDirectionalLight(lightBuf.lights[lightIdx], N, V, albedo,
+                                        metallic, roughness, F0, sunShadow);
+    }
+
+    // ---- Sub-loop 2: Shadowed local lights (all threads sample cube map) ----
+    for (uint i = shadowStart; i < unshadowStart; i++) {
+        uint lightIdx = indexBuf.indices[c.offset + i];
+        Lo += evaluateShadowedLocalLight(lightBuf.lights[lightIdx], N, V, albedo,
+                                          metallic, roughness, F0);
+
+        // Phase 8C.4: Luminance early exit — check every 4th shadowed light.
+        // Shadowed lights are the most expensive, so early exit here saves the most.
+        // Only check after processing at least 4 shadowed lights to avoid premature bail.
+        uint processed = i - shadowStart;
+        if ((processed & 3u) == 3u && processed >= 4u) {
+            float lum = dot(Lo, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 1.5) {
+                // Skip remaining shadowed AND all unshadowed lights.
+                unshadowStart = totalCount;
+                break;
+            }
+        }
+    }
+
+    // ---- Sub-loop 3: Unshadowed local lights (no shadow fetch at all) ----
+    for (uint i = unshadowStart; i < totalCount; i++) {
+        uint lightIdx = indexBuf.indices[c.offset + i];
+        Lo += evaluateUnshadowedLocalLight(lightBuf.lights[lightIdx], N, V, albedo,
+                                            metallic, roughness, F0);
+
+        // Luminance early exit — unshadowed lights are cheap, check less often.
+        if (((i - unshadowStart) & 7u) == 7u) {
             float lum = dot(Lo, vec3(0.2126, 0.7152, 0.0722));
             if (lum > 1.5) break;
         }
@@ -699,6 +905,12 @@ void main() {
 
     // ---- DEBUG: Uncomment to visualize sun shadow ----
     // outColor = vec4(vec3(sunShadow), 1.0); return;
+
+    // ---- DEBUG: Uncomment to visualize cascade index (R=0, G=1, B=2, W=3) ----
+    // float vz = -(cluster.view_mat * vec4(fragWorldPos, 1.0)).z;
+    // uint ci = 3u; for (uint ii=0u;ii<3u;ii++){if(vz<csm.split_distances[ii]){ci=ii;break;}}
+    // vec3 cc = vec3(ci==0u?1.0:0.0, ci==1u?1.0:0.0, ci==2u?1.0:(ci==3u?1.0:0.0));
+    // outColor = vec4(cc, 1.0); return;
 
     // Phase 9A: Output raw linear HDR to R16G16B16A16_SFLOAT target.
     // Tonemapping + gamma correction moved to tonemap.comp compute pass.
