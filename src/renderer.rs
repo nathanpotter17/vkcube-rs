@@ -152,6 +152,12 @@ pub struct Renderer {
     cascade_shadow: CascadeShadowMap,
     cascade_builder: CascadeBuilder,
     sun_direction: [f32; 3],
+    /// Tier 1 fix: previous sun direction for cascade skip detection.
+    prev_sun_direction: [f32; 3],
+    /// Tier 1 fix: previous view matrix for cascade skip detection.
+    prev_cascade_view: [[f32; 4]; 4],
+    /// Tier 1 fix: when false, cascade shadow maps are reused from last render.
+    cascade_dirty: bool,
 
     dynamic_light_indices: Vec<usize>,
     dynamic_light_time: f32,
@@ -521,6 +527,9 @@ impl Renderer {
             cascade_shadow,
             cascade_builder,
             sun_direction: sun_dir,
+            prev_sun_direction: [f32::NAN; 3], // NaN forces first-frame render
+            prev_cascade_view: [[0.0; 4]; 4],  // Zero forces first-frame mismatch
+            cascade_dirty: true,
             dynamic_light_indices,
             dynamic_light_time: 0.0,
             probe_grid, gi_resources, probe_bake_target,
@@ -870,7 +879,14 @@ impl Renderer {
             // ════════════════════════════════════════════════════════════
             // STEP 3: Flush dirty objects to SSBO (AFTER fence wait — §3.3)
             // ════════════════════════════════════════════════════════════
+            // Tier 1 fix: detect geometry changes for cascade skip.
+            // needs_host_barrier is set by flush_dirty when data was written
+            // via ReBAR path; for staged path, dirty_objects non-empty signals change.
+            let had_dirty_objects = !self.gpu_cull.dirty_objects.is_empty();
             self.gpu_cull.flush_dirty(&mut self.memory_ctx);
+            if had_dirty_objects {
+                self.cascade_dirty = true;
+            }
 
             self.profiler.read_results(&self.device, self.current_frame);
             self.memory_ctx.ring.begin_frame(self.current_frame);
@@ -1091,72 +1107,90 @@ impl Renderer {
             self.profiler.begin_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
             // ---- Cascaded sun directional shadow (CASCADE_COUNT passes) ----
+            // Tier 1 fix: Skip cascade re-render when sun direction, camera view,
+            // and geometry are all unchanged since last render.
             {
-                let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
-                    width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
-                    min_depth: 0.0, max_depth: 1.0 };
-                let sun_ss = vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D { width: SUN_SHADOW_SIZE, height: SUN_SHADOW_SIZE },
-                };
-                let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } }];
+                let sun_changed = self.prev_sun_direction[0] != self.sun_direction[0]
+                    || self.prev_sun_direction[1] != self.sun_direction[1]
+                    || self.prev_sun_direction[2] != self.sun_direction[2];
+                if sun_changed {
+                    self.cascade_dirty = true;
+                    self.prev_sun_direction = self.sun_direction;
+                }
+                if self.prev_cascade_view != view_mat {
+                    self.cascade_dirty = true;
+                    self.prev_cascade_view = view_mat;
+                }
 
-                for cascade in 0..CASCADE_COUNT {
-                    // Combined VP in frame.view, identity in frame.proj.
-                    // sun_shadow.vert computes: gl_Position = frame.proj * frame.view * worldPos
-                    // With identity proj this becomes: combined_VP * worldPos
-                    // which is bit-exact with the fragment shader's:
-                    //   csm.cascade_matrices[i] * worldPos
-                    // Eliminates float precision mismatch → less bias needed → no peter-panning.
-                    let cascade_global = GlobalUbo {
-                        view: cascade_render.shadow_data.cascade_matrices[cascade],
-                        proj: crate::scene::identity_matrix(),
-                        camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
-                        sun_light_vp: sun_vp,
-                        sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                if self.cascade_dirty {
+                    let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
+                        width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
+                        min_depth: 0.0, max_depth: 1.0 };
+                    let sun_ss = vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width: SUN_SHADOW_SIZE, height: SUN_SHADOW_SIZE },
                     };
-                    let cascade_g_off = self.memory_ctx.ring
-                        .push_data(&cascade_global)
-                        .expect("Ring: cascade GlobalUbo")
-                        .offset as u32;
-                    let cascade_dyn_off = [cascade_g_off, c_off, p_off, csm_off];
+                    let clear = [vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } }];
 
-                    let rp = vk::RenderPassBeginInfo::default()
-                        .render_pass(self.render_passes.shadow)
-                        .framebuffer(self.cascade_shadow.framebuffers[cascade])
-                        .render_area(sun_ss)
-                        .clear_values(&clear);
-                    self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
-                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sun_shadow);
-                    self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
-                    self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
+                    for cascade in 0..CASCADE_COUNT {
+                        // Combined VP in frame.view, identity in frame.proj.
+                        // sun_shadow.vert computes: gl_Position = frame.proj * frame.view * worldPos
+                        // With identity proj this becomes: combined_VP * worldPos
+                        // which is bit-exact with the fragment shader's:
+                        //   csm.cascade_matrices[i] * worldPos
+                        // Eliminates float precision mismatch → less bias needed → no peter-panning.
+                        let cascade_global = GlobalUbo {
+                            view: cascade_render.shadow_data.cascade_matrices[cascade],
+                            proj: crate::scene::identity_matrix(),
+                            camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
+                            sun_light_vp: sun_vp,
+                            sun_direction: [self.sun_direction[0], self.sun_direction[1], self.sun_direction[2], 1.0],
+                        };
+                        let cascade_g_off = self.memory_ctx.ring
+                            .push_data(&cascade_global)
+                            .expect("Ring: cascade GlobalUbo")
+                            .offset as u32;
+                        let cascade_dyn_off = [cascade_g_off, c_off, p_off, csm_off];
 
-                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.layout, 0,
-                        &[self.frame_descriptors.per_frame_sets[f]], &cascade_dyn_off);
+                        let rp = vk::RenderPassBeginInfo::default()
+                            .render_pass(self.render_passes.shadow)
+                            .framebuffer(self.cascade_shadow.framebuffers[cascade])
+                            .render_area(sun_ss)
+                            .clear_values(&clear);
+                        self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+                        self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sun_shadow);
+                        self.device.cmd_set_viewport(cmd, 0, &[sun_sv]);
+                        self.device.cmd_set_scissor(cmd, 0, &[sun_ss]);
 
-                    // Phase 8A: Bind object SSBO (set 3) once for all draws
-                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.layout, 3,
-                        &[self.gpu_cull.object_ssbo_set], &[]);
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 0,
+                            &[self.frame_descriptors.per_frame_sets[f]], &cascade_dyn_off);
 
-                    // Phase 8B: single mega VB/IB bind
-                    self.device.cmd_bind_vertex_buffers(cmd, 0,
-                        &[self.gpu_cull.mega.vertex_buffer], &[0]);
-                    self.device.cmd_bind_index_buffer(cmd,
-                        self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+                        // Phase 8A: Bind object SSBO (set 3) once for all draws
+                        self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                            self.pipelines.layout, 3,
+                            &[self.gpu_cull.object_ssbo_set], &[]);
 
-                    // All shadow geometry rendered into every cascade (no per-cascade culling yet).
-                    self.device.cmd_draw_indexed_indirect_count(
-                        cmd,
-                        self.gpu_cull.shadow_cmds[f],
-                        0,
-                        self.gpu_cull.shadow_counts[f],
-                        0,
-                        MAX_INDIRECT_DRAWS,
-                        INDIRECT_COMMAND_STRIDE,
-                    );
-                    self.device.cmd_end_render_pass(cmd);
+                        // Phase 8B: single mega VB/IB bind
+                        self.device.cmd_bind_vertex_buffers(cmd, 0,
+                            &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                        self.device.cmd_bind_index_buffer(cmd,
+                            self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+
+                        // All shadow geometry rendered into every cascade (no per-cascade culling yet).
+                        self.device.cmd_draw_indexed_indirect_count(
+                            cmd,
+                            self.gpu_cull.shadow_cmds[f],
+                            0,
+                            self.gpu_cull.shadow_counts[f],
+                            0,
+                            MAX_INDIRECT_DRAWS,
+                            INDIRECT_COMMAND_STRIDE,
+                        );
+                        self.device.cmd_end_render_pass(cmd);
+                    }
+
+                    self.cascade_dirty = false;
                 }
             }
 
@@ -1174,6 +1208,27 @@ impl Renderer {
             // 16 slots × 6 faces × ~0.02 ms/face ≈ 1.9 ms max spike.
             const MAX_DIRTY_RENDERS_PER_FRAME: u32 = 16;
             let mut dirty_rendered = 0u32;
+
+            // Tier 1 fix: Hoist invariant state — mega VB/IB + SSBO descriptor
+            // set 3 are identical for every face of every point shadow slot.
+            // Bind once outside both loops instead of per-face.
+            // Saves up to 3×96 = 288 redundant driver calls/frame.
+            //
+            // Note: vkCmdBindPipeline(GRAPHICS) requires an active render pass
+            // per Vulkan §10.10, so pipeline bind remains inside the face loop.
+            // VB/IB/descriptor binds persist across render pass instances.
+            let has_dirty_shadows = assigned.iter().any(|(slot, _)| {
+                self.shadow_budget.should_render_slot(*slot, self.global_frame)
+            });
+            if has_dirty_shadows {
+                self.device.cmd_bind_vertex_buffers(cmd, 0,
+                    &[self.gpu_cull.mega.vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(cmd,
+                    self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines.layout, 3,
+                    &[self.gpu_cull.object_ssbo_set], &[]);
+            }
 
             for (slot, light_idx) in assigned {
                 // Phase 8D.1: Combined dirty + LOD cadence check.
@@ -1211,6 +1266,8 @@ impl Renderer {
                         .framebuffer(self.shadow_atlas.framebuffer(slot, face))
                         .render_area(ss).clear_values(&clear);
                     self.device.cmd_begin_render_pass(cmd, &rp, vk::SubpassContents::INLINE);
+
+                    // Pipeline must bind inside active render pass (Vulkan §10.10).
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.shadow);
                     self.device.cmd_set_viewport(cmd, 0, &[sv]);
                     self.device.cmd_set_scissor(cmd, 0, &[ss]);
@@ -1218,20 +1275,12 @@ impl Renderer {
                         vk::ShaderStageFlags::VERTEX|vk::ShaderStageFlags::FRAGMENT, 0,
                         std::slice::from_raw_parts(&push as *const _ as *const u8, std::mem::size_of_val(&push)));
 
+                    // Per-frame descriptor set 0 with dynamic offsets (varies per face).
                     self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
                         self.pipelines.layout, 0,
                         &[self.frame_descriptors.per_frame_sets[f]], &face_dyn_off);
 
-                    // Phase 8A: Bind object SSBO (set 3)
-                    self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.layout, 3,
-                        &[self.gpu_cull.object_ssbo_set], &[]);
-
-                    // Phase 8B: single mega VB/IB bind
-                    self.device.cmd_bind_vertex_buffers(cmd, 0,
-                        &[self.gpu_cull.mega.vertex_buffer], &[0]);
-                    self.device.cmd_bind_index_buffer(cmd,
-                        self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
+                    // VB, IB, SSBO set 3 already bound before outer loop.
 
                     // Phase 8C §2 bug fix: use shadow caster commands, not opaque
                     self.device.cmd_draw_indexed_indirect_count(

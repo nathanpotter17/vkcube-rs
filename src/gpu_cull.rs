@@ -401,6 +401,9 @@ pub struct GpuCullResources {
 
     // ---- Dirty object queue ----
     pub dirty_objects: Vec<(u32, GpuObjectData)>,
+    /// Tier 1 fix: O(1) lookup — object ID → index in dirty_objects vec.
+    /// Eliminates O(n) linear scan in queue_dirty.
+    dirty_index: std::collections::HashMap<u32, usize>,
 
     // ---- Phase 8B: Mega Buffers ----
     pub mega: MegaBuffers,
@@ -738,6 +741,7 @@ impl GpuCullResources {
             object_ssbo_set_layout,
             object_ssbo_set,
             dirty_objects: Vec::with_capacity(1024),
+            dirty_index: std::collections::HashMap::with_capacity(1024),
             mega,
             total_alive: 0,
             #[cfg(debug_assertions)]
@@ -827,6 +831,7 @@ impl GpuCullResources {
         }
 
         self.dirty_objects.clear();
+        self.dirty_index.clear();
     }
 
     /// Batches all dirty entries into a single staging region + single transfer submit.
@@ -949,15 +954,20 @@ impl GpuCullResources {
     }
 
     /// Queue an object for SSBO update. Updates CPU mirror.
+    /// Tier 1 fix: O(1) deduplication via HashMap index.
+    /// Old code: `.iter_mut().find()` was O(n) per call → O(n²) per sector stream.
     pub fn queue_dirty(&mut self, id: u32, data: GpuObjectData) {
         if (id as usize) < self.object_mirror.len() {
             self.object_mirror[id as usize] = data;
         }
 
-        if let Some(entry) = self.dirty_objects.iter_mut().find(|(oid, _)| *oid == id) {
-            entry.1 = data;
+        if let Some(&idx) = self.dirty_index.get(&id) {
+            // Update in-place — O(1)
+            self.dirty_objects[idx].1 = data;
         } else {
+            let idx = self.dirty_objects.len();
             self.dirty_objects.push((id, data));
+            self.dirty_index.insert(id, idx);
         }
     }
 

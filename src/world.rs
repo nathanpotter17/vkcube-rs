@@ -311,6 +311,8 @@ pub struct World {
     pub objects: Vec<RenderObject>,
     pub free_ids: Vec<u32>,
     next_id: u32,
+    /// Tier 1 fix: cached alive count. Eliminates O(n) scan in total_objects/alive_count.
+    alive_count_cached: u32,
 }
 
 impl World {
@@ -320,6 +322,7 @@ impl World {
             objects: Vec::with_capacity(4096),
             free_ids: Vec::new(),
             next_id: 0,
+            alive_count_cached: 0,
         }
     }
 
@@ -347,6 +350,7 @@ impl World {
         }
         // Phase 8A: spatial.insert REMOVED - objects tracked in GPU SSBO via gpu_cull.rs
         self.objects[idx] = obj;
+        self.alive_count_cached += 1;
         if let Some(sec) = self.sectors.get_mut(&sector) {
             sec.objects.push(id);
             // Grow sector content bounds to include this object's AABB.
@@ -367,6 +371,7 @@ impl World {
             if let Some(o) = self.objects.get_mut(id.0 as usize) { o.alive = false; }
             self.free_ids.push(id.0);
         }
+        self.alive_count_cached = self.alive_count_cached.saturating_sub(ids.len() as u32);
         ids
     }
 
@@ -409,9 +414,9 @@ impl World {
         v.into_iter().map(|(c,_)| c).collect()
     }
 
-    /// Phase 8A: Count alive objects directly (no spatial grid).
+    /// Phase 8A: Alive object count from cached counter (Tier 1 fix: O(1)).
     pub fn total_objects(&self) -> usize {
-        self.objects.iter().filter(|o| o.alive).count()
+        self.alive_count_cached as usize
     }
 
     pub fn ready_sector_count(&self) -> usize {
@@ -434,9 +439,9 @@ impl World {
             .map(|(i, o)| (i as u32, o))
     }
 
-    /// Count of alive objects (as u32 for GPU dispatch).
+    /// Count of alive objects (as u32 for GPU dispatch). Tier 1 fix: O(1).
     pub fn alive_count(&self) -> u32 {
-        self.objects.iter().filter(|o| o.alive).count() as u32
+        self.alive_count_cached
     }
 }
 
