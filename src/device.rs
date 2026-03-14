@@ -244,6 +244,7 @@ impl DeviceContext {
                 .sampler_anisotropy(true)
                 .image_cube_array(true)
                 .multi_draw_indirect(true)
+                .depth_bias_clamp(true)
                 .draw_indirect_first_instance(true);  // Phase 8A: GPU-driven rendering
 
             let device = instance.create_device(
