@@ -1,11 +1,11 @@
-// Phase 8A: GPU Frustum Culling Compute Shader
+// Phase 8B: GPU Frustum Culling Compute Shader
 // Compile: glslc shaders/cull.comp -o shaders/compiled/cull.comp.spv --target-env=vulkan1.1 --target-spv=spv1.3
 //
 // Performs frustum culling on the GPU and writes visible objects to
 // indirect command buffers for vkCmdDrawIndexedIndirectCount.
 //
-// Per-group atomic append: objects are routed to their buffer_group's
-// section of the indirect command buffer using prefix-summed base offsets.
+// Single mega buffer: all objects share one VB/IB pair, atomic append
+// directly into a flat indirect command array (no per-group routing).
 
 #version 450
 
@@ -23,7 +23,7 @@ struct ObjectData {
     uint  index_count;  //  4 bytes — 0 = slot empty, skip
     int   vertex_offset;//  4 bytes
     uint  material_id;  //  4 bytes
-    uint  buffer_group; //  4 bytes — VB/IB pair index
+    uint  _reserved0;   //  4 bytes — padding (was buffer_group)
     uint  flags;        //  4 bytes — RenderFlags bits
     float lod_bias;     //  4 bytes
     uint  _pad;         //  4 bytes
@@ -48,7 +48,6 @@ layout(set = 0, binding = 1) writeonly buffer OpaqueDraws      { DrawIndexedIndi
 layout(set = 0, binding = 2)           buffer OpaqueGroupCounts{ uint opaque_counts[];  };
 layout(set = 0, binding = 3) writeonly buffer ShadowDraws      { DrawIndexedIndirectCommand shadow_draws[];  };
 layout(set = 0, binding = 4)           buffer ShadowGroupCounts{ uint shadow_counts[];  };
-layout(set = 0, binding = 5) readonly  buffer GroupBases       { uint group_bases[];   };
 
 // ====================================================================
 //  Push Constants
@@ -129,8 +128,7 @@ void main() {
     }
 
     // Object is visible — write to opaque indirect buffer
-    uint group = obj.buffer_group;
-    uint slot = atomicAdd(opaque_counts[group], 1u) + group_bases[group];
+    uint slot = atomicAdd(opaque_counts[0], 1u);
 
     opaque_draws[slot].indexCount    = obj.index_count;
     opaque_draws[slot].instanceCount = 1u;
@@ -140,7 +138,7 @@ void main() {
 
     // If shadow caster, also write to shadow indirect buffer
     if ((obj.flags & FLAG_SHADOW_CASTER) != 0u) {
-        uint shadow_slot = atomicAdd(shadow_counts[group], 1u) + group_bases[group];
+        uint shadow_slot = atomicAdd(shadow_counts[0], 1u);
 
         shadow_draws[shadow_slot].indexCount    = obj.index_count;
         shadow_draws[shadow_slot].instanceCount = 1u;

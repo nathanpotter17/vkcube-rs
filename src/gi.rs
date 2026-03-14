@@ -2134,10 +2134,13 @@ fn upload_cubemap_faces(
     assert!(total_bytes as u64 <= staging_size,
         "Cube map mip {} ({} bytes) exceeds staging buffer", mip_level, total_bytes);
 
+    // Reset staging ring if not enough contiguous space.
+    memory_ctx.reset_staging_if_needed(total_bytes as u64);
+    let staging_base = memory_ctx.transfer.staging_offset;
     let staging_ptr = memory_ctx.staging_ptr();
 
     unsafe {
-        let mut offset = 0usize;
+        let mut offset = staging_base as usize;
         for face in faces {
             let len = face.len().min(face_bytes);
             std::ptr::copy_nonoverlapping(
@@ -2179,11 +2182,11 @@ fn upload_cubemap_faces(
             vk::DependencyFlags::empty(), &[], &[],
             std::slice::from_ref(&barrier));
 
-        // Copy each face from staging.
+        // Copy each face from staging (offsets relative to staging_base).
         let mut regions = Vec::with_capacity(6);
         for layer in 0..6u32 {
             regions.push(vk::BufferImageCopy::default()
-                .buffer_offset((layer as u64) * face_bytes as u64)
+                .buffer_offset(staging_base + (layer as u64) * face_bytes as u64)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level,
@@ -2224,6 +2227,9 @@ fn upload_cubemap_faces(
         device.queue_wait_idle(queue)?;
         device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
     }
+
+    // Sync complete — staging ring safe to reuse from offset 0.
+    memory_ctx.transfer.staging_offset = 0;
 
     Ok(())
 }

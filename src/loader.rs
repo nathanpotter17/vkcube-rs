@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::material::{material_flags, MaterialData, MaterialLibrary};
-use crate::memory::{BufferAllocation, MemoryContext};
+use crate::memory::MemoryContext;
 use crate::scene::Vertex;
 use crate::texture::TextureManager;
 
@@ -32,20 +32,16 @@ use crate::texture::TextureManager;
 //  Public types
 // ====================================================================
 
-/// A single loaded mesh: vertex/index data on the GPU plus draw parameters.
+/// A single loaded mesh: raw vertex/index data for mega buffer upload.
 pub struct LoadedMesh {
-    /// Temporary GPU allocation — freed by renderer after copying to mega buffer
-    pub vertex_alloc: BufferAllocation,
-    /// Temporary GPU allocation — freed by renderer after copying to mega buffer
-    pub index_alloc: BufferAllocation,
     pub vertex_count: u32,
     pub index_count: u32,
     pub material_id: u32,
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
-    /// Phase 8B: raw vertex bytes for mega buffer upload
+    /// Raw vertex bytes for mega buffer upload
     pub vertices_raw: Vec<u8>,
-    /// Phase 8B: raw index bytes for mega buffer upload
+    /// Raw index bytes for mega buffer upload
     pub indices_raw: Vec<u8>,
 }
 
@@ -385,33 +381,7 @@ impl GltfLoader {
                     .get(&primitive.material().index())
                     .unwrap_or(&0);
 
-                // Upload vertex buffer.
-                let vert_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        vertices.as_ptr() as *const u8,
-                        vertices.len() * std::mem::size_of::<Vertex>(),
-                    )
-                };
-                let vertex_alloc = memory_ctx.create_buffer_with_data(
-                    vert_bytes,
-                    vk::BufferUsageFlags::VERTEX_BUFFER,
-                    command_pool, queue,
-                )?;
-
-                // Upload index buffer.
-                let idx_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        indices.as_ptr() as *const u8,
-                        indices.len() * std::mem::size_of::<u32>(),
-                    )
-                };
-                let index_alloc = memory_ctx.create_buffer_with_data(
-                    idx_bytes,
-                    vk::BufferUsageFlags::INDEX_BUFFER,
-                    command_pool, queue,
-                )?;
-
-                // Phase 8B: capture raw bytes for mega buffer upload
+                // Capture raw bytes for mega buffer upload.
                 let vertices_raw = unsafe {
                     std::slice::from_raw_parts(
                         vertices.as_ptr() as *const u8,
@@ -427,15 +397,13 @@ impl GltfLoader {
                 }.to_vec();
 
                 meshes.push(LoadedMesh {
-                    vertex_alloc,
-                    index_alloc,
                     vertex_count: vertex_count as u32,
                     index_count: indices.len() as u32,
                     material_id,
                     aabb_min,
                     aabb_max,
-                    vertices_raw,  // Phase 8B
-                    indices_raw,   // Phase 8B
+                    vertices_raw,
+                    indices_raw,
                 });
 
                 println!("[GltfLoader]   Mesh '{}' primitive: {} verts, {} indices, mat_id={}",

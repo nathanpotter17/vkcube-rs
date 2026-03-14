@@ -39,8 +39,8 @@ pub const MAX_GPU_OBJECTS: u32 = 65_536;
 pub const MAX_INDIRECT_DRAWS: u32 = 65_536;
 /// Size of VkDrawIndexedIndirectCommand (20 bytes)
 pub const INDIRECT_COMMAND_STRIDE: u32 = 20;
-/// Phase 8B: single mega buffer group (retained for descriptor layout compat)
-pub const MAX_BUFFER_GROUPS: u32 = 256;
+/// Phase 8B: single mega buffer group — count buffers need only 1 u32.
+pub const DRAW_COUNT_BUFFER_SIZE: u64 = 4;
 
 /// Phase 8B: Mega vertex buffer capacity (128 MB)
 pub const MEGA_VB_SIZE: u64 = 128 * 1024 * 1024;
@@ -70,8 +70,8 @@ pub struct GpuObjectData {
     pub vertex_offset: i32,
     /// Material ID for fragment shader lookup
     pub material_id: u32,
-    /// Phase 8B: always 0 (single mega buffer). Retained for SSBO layout compat.
-    pub buffer_group: u32,
+    /// Reserved (was buffer_group pre-Phase 8B). Always 0. Kept for 128B layout.
+    pub _reserved0: u32,
     /// RenderFlags bits (SHADOW_CASTER, TRANSPARENT, etc.)
     pub flags: u32,
     /// LOD selection bias
@@ -101,7 +101,7 @@ impl GpuObjectData {
             index_count,
             vertex_offset,
             material_id,
-            buffer_group: 0, // Phase 8B: always mega buffer group 0
+            _reserved0: 0,
             flags: flags.0,
             lod_bias: 0.0,
             _pad: 0,
@@ -411,17 +411,11 @@ pub struct GpuCullResources {
     pub shadow_cmds: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
     pub shadow_cmds_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
 
-    // ---- Atomic draw count buffers (one u32 per group, double-buffered) ----
-    // Phase 8B: only index 0 is used (single mega buffer group)
+    // ---- Atomic draw count buffers (single u32, double-buffered) ----
     pub opaque_counts: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
     pub opaque_counts_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
     pub shadow_counts: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
     pub shadow_counts_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
-
-    // ---- Group base offsets (prefix sum, read by cull shader) ----
-    // Phase 8B: retained for descriptor layout compat; group_bases[0] = 0 always
-    pub group_bases: vk::Buffer,
-    pub group_bases_handle: BufferHandle,
 
     // ---- Compute pipeline ----
     pub pipeline_layout: vk::PipelineLayout,
@@ -500,8 +494,7 @@ impl GpuCullResources {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let ssbo_size = (MAX_GPU_OBJECTS as u64) * 128;
         let indirect_size = (MAX_INDIRECT_DRAWS as u64) * (INDIRECT_COMMAND_STRIDE as u64);
-        let counts_size = (MAX_BUFFER_GROUPS as u64) * 4;
-        let group_bases_size = (MAX_BUFFER_GROUPS as u64) * 4;
+        let counts_size = DRAW_COUNT_BUFFER_SIZE;
 
         // ---- Allocate Object SSBO (try ReBAR first) ----
         let (object_ssbo, object_ssbo_handle, object_ssbo_mapped) = {
@@ -627,15 +620,6 @@ impl GpuCullResources {
             cascade_count_buf_size,
         );
 
-        // ---- Allocate group base offsets buffer ----
-        let group_bases_alloc = allocator.create_buffer(
-            group_bases_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuOnly,
-        )?;
-        let group_bases = group_bases_alloc.buffer;
-        let group_bases_handle = group_bases_alloc.handle;
-
         // ---- Create cull compute descriptor set layout ----
         let cull_bindings = [
             // binding 0: GpuObjectData[] (read)
@@ -665,12 +649,6 @@ impl GpuCullResources {
             // binding 4: shadow group counts (read/write)
             vk::DescriptorSetLayoutBinding::default()
                 .binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            // binding 5: group_base_offsets[] (read) — Phase 8B: [0]=0 always
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -717,7 +695,7 @@ impl GpuCullResources {
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(6 * MAX_FRAMES_IN_FLIGHT as u32 + 1),
+                .descriptor_count(5 * MAX_FRAMES_IN_FLIGHT as u32 + 1),
         ];
 
         let descriptor_pool = unsafe {
@@ -765,10 +743,6 @@ impl GpuCullResources {
                     .buffer(shadow_counts[frame])
                     .offset(0)
                     .range(counts_size),
-                vk::DescriptorBufferInfo::default()
-                    .buffer(group_bases)
-                    .offset(0)
-                    .range(group_bases_size),
             ];
 
             let writes: Vec<_> = buffer_infos
@@ -955,8 +929,6 @@ impl GpuCullResources {
             opaque_counts_handles,
             shadow_counts,
             shadow_counts_handles,
-            group_bases,
-            group_bases_handle,
             pipeline_layout,
             pipeline,
             descriptor_set_layout,
@@ -1253,28 +1225,6 @@ impl GpuCullResources {
         }
     }
 
-    /// Phase 8B: Upload group base offsets inline. group_bases[0] = 0 always.
-    /// Retained for cull shader descriptor layout compatibility.
-    pub fn update_group_base_offsets_inline(
-        &mut self,
-        device: &Device,
-        cmd: vk::CommandBuffer,
-    ) {
-        // Phase 8B: all objects in group 0, base offset is 0
-        let base_offsets = [0u32; MAX_BUFFER_GROUPS as usize];
-        let byte_size = (MAX_BUFFER_GROUPS as usize) * 4;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                base_offsets.as_ptr() as *const u8,
-                byte_size,
-            )
-        };
-
-        unsafe {
-            device.cmd_update_buffer(cmd, self.group_bases, 0, bytes);
-        }
-    }
-
     pub fn destroy(&mut self, allocator: &mut GpuAllocator) {
         // Tier 3: destroy cascade cull resources
         unsafe {
@@ -1298,7 +1248,6 @@ impl GpuCullResources {
         }
 
         allocator.free_buffer(self.object_ssbo_handle);
-        allocator.free_buffer(self.group_bases_handle);
 
         for i in 0..MAX_FRAMES_IN_FLIGHT {
             allocator.free_buffer(self.opaque_cmds_handles[i]);

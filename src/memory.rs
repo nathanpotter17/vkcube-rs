@@ -1886,20 +1886,17 @@ impl MemoryBudget {
 // ====================================================================
 
 /// Owns all GPU memory resources: pool allocator, ring buffer, transfer
-/// queue, memory budget, and the legacy staging belt for synchronous
-/// init-time uploads.
+/// queue, and memory budget.
+///
+/// Init-time synchronous uploads reuse `TransferQueue`'s staging ring
+/// (64 MB) instead of a separate staging belt — eliminating the 64 MB
+/// HOST_VISIBLE duplication that existed in the pre-async-transfer era.
 pub struct MemoryContext {
     device: Device,
     pub allocator: GpuAllocator,
     pub ring: RingBuffer,
     pub transfer: TransferQueue,
     pub budget: MemoryBudget,
-
-    // Legacy synchronous staging belt
-    staging_buffer: vk::Buffer,
-    staging_memory: vk::DeviceMemory,
-    staging_mapped: NonNull<u8>,
-    staging_size: u64,
 }
 
 unsafe impl Send for MemoryContext {}
@@ -1927,59 +1924,12 @@ impl MemoryContext {
 
         let budget = MemoryBudget::new(&memory_properties);
 
-        // ---- legacy reusable staging buffer ----
-        let staging_info = vk::BufferCreateInfo::default()
-            .size(STAGING_BUFFER_SIZE)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let staging_buffer = unsafe { device.create_buffer(&staging_info, None)? };
-        let staging_req =
-            unsafe { device.get_buffer_memory_requirements(staging_buffer) };
-
-        let required = vk::MemoryPropertyFlags::HOST_VISIBLE
-            | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let staging_type = (0..memory_properties.memory_type_count)
-            .find(|&i| {
-                (staging_req.memory_type_bits & (1 << i)) != 0
-                    && memory_properties.memory_types[i as usize]
-                        .property_flags
-                        .contains(required)
-            })
-            .ok_or("No memory type for staging buffer")?;
-
-        let staging_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(staging_req.size)
-            .memory_type_index(staging_type);
-        let staging_memory = unsafe { device.allocate_memory(&staging_alloc, None)? };
-        unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0)? }
-
-        let raw = unsafe {
-            device.map_memory(
-                staging_memory,
-                0,
-                STAGING_BUFFER_SIZE,
-                vk::MemoryMapFlags::empty(),
-            )?
-        };
-        let staging_mapped =
-            NonNull::new(raw as *mut u8).ok_or("Failed to map staging")?;
-
-        println!(
-            "[MemoryContext] Legacy staging belt: {} MB",
-            STAGING_BUFFER_SIZE / (1024 * 1024),
-        );
-
         Ok(Self {
             device,
             allocator,
             ring,
             transfer,
             budget,
-            staging_buffer,
-            staging_memory,
-            staging_mapped,
-            staging_size: STAGING_BUFFER_SIZE,
         })
     }
 
@@ -2070,10 +2020,10 @@ impl MemoryContext {
     ) -> Result<BufferAllocation, Box<dyn std::error::Error>> {
         let size = data.len() as u64;
         assert!(
-            size <= self.staging_size,
-            "Upload {} B exceeds staging belt {} B",
+            size <= self.transfer.staging_size,
+            "Upload {} B exceeds transfer staging belt {} B",
             size,
-            self.staging_size,
+            self.transfer.staging_size,
         );
 
         let alloc = self.allocator.create_buffer(
@@ -2082,13 +2032,20 @@ impl MemoryContext {
             MemoryLocation::GpuOnly,
         )?;
 
+        // Use TransferQueue's staging ring for the CPU→GPU copy.
+        if self.transfer.staging_offset + size > self.transfer.staging_size {
+            self.transfer.staging_offset = 0;
+        }
+        let staging_offset = self.transfer.staging_offset;
+
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                self.staging_mapped.as_ptr(),
+                self.transfer.staging_mapped.as_ptr().add(staging_offset as usize),
                 data.len(),
             );
         }
+        self.transfer.staging_offset += align_up(size, 64);
 
         unsafe {
             let cmd_info = vk::CommandBufferAllocateInfo::default()
@@ -2103,10 +2060,13 @@ impl MemoryContext {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
-            let region = vk::BufferCopy::default().size(size);
+            let region = vk::BufferCopy::default()
+                .src_offset(staging_offset)
+                .dst_offset(0)
+                .size(size);
             self.device.cmd_copy_buffer(
                 cmd,
-                self.staging_buffer,
+                self.transfer.staging_buffer,
                 alloc.buffer,
                 std::slice::from_ref(&region),
             );
@@ -2122,6 +2082,11 @@ impl MemoryContext {
             self.device
                 .free_command_buffers(command_pool, std::slice::from_ref(&cmd));
         }
+
+        // Sync complete — entire staging ring is safe to reuse from offset 0.
+        // Keeps init-time uploads cache-hot at ring start instead of advancing
+        // through 64 MB of cold staging memory.
+        self.transfer.staging_offset = 0;
 
         Ok(alloc)
     }
@@ -2143,17 +2108,24 @@ impl MemoryContext {
     }
 
     // ----------------------------------------------------------------
-    //  Staging buffer accessors (for bulk uploads in gi.rs, etc.)
+    //  Staging buffer accessors (via TransferQueue)
     // ----------------------------------------------------------------
 
-    /// Raw staging buffer handle (for vkCmdCopyBufferToImage).
-    pub fn staging_buffer(&self) -> vk::Buffer { self.staging_buffer }
+    /// Transfer staging buffer handle (for vkCmdCopyBufferToImage).
+    pub fn staging_buffer(&self) -> vk::Buffer { self.transfer.staging_buffer }
 
     /// Staging buffer capacity in bytes.
-    pub fn staging_size(&self) -> u64 { self.staging_size }
+    pub fn staging_size(&self) -> u64 { self.transfer.staging_size }
 
     /// Raw mapped pointer into the staging buffer.
-    pub fn staging_ptr(&self) -> *mut u8 { self.staging_mapped.as_ptr() }
+    pub fn staging_ptr(&self) -> *mut u8 { self.transfer.staging_mapped.as_ptr() }
+
+    /// Reset transfer staging ring to beginning if needed for large uploads.
+    pub fn reset_staging_if_needed(&mut self, required: u64) {
+        if self.transfer.staging_offset + required > self.transfer.staging_size {
+            self.transfer.staging_offset = 0;
+        }
+    }
 
     /// Create a device-local VkImage and upload pixel data synchronously.
     /// Returns the image in `SHADER_READ_ONLY_OPTIMAL` layout.
@@ -2167,7 +2139,7 @@ impl MemoryContext {
         queue: vk::Queue,
     ) -> Result<ImageAllocation, Box<dyn std::error::Error>> {
         let size = data.len() as u64;
-        assert!(size <= self.staging_size);
+        assert!(size <= self.transfer.staging_size);
 
         let alloc = self.allocator.create_image(
             width,
@@ -2178,13 +2150,22 @@ impl MemoryContext {
             MemoryLocation::GpuOnly,
         )?;
 
+        // Use TransferQueue's staging ring.
+        if self.transfer.staging_offset + size > self.transfer.staging_size {
+            self.transfer.staging_offset = 0;
+        }
+        let staging_offset = self.transfer.staging_offset;
+
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                self.staging_mapped.as_ptr(),
+                self.transfer.staging_mapped.as_ptr().add(staging_offset as usize),
                 data.len(),
             );
+        }
+        self.transfer.staging_offset += align_up(size, 64);
 
+        unsafe {
             let cmd_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
@@ -2225,7 +2206,7 @@ impl MemoryContext {
             );
 
             let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
+                .buffer_offset(staging_offset)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
@@ -2236,7 +2217,7 @@ impl MemoryContext {
 
             self.device.cmd_copy_buffer_to_image(
                 cmd,
-                self.staging_buffer,
+                self.transfer.staging_buffer,
                 alloc.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 std::slice::from_ref(&region),
@@ -2280,6 +2261,9 @@ impl MemoryContext {
             self.device
                 .free_command_buffers(command_pool, std::slice::from_ref(&cmd));
         }
+
+        // Sync complete — staging ring safe to reuse from offset 0.
+        self.transfer.staging_offset = 0;
 
         Ok(alloc)
     }
@@ -2485,7 +2469,7 @@ impl MemoryContext {
     ) -> Result<ImageAllocation, Box<dyn std::error::Error>> {
         let mip_levels = Self::compute_mip_levels(width, height);
         let size = data.len() as u64;
-        assert!(size <= self.staging_size);
+        assert!(size <= self.transfer.staging_size);
 
         let alloc = self.allocator.create_image(
             width, height, format,
@@ -2496,14 +2480,20 @@ impl MemoryContext {
             MemoryLocation::GpuOnly,
         )?;
 
-        // Copy data into staging buffer.
+        // Copy data into TransferQueue's staging ring.
+        if self.transfer.staging_offset + size > self.transfer.staging_size {
+            self.transfer.staging_offset = 0;
+        }
+        let staging_offset = self.transfer.staging_offset;
+
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                self.staging_mapped.as_ptr(),
+                self.transfer.staging_mapped.as_ptr().add(staging_offset as usize),
                 data.len(),
             );
         }
+        self.transfer.staging_offset += align_up(size, 64);
 
         unsafe {
             let cmd = self.begin_one_time_cmd(command_pool)?;
@@ -2535,7 +2525,7 @@ impl MemoryContext {
 
             // Copy staging → base mip (level 0).
             let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
+                .buffer_offset(staging_offset)
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
@@ -2545,7 +2535,7 @@ impl MemoryContext {
                 .image_extent(vk::Extent3D { width, height, depth: 1 });
             self.device.cmd_copy_buffer_to_image(
                 cmd,
-                self.staging_buffer,
+                self.transfer.staging_buffer,
                 alloc.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 std::slice::from_ref(&region),
@@ -2558,6 +2548,9 @@ impl MemoryContext {
             self.device.queue_wait_idle(queue)?;
             self.device.free_command_buffers(command_pool, std::slice::from_ref(&cmd));
         }
+
+        // Sync complete — staging ring safe to reuse from offset 0.
+        self.transfer.staging_offset = 0;
 
         // Now generate the mip chain (transitions all levels to SHADER_READ_ONLY).
         self.generate_mipmaps(alloc.image, width, height, mip_levels, command_pool, queue)?;
@@ -2611,11 +2604,6 @@ impl Drop for MemoryContext {
             self.device.unmap_memory(self.ring.memory);
             self.device.destroy_buffer(self.ring.buffer, None);
             self.device.free_memory(self.ring.memory, None);
-
-            // Legacy staging belt.
-            self.device.unmap_memory(self.staging_memory);
-            self.device.destroy_buffer(self.staging_buffer, None);
-            self.device.free_memory(self.staging_memory, None);
 
             // TransferQueue::drop runs automatically.
             // GpuAllocator::drop runs after this method.

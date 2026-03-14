@@ -27,7 +27,8 @@ use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
                  PROBE_CAPTURE_NEAR, PROBE_CAPTURE_FAR, PROBE_CAPTURE_SIZE};
 use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
                        CascadeCullPushConstants,
-                       MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
+                       MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS,
+                       DRAW_COUNT_BUFFER_SIZE};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightCategory, LightManager, LightType,
     ShadowAtlas, ShadowBudgetManager, ShadowLod, ShadowPushConstants,
@@ -312,10 +313,6 @@ impl Renderer {
                                 gpu_cull.mega.index_buffer,
                                 mega_alloc.index_offset_bytes,
                             ).expect("Failed to upload glTF indices to mega buffer");
- 
-                            // Free temporary per-mesh GPU allocations
-                            memory_ctx.allocator.free_buffer(mesh.vertex_alloc.handle);
-                            memory_ctx.allocator.free_buffer(mesh.index_alloc.handle);
  
                             let bounds = Aabb::new(
                                 [
@@ -993,9 +990,8 @@ impl Renderer {
             // ════════════════════════════════════════════════════════════
             // STEP 4: Zero count buffers (vkCmdFillBuffer)
             // ════════════════════════════════════════════════════════════
-            let count_size = (MAX_BUFFER_GROUPS as u64) * 4;
-            self.device.cmd_fill_buffer(cmd, self.gpu_cull.opaque_counts[f], 0, count_size, 0);
-            self.device.cmd_fill_buffer(cmd, self.gpu_cull.shadow_counts[f], 0, count_size, 0);
+            self.device.cmd_fill_buffer(cmd, self.gpu_cull.opaque_counts[f], 0, DRAW_COUNT_BUFFER_SIZE, 0);
+            self.device.cmd_fill_buffer(cmd, self.gpu_cull.shadow_counts[f], 0, DRAW_COUNT_BUFFER_SIZE, 0);
 
             // Tier 3: zero per-cascade count buffers (covers aligned stride padding)
             let cascade_count_total_size = CASCADE_COUNT as u64 * self.gpu_cull.cascade_count_stride;
@@ -1037,7 +1033,6 @@ impl Renderer {
             // ════════════════════════════════════════════════════════════
             // STEP 6: GPU Cull Dispatch
             // ════════════════════════════════════════════════════════════
-            self.gpu_cull.update_group_base_offsets_inline(&device_ctx.device, cmd);
 
             let cull_push = CullPushConstants::new(&frustum, camera_pos, self.gpu_cull.total_alive);
 
