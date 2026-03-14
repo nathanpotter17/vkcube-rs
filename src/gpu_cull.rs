@@ -9,6 +9,13 @@
 //! - BufferGroup eliminated: all geometry in mega buffers, single bind per pass
 //! - Cull shader uses single atomic counter (buffer_group always 0)
 //!
+//! Tier 3 additions:
+//! - Per-cascade indirect command buffers + count buffers (double-buffered)
+//! - CascadeCullPushConstants: 100 bytes, cascade frustum + total_objects
+//! - Separate cascade_cull compute pipeline with its own descriptor set layout
+//! - cascade_cull_descriptor_sets[frame][cascade]: each binds cascade-specific
+//!   region of the shared indirect buffer
+//!
 //! Key invariants:
 //! - `flush_dirty()` MUST be called AFTER `wait_for_fences()` (§3.3)
 //! - Pre-cull barrier must include VERTEX_SHADER|FRAGMENT_SHADER src (§3.4)
@@ -17,6 +24,7 @@
 use ash::{vk, Device};
 use std::ptr::NonNull;
 
+use crate::light::CASCADE_COUNT;
 use crate::memory::{
     BufferAllocation, BufferHandle, GpuAllocator, MemoryContext, MemoryLocation,
     MAX_FRAMES_IN_FLIGHT,
@@ -129,6 +137,33 @@ impl CullPushConstants {
         Self {
             frustum_planes: *frustum,
             camera_pos,
+            total_objects,
+        }
+    }
+}
+
+// ====================================================================
+//  Tier 3: CascadeCullPushConstants — 100 bytes
+// ====================================================================
+
+/// Push constants for per-cascade shadow cull compute dispatch.
+/// Passes the cascade's light-space frustum planes so the shader culls
+/// against the cascade volume rather than the camera frustum.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CascadeCullPushConstants {
+    /// Six frustum planes extracted from the cascade's combined VP matrix.
+    pub frustum_planes: [[f32; 4]; 6],
+    /// Total number of objects to process (same as main cull dispatch).
+    pub total_objects: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<CascadeCullPushConstants>() == 100);
+
+impl CascadeCullPushConstants {
+    pub fn new(frustum: &[[f32; 4]; 6], total_objects: u32) -> Self {
+        Self {
+            frustum_planes: *frustum,
             total_objects,
         }
     }
@@ -399,6 +434,32 @@ pub struct GpuCullResources {
     pub object_ssbo_set_layout: vk::DescriptorSetLayout,
     pub object_ssbo_set: vk::DescriptorSet,
 
+    // ---- Tier 3: Per-cascade shadow cull resources ----
+    // Each frame has one indirect buffer (CASCADE_COUNT regions) and one count buffer
+    // (CASCADE_COUNT u32s). Descriptor sets select the region via buffer offset.
+
+    /// Per-cascade indirect command buffers (double-buffered).
+    /// Layout: CASCADE_COUNT contiguous regions of MAX_INDIRECT_DRAWS commands each.
+    pub cascade_indirect: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
+    cascade_indirect_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
+
+    /// Per-cascade atomic draw counts (double-buffered).
+    /// Layout: CASCADE_COUNT contiguous u32s.
+    pub cascade_counts: [vk::Buffer; MAX_FRAMES_IN_FLIGHT],
+    cascade_counts_handles: [BufferHandle; MAX_FRAMES_IN_FLIGHT],
+
+    /// Cascade cull compute pipeline (separate from main cull).
+    pub cascade_cull_pipeline: vk::Pipeline,
+    pub cascade_cull_pipeline_layout: vk::PipelineLayout,
+    cascade_cull_descriptor_set_layout: vk::DescriptorSetLayout,
+    cascade_cull_descriptor_pool: vk::DescriptorPool,
+    /// [frame][cascade] — each set binds the cascade-specific buffer region.
+    pub cascade_cull_descriptor_sets: [[vk::DescriptorSet; CASCADE_COUNT]; MAX_FRAMES_IN_FLIGHT],
+
+    /// Byte stride between cascade count u32s in cascade_counts buffer.
+    /// Equal to minStorageBufferOffsetAlignment (typically 64).
+    pub cascade_count_stride: u64,
+
     // ---- Dirty object queue ----
     pub dirty_objects: Vec<(u32, GpuObjectData)>,
     /// Tier 1 fix: O(1) lookup — object ID → index in dirty_objects vec.
@@ -435,6 +496,7 @@ impl GpuCullResources {
     pub fn new(
         device: &Device,
         allocator: &mut GpuAllocator,
+        min_ssbo_alignment: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let ssbo_size = (MAX_GPU_OBJECTS as u64) * 128;
         let indirect_size = (MAX_INDIRECT_DRAWS as u64) * (INDIRECT_COMMAND_STRIDE as u64);
@@ -523,6 +585,47 @@ impl GpuCullResources {
             shadow_counts[i] = alloc2.buffer;
             shadow_counts_handles[i] = alloc2.handle;
         }
+
+        // ---- Tier 3: Allocate per-cascade indirect + count buffers ----
+        let cascade_indirect_size =
+            CASCADE_COUNT as u64 * MAX_INDIRECT_DRAWS as u64 * INDIRECT_COMMAND_STRIDE as u64;
+        // Each cascade's atomic count u32 must sit at a minStorageBufferOffsetAlignment
+        // boundary for descriptor binding. Stride between cascades is the alignment.
+        let cascade_count_stride = min_ssbo_alignment.max(4);
+        let cascade_count_buf_size = CASCADE_COUNT as u64 * cascade_count_stride;
+
+        let mut cascade_indirect = [vk::Buffer::null(); MAX_FRAMES_IN_FLIGHT];
+        let mut cascade_indirect_handles = [BufferHandle(0); MAX_FRAMES_IN_FLIGHT];
+        let mut cascade_counts_buf = [vk::Buffer::null(); MAX_FRAMES_IN_FLIGHT];
+        let mut cascade_counts_handles = [BufferHandle(0); MAX_FRAMES_IN_FLIGHT];
+
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            let alloc = allocator.create_buffer(
+                cascade_indirect_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly,
+            )?;
+            cascade_indirect[i] = alloc.buffer;
+            cascade_indirect_handles[i] = alloc.handle;
+
+            let alloc2 = allocator.create_buffer(
+                cascade_count_buf_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly,
+            )?;
+            cascade_counts_buf[i] = alloc2.buffer;
+            cascade_counts_handles[i] = alloc2.handle;
+        }
+
+        println!(
+            "[GpuCull] Tier 3: CascadeIndirect={:.2}MB×2, CascadeCounts={}B×2",
+            cascade_indirect_size as f64 / (1024.0 * 1024.0),
+            cascade_count_buf_size,
+        );
 
         // ---- Allocate group base offsets buffer ----
         let group_bases_alloc = allocator.create_buffer(
@@ -703,8 +806,129 @@ impl GpuCullResources {
 
         unsafe { device.update_descriptor_sets(std::slice::from_ref(&ssbo_write), &[]) };
 
+        // ---- Tier 3: Create cascade cull descriptor set layout ----
+        let cascade_cull_bindings = [
+            // binding 0: GpuObjectData[] (read) — same SSBO as main cull
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // binding 1: DrawIndexedIndirectCommand[] (write, cascade-specific region)
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // binding 2: cascade_count atomic u32 (read/write, cascade-specific offset)
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+
+        let cascade_cull_descriptor_set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&cascade_cull_bindings),
+                None,
+            )?
+        };
+
+        // ---- Tier 3: Cascade cull pipeline layout ----
+        let cascade_push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<CascadeCullPushConstants>() as u32);
+
+        let cascade_cull_pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(std::slice::from_ref(&cascade_cull_descriptor_set_layout))
+                    .push_constant_ranges(std::slice::from_ref(&cascade_push_range)),
+                None,
+            )?
+        };
+
+        // ---- Tier 3: Cascade cull descriptor pool ----
+        let cascade_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(3 * CASCADE_COUNT as u32 * MAX_FRAMES_IN_FLIGHT as u32),
+        ];
+        let cascade_cull_descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(CASCADE_COUNT as u32 * MAX_FRAMES_IN_FLIGHT as u32)
+                    .pool_sizes(&cascade_pool_sizes),
+                None,
+            )?
+        };
+
+        // ---- Tier 3: Allocate + write cascade cull descriptor sets ----
+        let cascade_set_layouts: Vec<_> = (0..CASCADE_COUNT * MAX_FRAMES_IN_FLIGHT)
+            .map(|_| cascade_cull_descriptor_set_layout)
+            .collect();
+
+        let cascade_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(cascade_cull_descriptor_pool)
+            .set_layouts(&cascade_set_layouts);
+
+        let cascade_sets_flat = unsafe { device.allocate_descriptor_sets(&cascade_alloc_info)? };
+
+        let mut cascade_cull_descriptor_sets =
+            [[vk::DescriptorSet::null(); CASCADE_COUNT]; MAX_FRAMES_IN_FLIGHT];
+
+        let indirect_region_size =
+            MAX_INDIRECT_DRAWS as u64 * INDIRECT_COMMAND_STRIDE as u64;
+
+        for frame in 0..MAX_FRAMES_IN_FLIGHT {
+            for cascade in 0..CASCADE_COUNT {
+                let set_idx = frame * CASCADE_COUNT + cascade;
+                let set = cascade_sets_flat[set_idx];
+                cascade_cull_descriptor_sets[frame][cascade] = set;
+
+                let buffer_infos = [
+                    // binding 0: full object SSBO
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(object_ssbo)
+                        .offset(0)
+                        .range(ssbo_size),
+                    // binding 1: cascade-specific indirect command region
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(cascade_indirect[frame])
+                        .offset(cascade as u64 * indirect_region_size)
+                        .range(indirect_region_size),
+                    // binding 2: cascade-specific count u32 (aligned to minStorageBufferOffsetAlignment)
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(cascade_counts_buf[frame])
+                        .offset(cascade as u64 * cascade_count_stride)
+                        .range(4),
+                ];
+
+                let writes: Vec<_> = buffer_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(binding, info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(binding as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(info))
+                    })
+                    .collect();
+
+                unsafe { device.update_descriptor_sets(&writes, &[]) };
+            }
+        }
+
         // ---- Load and create cull compute pipeline ----
         let pipeline = Self::create_cull_pipeline(device, pipeline_layout)?;
+
+        // ---- Tier 3: Create cascade cull compute pipeline ----
+        let cascade_cull_pipeline =
+            Self::create_cascade_cull_pipeline(device, cascade_cull_pipeline_layout)?;
 
         // ---- Phase 8B: Create mega buffers ----
         let mega = MegaBuffers::new(allocator)?;
@@ -740,6 +964,16 @@ impl GpuCullResources {
             descriptor_sets,
             object_ssbo_set_layout,
             object_ssbo_set,
+            cascade_indirect,
+            cascade_indirect_handles,
+            cascade_counts: cascade_counts_buf,
+            cascade_counts_handles,
+            cascade_cull_pipeline,
+            cascade_cull_pipeline_layout,
+            cascade_cull_descriptor_set_layout,
+            cascade_cull_descriptor_pool,
+            cascade_cull_descriptor_sets,
+            cascade_count_stride,
             dirty_objects: Vec::with_capacity(1024),
             dirty_index: std::collections::HashMap::with_capacity(1024),
             mega,
@@ -755,6 +989,45 @@ impl GpuCullResources {
         layout: vk::PipelineLayout,
     ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
         let shader_code = std::fs::read("shaders/compiled/cull.comp.spv")?;
+        let shader_code_aligned: Vec<u32> = shader_code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let shader_module = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&shader_code_aligned),
+                None,
+            )?
+        };
+
+        let entry_name = c"main";
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(entry_name);
+
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage_info)
+            .layout(layout);
+
+        let pipeline = unsafe {
+            device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, e)| e)?[0]
+        };
+
+        unsafe { device.destroy_shader_module(shader_module, None) };
+
+        Ok(pipeline)
+    }
+
+    /// Tier 3: Load and create the per-cascade shadow cull compute pipeline.
+    fn create_cascade_cull_pipeline(
+        device: &Device,
+        layout: vk::PipelineLayout,
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        let shader_code = std::fs::read("shaders/compiled/cascade_cull.comp.spv")?;
         let shader_code_aligned: Vec<u32> = shader_code
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1003,6 +1276,19 @@ impl GpuCullResources {
     }
 
     pub fn destroy(&mut self, allocator: &mut GpuAllocator) {
+        // Tier 3: destroy cascade cull resources
+        unsafe {
+            self.device.destroy_pipeline(self.cascade_cull_pipeline, None);
+            self.device.destroy_pipeline_layout(self.cascade_cull_pipeline_layout, None);
+            self.device.destroy_descriptor_pool(self.cascade_cull_descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.cascade_cull_descriptor_set_layout, None);
+        }
+
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            allocator.free_buffer(self.cascade_indirect_handles[i]);
+            allocator.free_buffer(self.cascade_counts_handles[i]);
+        }
+
         unsafe {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);

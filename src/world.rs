@@ -449,15 +449,17 @@ impl World {
 //  Frustum helpers
 // ====================================================================
 
+/// Tier 2: Branchless AABB-vs-frustum test via AVX2.
+///
+/// Delegates to `simd_math::aabb_visible` which uses `_mm_blendv_ps` for
+/// branchless p-vertex selection across all 6 planes. On mixed visible/
+/// invisible workloads this eliminates branch misprediction penalties
+/// (~2-4 cycles per mispredict × 6 planes × thousands of objects).
+///
+/// Scalar fallback on non-AVX2 hardware produces identical results.
 #[inline]
 pub fn aabb_visible(frustum: &[[f32;4];6], mn: [f32;3], mx: [f32;3]) -> bool {
-    for p in frustum {
-        let px = if p[0]>=0.0 {mx[0]} else {mn[0]};
-        let py = if p[1]>=0.0 {mx[1]} else {mn[1]};
-        let pz = if p[2]>=0.0 {mx[2]} else {mn[2]};
-        if p[0]*px + p[1]*py + p[2]*pz + p[3] < 0.0 { return false; }
-    }
-    true
+    crate::simd_math::aabb_visible(frustum, mn, mx)
 }
 
 // Phase 8A: frustum_aabb_xz REMOVED - not needed with GPU culling.

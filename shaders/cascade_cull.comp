@@ -1,0 +1,137 @@
+// Tier 3: Per-Cascade Frustum Culling Compute Shader
+// Compile: glslc shaders/cascade_cull.comp -o shaders/compiled/cascade_cull.comp.spv --target-env=vulkan1.1 --target-spv=spv1.3
+//
+// Culls shadow-casting objects against a single cascade's light-space
+// frustum planes.  Produces a per-cascade indirect command buffer consumed
+// by vkCmdDrawIndexedIndirectCount during cascade shadow rendering.
+//
+// Dispatched once per cascade (CASCADE_COUNT × per frame).  Each dispatch
+// binds a descriptor set whose binding 1/2 point to a cascade-specific
+// region of the shared indirect buffer and count buffer.
+//
+// Key differences from cull.comp:
+//   - Only processes SHADOW_CASTER flagged objects (no opaque output)
+//   - Frustum planes come from cascade VP matrix, not camera VP
+//   - No buffer_group routing (Phase 8B single-group simplification)
+//   - No group_bases indirection — writes at atomicAdd offset directly
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ====================================================================
+//  Data Structures (must match Rust GpuObjectData — 128 bytes)
+// ====================================================================
+
+struct ObjectData {
+    mat4  model;        // 64 bytes
+    vec4  aabb_min;     // 16 bytes (w unused)
+    vec4  aabb_max;     // 16 bytes (w unused)
+    uint  first_index;  //  4 bytes
+    uint  index_count;  //  4 bytes — 0 = slot empty, skip
+    int   vertex_offset;//  4 bytes
+    uint  material_id;  //  4 bytes
+    uint  buffer_group; //  4 bytes
+    uint  flags;        //  4 bytes — RenderFlags bits
+    float lod_bias;     //  4 bytes
+    uint  _pad;         //  4 bytes
+};
+
+struct DrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+// ====================================================================
+//  Descriptor Bindings
+// ====================================================================
+
+// binding 0: persistent object SSBO (same buffer as cull.comp binding 0)
+layout(set = 0, binding = 0) readonly  buffer Objects      { ObjectData objects[];                       };
+// binding 1: per-cascade indirect command buffer (descriptor offset selects cascade region)
+layout(set = 0, binding = 1) writeonly buffer CascadeDraws { DrawIndexedIndirectCommand cascade_draws[]; };
+// binding 2: per-cascade atomic draw count (descriptor offset selects cascade's u32)
+layout(set = 0, binding = 2)           buffer CascadeCount { uint cascade_count;                          };
+
+// ====================================================================
+//  Push Constants — 100 bytes
+// ====================================================================
+
+layout(push_constant) uniform CascadeCullParams {
+    vec4  frustum[6];     // 96 bytes — cascade light-space frustum planes (Ax+By+Cz+D)
+    uint  total_objects;  //  4 bytes
+};
+
+// ====================================================================
+//  RenderFlags Constants (must match Rust RenderFlags / cull.comp)
+// ====================================================================
+
+const uint FLAG_SHADOW_CASTER = 1u;   // 1 << 0
+const uint FLAG_TRANSPARENT   = 16u;  // 1 << 4
+
+// ====================================================================
+//  Frustum Test — identical to cull.comp
+// ====================================================================
+
+bool frustum_test(vec3 aabb_min, vec3 aabb_max) {
+    for (int i = 0; i < 6; i++) {
+        vec3 p;
+        p.x = frustum[i].x >= 0.0 ? aabb_max.x : aabb_min.x;
+        p.y = frustum[i].y >= 0.0 ? aabb_max.y : aabb_min.y;
+        p.z = frustum[i].z >= 0.0 ? aabb_max.z : aabb_min.z;
+
+        if (dot(frustum[i].xyz, p) + frustum[i].w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ====================================================================
+//  Main
+// ====================================================================
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    if (id >= total_objects) {
+        return;
+    }
+
+    ObjectData obj = objects[id];
+
+    // Skip empty/dead slots
+    if (obj.index_count == 0u) {
+        return;
+    }
+    if (obj.flags == 0u) {
+        return;
+    }
+
+    // Only shadow casters participate in cascade shadow maps
+    if ((obj.flags & FLAG_SHADOW_CASTER) == 0u) {
+        return;
+    }
+
+    // Skip transparent objects (same as cull.comp)
+    if ((obj.flags & FLAG_TRANSPARENT) != 0u) {
+        return;
+    }
+
+    // Frustum cull against this cascade's light-space frustum
+    if (!frustum_test(obj.aabb_min.xyz, obj.aabb_max.xyz)) {
+        return;
+    }
+
+    // Object is visible in this cascade — append indirect draw command
+    uint slot = atomicAdd(cascade_count, 1u);
+
+    cascade_draws[slot].indexCount    = obj.index_count;
+    cascade_draws[slot].instanceCount = 1u;
+    cascade_draws[slot].firstIndex    = obj.first_index;
+    cascade_draws[slot].vertexOffset  = obj.vertex_offset;
+    cascade_draws[slot].firstInstance = id;  // vertex shader reads SSBO[gl_InstanceIndex]
+}

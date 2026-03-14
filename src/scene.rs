@@ -245,22 +245,19 @@ impl Camera {
         self.aspect = width as f32 / height as f32;
     }
 
+    /// Tier 2: Consolidated frustum plane extraction.
+    ///
+    /// Delegates VP multiply to `simd_math::multiply_matrices` (FMA precision)
+    /// and plane extraction+normalization to `simd_math::extract_frustum_planes_from_vp`
+    /// (AVX2 vectorized normalization with Newton-Raphson rsqrt).
+    ///
+    /// Previously this method duplicated inline VP multiply + plane extraction
+    /// + normalization logic. Now a single codepath through simd_math ensures
+    /// all callers (renderer cascade builder, world sector priority, light cull)
+    /// get identical, FMA-precise planes.
     pub fn extract_frustum_planes(&self) -> [[f32; 4]; 6] {
         let vp = multiply_matrices(self.get_view_matrix(), self.get_projection_matrix());
-        let row = |r: usize| [vp[0][r], vp[1][r], vp[2][r], vp[3][r]];
-        let r0 = row(0); let r1 = row(1); let r2 = row(2); let r3 = row(3);
-        let add = |a: [f32;4], b: [f32;4]| [a[0]+b[0],a[1]+b[1],a[2]+b[2],a[3]+b[3]];
-        let sub = |a: [f32;4], b: [f32;4]| [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]];
-        let norm = |mut p: [f32;4]| {
-            let len = (p[0]*p[0]+p[1]*p[1]+p[2]*p[2]).sqrt();
-            if len > 0.0 { p[0]/=len; p[1]/=len; p[2]/=len; p[3]/=len; }
-            p
-        };
-        [
-            norm(add(r3, r0)), norm(sub(r3, r0)),
-            norm(add(r3, r1)), norm(sub(r3, r1)),
-            norm(add(r3, r2)), norm(sub(r3, r2)),
-        ]
+        extract_frustum_planes_from_vp(&vp)
     }
 }
 
@@ -342,32 +339,34 @@ fn create_translation_matrix(t: [f32; 3]) -> [[f32; 4]; 4] {
     [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[t[0],t[1],t[2],1.0]]
 }
 
+/// Tier 2: FMA-accelerated 4×4 matrix multiply.
+///
+/// Delegates to `simd_math::multiply_matrices` which uses AVX2+FMA when
+/// available at runtime, falling back to scalar otherwise.
+///
+/// FMA eliminates one rounding step per multiply-add (`rn(a*b + c)` vs
+/// `rn(rn(a*b) + c)`), directly improving cascade shadow seam precision,
+/// frustum plane tightness, and probe capture VP fidelity.
+///
+/// Drop-in replacement: all existing callsites (renderer.rs, Camera,
+/// CascadeBuilder, etc.) automatically gain FMA precision.
 pub fn multiply_matrices(a: [[f32;4];4], b: [[f32;4];4]) -> [[f32;4];4] {
-    let mut r = [[0.0;4];4];
-    for i in 0..4 { for j in 0..4 { for k in 0..4 { r[i][j] += a[i][k]*b[k][j]; } } }
-    r
+    crate::simd_math::multiply_matrices(a, b)
 }
 
-/// Extract frustum planes from a pre-computed view-projection matrix.
+/// Tier 2: Vectorized frustum plane extraction from view-projection matrix.
+///
+/// Delegates to `simd_math::extract_frustum_planes_from_vp` which uses AVX2
+/// for SIMD normalization of all 6 planes with Newton-Raphson refined rsqrt.
+///
+/// Produces tighter planes than scalar sqrt → more accurate culling → fewer
+/// pop-in artifacts at frustum edges.
 ///
 /// Use this when the VP product is already available to avoid
 /// recomputing `view * proj` (saves one 4×4 matrix multiply +
 /// two matrix getter calls compared to `Camera::extract_frustum_planes`).
 pub fn extract_frustum_planes_from_vp(vp: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
-    let row = |r: usize| [vp[0][r], vp[1][r], vp[2][r], vp[3][r]];
-    let r0 = row(0); let r1 = row(1); let r2 = row(2); let r3 = row(3);
-    let add = |a: [f32;4], b: [f32;4]| [a[0]+b[0],a[1]+b[1],a[2]+b[2],a[3]+b[3]];
-    let sub = |a: [f32;4], b: [f32;4]| [a[0]-b[0],a[1]-b[1],a[2]-b[2],a[3]-b[3]];
-    let norm = |mut p: [f32;4]| {
-        let len = (p[0]*p[0]+p[1]*p[1]+p[2]*p[2]).sqrt();
-        if len > 0.0 { p[0]/=len; p[1]/=len; p[2]/=len; p[3]/=len; }
-        p
-    };
-    [
-        norm(add(r3, r0)), norm(sub(r3, r0)),
-        norm(add(r3, r1)), norm(sub(r3, r1)),
-        norm(add(r3, r2)), norm(sub(r3, r2)),
-    ]
+    crate::simd_math::extract_frustum_planes_from_vp(vp)
 }
 
 /// Compute the inverse of a perspective projection matrix.

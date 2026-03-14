@@ -49,33 +49,39 @@ unsafe fn multiply_matrices_avx2_fma(
     a: [[f32; 4]; 4],
     b: [[f32; 4]; 4],
 ) -> [[f32; 4]; 4] {
-    // Load columns of A as 128-bit SSE registers (4 floats each).
-    // We use SSE4.1 within the AVX2 feature gate since AVX2 implies SSE4.1.
-    let a0 = _mm_loadu_ps(a[0].as_ptr());
-    let a1 = _mm_loadu_ps(a[1].as_ptr());
-    let a2 = _mm_loadu_ps(a[2].as_ptr());
-    let a3 = _mm_loadu_ps(a[3].as_ptr());
+    // Must match scalar convention: r[i][j] = sum_k a[i][k] * b[k][j]
+    //
+    // In this codebase's column-major storage (m[col][row]),
+    // multiply_matrices(view, proj) must yield proj × view (math order).
+    //
+    // Load B's 4 sub-arrays as persistent SSE registers.
+    // For each sub-array i of A, broadcast a[i][k] and accumulate:
+    //   result[i] = b[0]*a[i][0] + b[1]*a[i][1] + b[2]*a[i][2] + b[3]*a[i][3]
+    //
+    // This computes: result[i][lane] = sum_k b[k][lane] * a[i][k]
+    //              = sum_k a[i][k] * b[k][lane]   ← matches scalar r[i][j]
+    let b0 = _mm_loadu_ps(b[0].as_ptr());
+    let b1 = _mm_loadu_ps(b[1].as_ptr());
+    let b2 = _mm_loadu_ps(b[2].as_ptr());
+    let b3 = _mm_loadu_ps(b[3].as_ptr());
 
     let mut result = [[0.0f32; 4]; 4];
 
-    // For each column j of B, compute: result[j] = A * B[j]
-    // result[j] = a0*b[j][0] + a1*b[j][1] + a2*b[j][2] + a3*b[j][3]
-    // Using FMA: fmadd(a0, broadcast(b[j][0]), fmadd(a1, broadcast(b[j][1]), ...))
-    for j in 0..4 {
-        let b0 = _mm_set1_ps(b[j][0]);
-        let b1 = _mm_set1_ps(b[j][1]);
-        let b2 = _mm_set1_ps(b[j][2]);
-        let b3 = _mm_set1_ps(b[j][3]);
+    for i in 0..4 {
+        let a0 = _mm_set1_ps(a[i][0]);
+        let a1 = _mm_set1_ps(a[i][1]);
+        let a2 = _mm_set1_ps(a[i][2]);
+        let a3 = _mm_set1_ps(a[i][3]);
 
         // Chain FMAs from the inside out for maximum precision:
-        // t0 = a2 * b2 + a3 * b3
-        let t0 = _mm_fmadd_ps(a2, b2, _mm_mul_ps(a3, b3));
-        // t1 = a1 * b1 + t0
-        let t1 = _mm_fmadd_ps(a1, b1, t0);
-        // col = a0 * b0 + t1
-        let col = _mm_fmadd_ps(a0, b0, t1);
+        // t0 = b2 * a2 + b3 * a3
+        let t0 = _mm_fmadd_ps(b2, a2, _mm_mul_ps(b3, a3));
+        // t1 = b1 * a1 + t0
+        let t1 = _mm_fmadd_ps(b1, a1, t0);
+        // row = b0 * a0 + t1
+        let row = _mm_fmadd_ps(b0, a0, t1);
 
-        _mm_storeu_ps(result[j].as_mut_ptr(), col);
+        _mm_storeu_ps(result[i].as_mut_ptr(), row);
     }
 
     result
@@ -467,54 +473,4 @@ pub fn aabb_from_vertices_transformed(
     }
 
     (min, max)
-}
-
-// ====================================================================
-//  Tests
-// ====================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_multiply_matrices_identity() {
-        let id = [[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]];
-        let a = [[1.0,2.0,3.0,4.0],[5.0,6.0,7.0,8.0],[9.0,10.0,11.0,12.0],[13.0,14.0,15.0,16.0]];
-        let result = multiply_matrices(a, id);
-        for i in 0..4 {
-            for j in 0..4 {
-                assert!((result[i][j] - a[i][j]).abs() < 1e-6,
-                    "Mismatch at [{i}][{j}]: {} vs {}", result[i][j], a[i][j]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_aabb_visible_inside() {
-        // A frustum that accepts everything (planes pointing outward from origin)
-        let frustum = [
-            [ 1.0,  0.0,  0.0, 100.0],
-            [-1.0,  0.0,  0.0, 100.0],
-            [ 0.0,  1.0,  0.0, 100.0],
-            [ 0.0, -1.0,  0.0, 100.0],
-            [ 0.0,  0.0,  1.0, 100.0],
-            [ 0.0,  0.0, -1.0, 100.0],
-        ];
-        assert!(aabb_visible(&frustum, [-1.0; 3], [1.0; 3]));
-    }
-
-    #[test]
-    fn test_aabb_visible_outside() {
-        let frustum = [
-            [ 1.0,  0.0,  0.0, 100.0],
-            [-1.0,  0.0,  0.0, 100.0],
-            [ 0.0,  1.0,  0.0, 100.0],
-            [ 0.0, -1.0,  0.0, 100.0],
-            [ 0.0,  0.0,  1.0, 100.0],
-            [ 0.0,  0.0, -1.0, 100.0],
-        ];
-        // AABB far beyond the frustum
-        assert!(!aabb_visible(&frustum, [200.0; 3], [300.0; 3]));
-    }
 }

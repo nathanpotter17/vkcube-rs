@@ -12,22 +12,19 @@ use simmerlib::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n╔══════════════════════════════════╗");
-    println!("║        VULKAN RENDERER             ║");
-    println!("║   VMA-Style Memory Architecture    ║");
-    println!("║   + Async Streaming & Budgeting    ║");
-    println!("╠════════════════════════════════════╣");
-    println!("║  Controls (UE5 fly mode):          ║");
-    println!("║    RMB + Mouse  = Look around      ║");
-    println!("║    W/A/S/D      = Move             ║");
-    println!("║    Q / E        = Down / Up        ║");
-    println!("║    Shift        = Move fast        ║");
-    println!("║    Scroll       = Adjust speed     ║");
-    println!("║    L            = Spawn point light║");
-    println!("║    G            = Spawn geometry   ║");
-    println!("║    O            = Toggle overlay   ║");
-    println!("║    Escape       = Quit             ║");
-    println!("╚════════════════════════════════════╝");
+    let startup_msg = r#"
+    VULKAN RENDERER
+    
+    RMB + Mouse (Fly + Look)
+    Scroll      (Fly Speed)
+    W,A,S,D     (Move)
+    Q,E         (Up/Down)
+    L           (New Light)
+    G           (New Geo)
+    O           (Toggle Overlay)
+    Escape      (Quit)
+    "#;
+    println!("{}", startup_msg);
 
     // SDL2
     let sdl_context = sdl2::init()?;
@@ -44,8 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Vulkan device (now discovers dedicated transfer queue)
     let mut device_context = DeviceContext::new(&window, ENABLE_VALIDATION)?;
     println!(
-        "✓ Device initialized (UBO alignment: {}, dedicated transfer: {})",
+        "✓ Device initialized (UBO alignment: {}, SSBO alignment: {}, dedicated transfer: {})",
         device_context.min_ubo_alignment,
+        device_context.min_ssbo_alignment,
         device_context.has_dedicated_transfer,
     );
 

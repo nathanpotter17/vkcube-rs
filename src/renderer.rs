@@ -8,6 +8,10 @@
 //! A fullscreen tonemap compute pass reads HDR, applies ACES + sRGB gamma,
 //! and writes LDR to the swapchain via imageStore.
 //!
+//! Tier 3: Per-cascade frustum culling. Each cascade gets its own indirect
+//! command buffer filled by cascade_cull.comp, eliminating redundant shadow
+//! caster rendering across cascades.
+//!
 //! Key changes from pre-8A:
 //! - PerDrawUbo removed (set 3 now binds object SSBO)
 //! - DrawCommand CPU lists removed (cull shader writes VkDrawIndexedIndirectCommand)
@@ -22,6 +26,7 @@ use crate::gi::{GIResources, GpuProbeGridParams, ProbeBakeTarget, ProbeGrid,
                  SHProjectPushConstants, MAX_PROBE_BAKES_PER_FRAME,
                  PROBE_CAPTURE_NEAR, PROBE_CAPTURE_FAR, PROBE_CAPTURE_SIZE};
 use crate::gpu_cull::{GpuCullResources, GpuObjectData, CullPushConstants,
+                       CascadeCullPushConstants,
                        MegaAlloc, INDIRECT_COMMAND_STRIDE, MAX_INDIRECT_DRAWS, MAX_BUFFER_GROUPS};
 use crate::light::{
     self, cube_face_matrices, ClusterParamsUbo, Light, LightCategory, LightManager, LightType,
@@ -258,7 +263,7 @@ impl Renderer {
         let gi_resources = GIResources::new(&device, &mut memory_ctx, device_ctx.command_pool, device_ctx.queue, hdr_path)?;
 
         // Phase 8A: Initialize GPU culling resources
-        let mut gpu_cull = GpuCullResources::new(&device, &mut memory_ctx.allocator)?;
+        let mut gpu_cull = GpuCullResources::new(&device, &mut memory_ctx.allocator, device_ctx.min_ssbo_alignment)?;
 
         // ================================================================
         //  glTF asset loading
@@ -930,6 +935,22 @@ impl Renderer {
             );
             let cascade_data = &cascade_render.shadow_data;
 
+            // Tier 3: Determine cascade_dirty before command buffer recording so
+            // cascade cull dispatches (STEP 6.5) know whether to run.
+            {
+                let sun_changed = self.prev_sun_direction[0] != self.sun_direction[0]
+                    || self.prev_sun_direction[1] != self.sun_direction[1]
+                    || self.prev_sun_direction[2] != self.sun_direction[2];
+                if sun_changed {
+                    self.cascade_dirty = true;
+                    self.prev_sun_direction = self.sun_direction;
+                }
+                if self.prev_cascade_view != view_mat {
+                    self.cascade_dirty = true;
+                    self.prev_cascade_view = view_mat;
+                }
+            }
+
             let global_ubo = GlobalUbo {
                 view: view_mat, proj: proj_mat,
                 camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], self.global_frame as f32],
@@ -975,6 +996,12 @@ impl Renderer {
             let count_size = (MAX_BUFFER_GROUPS as u64) * 4;
             self.device.cmd_fill_buffer(cmd, self.gpu_cull.opaque_counts[f], 0, count_size, 0);
             self.device.cmd_fill_buffer(cmd, self.gpu_cull.shadow_counts[f], 0, count_size, 0);
+
+            // Tier 3: zero per-cascade count buffers (covers aligned stride padding)
+            let cascade_count_total_size = CASCADE_COUNT as u64 * self.gpu_cull.cascade_count_stride;
+            self.device.cmd_fill_buffer(
+                cmd, self.gpu_cull.cascade_counts[f], 0, cascade_count_total_size, 0,
+            );
 
             // ════════════════════════════════════════════════════════════
             // STEP 5: Pre-cull barrier (§3.4)
@@ -1026,6 +1053,46 @@ impl Renderer {
 
             let workgroups = (self.gpu_cull.total_alive + 255) / 256;
             self.device.cmd_dispatch(cmd, workgroups, 1, 1);
+
+            // ════════════════════════════════════════════════════════════
+            // STEP 6.5: Per-Cascade Shadow Cull Dispatches (Tier 3)
+            // ════════════════════════════════════════════════════════════
+            // Only dispatch when cascade_dirty — if cascades aren't being
+            // re-rendered, their indirect buffers don't need filling.
+            // The post-cull barrier (STEP 7) covers these writes.
+            if self.cascade_dirty {
+                self.device.cmd_bind_pipeline(
+                    cmd, vk::PipelineBindPoint::COMPUTE, self.gpu_cull.cascade_cull_pipeline,
+                );
+
+                for cascade in 0..CASCADE_COUNT {
+                    let cascade_frustum = crate::scene::extract_frustum_planes_from_vp(
+                        &cascade_render.shadow_data.cascade_matrices[cascade],
+                    );
+                    let cascade_push = CascadeCullPushConstants::new(
+                        &cascade_frustum,
+                        self.gpu_cull.total_alive,
+                    );
+
+                    self.device.cmd_bind_descriptor_sets(
+                        cmd, vk::PipelineBindPoint::COMPUTE,
+                        self.gpu_cull.cascade_cull_pipeline_layout, 0,
+                        &[self.gpu_cull.cascade_cull_descriptor_sets[f][cascade]], &[],
+                    );
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.gpu_cull.cascade_cull_pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        std::slice::from_raw_parts(
+                            &cascade_push as *const _ as *const u8,
+                            std::mem::size_of_val(&cascade_push),
+                        ),
+                    );
+
+                    self.device.cmd_dispatch(cmd, workgroups, 1, 1);
+                }
+            }
 
             // ════════════════════════════════════════════════════════════
             // STEP 7: Post-cull barrier
@@ -1107,21 +1174,9 @@ impl Renderer {
             self.profiler.begin_pass(&self.device, cmd, PassId::Shadow, self.current_frame);
 
             // ---- Cascaded sun directional shadow (CASCADE_COUNT passes) ----
-            // Tier 1 fix: Skip cascade re-render when sun direction, camera view,
-            // and geometry are all unchanged since last render.
+            // Tier 3: cascade_dirty detection moved to before STEP 6.5
+            // so cascade cull dispatches and render passes use same flag.
             {
-                let sun_changed = self.prev_sun_direction[0] != self.sun_direction[0]
-                    || self.prev_sun_direction[1] != self.sun_direction[1]
-                    || self.prev_sun_direction[2] != self.sun_direction[2];
-                if sun_changed {
-                    self.cascade_dirty = true;
-                    self.prev_sun_direction = self.sun_direction;
-                }
-                if self.prev_cascade_view != view_mat {
-                    self.cascade_dirty = true;
-                    self.prev_cascade_view = view_mat;
-                }
-
                 if self.cascade_dirty {
                     let sun_sv = vk::Viewport { x: 0.0, y: 0.0,
                         width: SUN_SHADOW_SIZE as f32, height: SUN_SHADOW_SIZE as f32,
@@ -1177,13 +1232,18 @@ impl Renderer {
                         self.device.cmd_bind_index_buffer(cmd,
                             self.gpu_cull.mega.index_buffer, 0, vk::IndexType::UINT32);
 
-                        // All shadow geometry rendered into every cascade (no per-cascade culling yet).
+                        // Tier 3: Per-cascade indirect draw — only objects
+                        // visible in this cascade's light-space frustum.
+                        let cascade_cmd_offset = cascade as u64
+                            * MAX_INDIRECT_DRAWS as u64
+                            * INDIRECT_COMMAND_STRIDE as u64;
+                        let cascade_count_offset = cascade as u64 * self.gpu_cull.cascade_count_stride;
                         self.device.cmd_draw_indexed_indirect_count(
                             cmd,
-                            self.gpu_cull.shadow_cmds[f],
-                            0,
-                            self.gpu_cull.shadow_counts[f],
-                            0,
+                            self.gpu_cull.cascade_indirect[f],
+                            cascade_cmd_offset,
+                            self.gpu_cull.cascade_counts[f],
+                            cascade_count_offset,
                             MAX_INDIRECT_DRAWS,
                             INDIRECT_COMMAND_STRIDE,
                         );

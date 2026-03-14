@@ -38,6 +38,9 @@ pub struct DeviceContext {
     pub depth_image_memory: vk::DeviceMemory,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub min_ubo_alignment: u64,
+    /// Minimum offset alignment for STORAGE_BUFFER descriptors.
+    /// Cascade shadow count buffer stride must be a multiple of this.
+    pub min_ssbo_alignment: u64,
     pub debug_utils: Option<debug_utils::Instance>,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     /// Nanoseconds per GPU timestamp tick (from VkPhysicalDeviceLimits).
@@ -278,6 +281,8 @@ impl DeviceContext {
                 instance.get_physical_device_properties(physical_device);
             let min_ubo_alignment =
                 device_properties.limits.min_uniform_buffer_offset_alignment;
+            let min_ssbo_alignment =
+                device_properties.limits.min_storage_buffer_offset_alignment;
             let timestamp_period = device_properties.limits.timestamp_period;
 
             // timestampValidBits for the graphics queue family.
@@ -457,6 +462,7 @@ impl DeviceContext {
                 depth_image_memory,
                 memory_properties,
                 min_ubo_alignment,
+                min_ssbo_alignment,
                 debug_utils,
                 debug_messenger,
                 timestamp_period,
